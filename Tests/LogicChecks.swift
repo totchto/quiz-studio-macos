@@ -148,6 +148,27 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   assert(FileManager.default.fileExists(atPath: legacyFolder.appendingPathComponent("quiz.json").path))
   print("PASS: round explanation step and timer, immediate repeat transitions, embedded round image and media, refusal to overwrite legacy folders")
 
+
+  let libraryFolder = root.appendingPathComponent("library")
+  try FileManager.default.createDirectory(at: libraryFolder,withIntermediateDirectories: true)
+  let libraryFile = libraryFolder.appendingPathComponent("Saved.quiz")
+  try withIntro.write(to: libraryFile)
+  let suite = "QuizStudioTests-" + UUID().uuidString
+  let preferences = UserDefaults(suiteName: suite)!
+  defer { preferences.removePersistentDomain(forName: suite) }
+  let library = Studio(draftURL: root.appendingPathComponent("library-draft.workspace"),libraryDefaults: preferences,nearbyFolder: libraryFolder); library.timer?.invalidate()
+  assert(library.recentQuizzes == [libraryFile.standardizedFileURL])
+  library.showLibrary(editing: true); assert(library.screen == .createLibrary)
+  library.editQuiz(libraryFile); assert(library.screen == .editor && library.documentURL == libraryFile && library.quiz.rounds[0].intro?.text == "Правила раунда")
+  library.removeFromLibrary(libraryFile); assert(library.recentQuizzes.isEmpty && FileManager.default.fileExists(atPath: libraryFile.path))
+  let reloadedLibrary = Studio(draftURL: root.appendingPathComponent("library-reloaded.workspace"),libraryDefaults: preferences,nearbyFolder: libraryFolder); reloadedLibrary.timer?.invalidate()
+  assert(reloadedLibrary.recentQuizzes.isEmpty)
+  assert(reloadedLibrary.load(libraryFile)); assert(reloadedLibrary.recentQuizzes == [libraryFile.standardizedFileURL])
+  reloadedLibrary.remember(libraryFile); assert(reloadedLibrary.recentQuizzes.count == 1)
+  reloadedLibrary.showLibrary(editing: false); assert(reloadedLibrary.screen == .library)
+  reloadedLibrary.newQuiz(); assert(reloadedLibrary.screen == .editor && reloadedLibrary.documentURL == nil && reloadedLibrary.quiz.title == "Новый квиз")
+  print("PASS: creation library, open for editing, non-destructive removal, hidden discovery after restart, explicit restore, duplicate prevention, play library and new blank quiz")
+
   print("PASS: schedule, per-round defaults, pause, automatic transitions, back, untimed question, save/load, portable assets, scores")
  }
 }

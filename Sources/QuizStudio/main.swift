@@ -104,12 +104,14 @@ struct Step {
     var showsTimer: Bool { [.question,.repeated,.pause].contains(kind) }
 }
 @MainActor final class Studio: ObservableObject {
-    enum Screen { case home, library, editor, teams }
+    enum Screen { case home, library, createLibrary, editor, teams }
     @Published var screen: Screen = .home
     @Published var introductionSeconds = 6
     @Published var resetScores = true
     @Published var recentQuizzes: [URL] = []
     var rememberRecent = true
+    var hiddenQuizzes: Set<String> = []
+    let libraryDefaults: UserDefaults
     @Published var quiz = Quiz()
     @Published var roundIndex = 0
     @Published var questionIndex = 0
@@ -138,19 +140,25 @@ struct Step {
         guard let s = step, quiz.rounds.indices.contains(s.round), quiz.rounds[s.round].questions.indices.contains(s.question) else { return nil }
         return quiz.rounds[s.round].questions[s.question]
     }
-    init(draftURL: URL? = nil) {
+    init(draftURL: URL? = nil, libraryDefaults: UserDefaults? = nil, nearbyFolder: URL? = nil) {
+        self.libraryDefaults = libraryDefaults ?? .standard
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("QuizStudio")
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-        rememberRecent = draftURL == nil
+        rememberRecent = draftURL == nil || libraryDefaults != nil
         draft = draftURL ?? support.appendingPathComponent("Draft.workspace")
         if draftURL == nil, !FileManager.default.fileExists(atPath: draft.path) {
             let legacyDraft = support.appendingPathComponent("Draft.quiz")
             if FileManager.default.fileExists(atPath: legacyDraft.path) { try? FileManager.default.copyItem(at: legacyDraft,to: draft) }
         }
         if rememberRecent {
-            recentQuizzes = (UserDefaults.standard.stringArray(forKey: "RecentQuizzes") ?? []).map { URL(fileURLWithPath: $0) }.filter { FileManager.default.fileExists(atPath: $0.path) }
-            let nearby = Bundle.main.bundleURL.deletingLastPathComponent()
-            for url in (try? FileManager.default.contentsOfDirectory(at: nearby,includingPropertiesForKeys: nil)) ?? [] where url.pathExtension == "quiz" && !recentQuizzes.contains(url) { recentQuizzes.append(url) }
+            hiddenQuizzes = Set(self.libraryDefaults.stringArray(forKey: "HiddenQuizzes") ?? [])
+            let saved = (self.libraryDefaults.stringArray(forKey: "RecentQuizzes") ?? []).map { URL(fileURLWithPath: $0).standardizedFileURL }
+            let nearby = nearbyFolder ?? Bundle.main.bundleURL.deletingLastPathComponent()
+            let discovered = ((try? FileManager.default.contentsOfDirectory(at: nearby,includingPropertiesForKeys: nil)) ?? []).filter { $0.pathExtension == "quiz" }.map(\.standardizedFileURL)
+            var seen: Set<String> = []
+            recentQuizzes = (saved + discovered).filter { url in
+                !hiddenQuizzes.contains(url.path) && FileManager.default.fileExists(atPath: url.path) && seen.insert(url.path).inserted
+            }
         }
         if FileManager.default.fileExists(atPath: draft.path) { load(draft) }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -177,11 +185,30 @@ struct Step {
         switch key { case 49: togglePause(); case 123: back(); case 124: next(); default: return false }
         return true
     }
+    func persistLibrary() {
+        guard rememberRecent else { return }
+        libraryDefaults.set(recentQuizzes.map(\.path),forKey: "RecentQuizzes")
+        libraryDefaults.set(hiddenQuizzes.sorted(),forKey: "HiddenQuizzes")
+    }
     func remember(_ url: URL) {
         guard rememberRecent, url.standardizedFileURL != draft.standardizedFileURL else { return }
-        recentQuizzes.removeAll { $0.standardizedFileURL == url.standardizedFileURL }
-        recentQuizzes.insert(url,at: 0)
-        UserDefaults.standard.set(recentQuizzes.prefix(20).map(\.path),forKey: "RecentQuizzes")
+        let canonical = url.standardizedFileURL
+        hiddenQuizzes.remove(canonical.path)
+        recentQuizzes.removeAll { $0.standardizedFileURL == canonical }
+        recentQuizzes.insert(canonical,at: 0)
+        persistLibrary()
+    }
+    func removeFromLibrary(_ url: URL) {
+        let canonical = url.standardizedFileURL
+        recentQuizzes.removeAll { $0.standardizedFileURL == canonical }
+        hiddenQuizzes.insert(canonical.path)
+        persistLibrary()
+        status = "Квиз убран из списка. Файл остался на Mac; его можно снова добавить через «Открыть квиз на Mac…»."
+    }
+    func showLibrary(editing: Bool) { status = ""; screen = editing ? .createLibrary : .library }
+    func editQuiz(_ url: URL) {
+        autosave()
+        if load(url) { screen = .editor }
     }
     func prepareGame() { resetScores = true; status = ""; screen = .teams }
     func beginGame() {
@@ -251,7 +278,8 @@ struct Step {
             alert.alertStyle = .warning; alert.addButton(withTitle: "Отмена"); alert.addButton(withTitle: "Всё равно продолжить")
             guard alert.runModal() == .alertSecondButtonReturn else { return false }
         }
-        let panel = NSSavePanel(); panel.title = "Сохранить квиз"; panel.nameFieldStringValue = quiz.title + ".quiz"; panel.allowedContentTypes = [UTType(exportedAs: "local.quizstudio.quiz",conformingTo: .data)]; panel.allowsOtherFileTypes = false
+        let panel = NSSavePanel(); panel.title = "Сохранить квиз"; panel.nameFieldStringValue = quiz.title + ".quiz";
+        if let documentURL, (try? documentURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true { panel.directoryURL = documentURL.deletingLastPathComponent(); panel.nameFieldStringValue = documentURL.lastPathComponent }; panel.allowedContentTypes = [UTType(exportedAs: "local.quizstudio.quiz",conformingTo: .data)]; panel.allowsOtherFileTypes = false
         if panel.runModal() == .OK, let url = panel.url {
             do { try write(to: url); documentURL = url; remember(url); status = "Сохранён файл: \(url.path)"; return true } catch { status = error.localizedDescription; let alert = NSAlert(); alert.messageText = "Не удалось сохранить файл"; alert.informativeText = error.localizedDescription; alert.runModal(); return false }
         }
@@ -401,7 +429,7 @@ struct Step {
 @main struct QuizStudioApp: App {
     @StateObject var studio = Studio()
     var body: some Scene {
-        WindowGroup("Квиз Студия · 0.5.0") { Content(studio: studio).frame(minWidth: 1050,minHeight: 720).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if !studio.playing && studio.load(url) { studio.prepareGame() } } }
+        WindowGroup("Квиз Студия · 0.6.0") { Content(studio: studio).frame(minWidth: 1050,minHeight: 720).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if !studio.playing && studio.load(url) { studio.prepareGame() } } }
         .commands { CommandGroup(replacing: .newItem) { Button("Создать квиз") { studio.newQuiz() }.keyboardShortcut("n").disabled(studio.playing); Button("Открыть квиз…") { studio.open() }.keyboardShortcut("o").disabled(studio.playing); Button("Сохранить квиз…") { studio.save() }.keyboardShortcut("s") } }
     }
 }
@@ -413,6 +441,7 @@ struct Content: View {
             else { switch studio.screen {
                 case .home: Welcome(studio: studio)
                 case .library: QuizLibrary(studio: studio)
+                case .createLibrary: QuizLibrary(studio: studio,editing: true)
                 case .teams: TeamSetup(studio: studio)
                 case .editor: Editor(studio: studio)
             } }
@@ -707,8 +736,8 @@ struct Welcome: View {
             Text("Квиз Студия").font(.system(size: 46,weight: .bold))
             Text("Создайте игру или проведите готовый квиз").font(.title3).foregroundStyle(.secondary)
             HStack(spacing: 24) {
-                Button { studio.newQuiz() } label: { entry("Начать создавать квиз","Вопросы, раунды, музыка и видео","square.and.pencil") }
-                Button { studio.status = ""; studio.screen = .library } label: { entry("Запустить квиз","Выбрать игру и представить команды","play.rectangle") }
+                Button { studio.showLibrary(editing: true) } label: { entry("Создать квиз","Новый квиз или редактирование готового","square.and.pencil") }
+                Button { studio.showLibrary(editing: false) } label: { entry("Запустить квиз","Выбрать игру и представить команды","play.rectangle") }
             }.buttonStyle(.plain)
             Button("Продолжить редактирование черновика") { studio.screen = .editor }
             Text(studio.status).foregroundStyle(.secondary)
@@ -723,23 +752,44 @@ struct Welcome: View {
 }
 struct QuizLibrary: View {
     @ObservedObject var studio: Studio
+    var editing = false
+    @State var search = ""
+    var visibleQuizzes: [URL] {
+        studio.recentQuizzes.filter { search.isEmpty || $0.deletingPathExtension().lastPathComponent.localizedCaseInsensitiveContains(search) }
+    }
     var body: some View {
         VStack(alignment: .leading,spacing: 24) {
-            HStack { Button("Главная") { studio.screen = .home }; Spacer(); Button("Выбрать квиз на Mac…") { studio.open(forPlay: true) }.buttonStyle(.borderedProminent) }
-            Text("Запустить квиз").font(.largeTitle.bold())
-            Text("Выберите сохранённый квиз. Затем добавьте команды перед стартом.").foregroundStyle(.secondary)
-            if studio.recentQuizzes.isEmpty { ContentUnavailableView("Пока нет сохранённых квизов",systemImage: "rectangle.stack",description: Text("Нажмите «Выбрать квиз на Mac…» и укажите файл .quiz")) }
-            else {
-                List(studio.recentQuizzes,id: \.path) { url in
-                    HStack {
-                        VStack(alignment: .leading) { Text(url.deletingPathExtension().lastPathComponent).font(.headline); Text(((try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true ? "Папка старого формата · " : "Файл .quiz · ") + url.path).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
+            HStack {
+                Button("Главная") { studio.screen = .home }
+                Spacer()
+                Button("Открыть квиз на Mac…") { studio.open(forPlay: !editing) }
+                if editing { Button("Создать с нуля",systemImage: "plus") { studio.newQuiz() }.buttonStyle(.borderedProminent) }
+            }
+            Text(editing ? "Создать или редактировать квиз" : "Запустить квиз").font(.largeTitle.bold())
+            Text(editing ? "Откройте сохранённый квиз для правок или начните новый с нуля." : "Выберите квиз для проведения. Его также можно открыть для редактирования.").foregroundStyle(.secondary)
+            TextField("Найти квиз по названию",text: $search).textFieldStyle(.roundedBorder)
+            if studio.recentQuizzes.isEmpty {
+                ContentUnavailableView("Пока нет сохранённых квизов",systemImage: "rectangle.stack",description: Text(editing ? "Создайте квиз с нуля или откройте файл на Mac." : "Нажмите «Открыть квиз на Mac…» и укажите файл .quiz"))
+            } else if visibleQuizzes.isEmpty {
+                ContentUnavailableView.search(text: search)
+            } else {
+                List(visibleQuizzes,id: \.path) { url in
+                    HStack(spacing: 16) {
+                        Image(systemName: "doc.text").font(.title2).foregroundStyle(.indigo)
+                        VStack(alignment: .leading,spacing: 5) {
+                            Text(url.deletingPathExtension().lastPathComponent).font(.headline)
+                            Text(((try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true ? "Папка старого формата · " : "Файл .quiz · ") + url.path).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
                         Spacer()
-                        Button("Выбрать") { if studio.load(url) { studio.prepareGame() } }
+                        Button("Редактировать",systemImage: "square.and.pencil") { studio.editQuiz(url) }
+                        if !editing { Button("Запустить",systemImage: "play.fill") { if studio.load(url) { studio.prepareGame() } }.buttonStyle(.borderedProminent) }
+                        Button { studio.removeFromLibrary(url) } label: { Image(systemName: "xmark.circle") }
+                            .buttonStyle(.borderless).help("Убрать из списка. Файл останется на Mac.").accessibilityLabel("Убрать из списка: " + url.deletingPathExtension().lastPathComponent)
                     }.padding(10)
                 }
             }
             Text(studio.status).foregroundStyle(.secondary)
-            Spacer()
+            Text("Удаление из списка не удаляет файл. Чтобы вернуть квиз, откройте его на Mac заново.").font(.caption).foregroundStyle(.secondary)
         }.padding(36)
     }
 }
