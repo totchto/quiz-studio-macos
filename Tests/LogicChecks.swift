@@ -1,6 +1,7 @@
 struct Stage: View { var studio: Studio; var audience: Bool; var body: some View { EmptyView() } }
 @main struct Checks {
  @MainActor static func tryData(_ url: URL) -> Data { (try? Data(contentsOf: url)) ?? Data() }
+ @MainActor static func tryRange(start: Double,end: Double,duration: Double) -> Bool { (try? MediaRange.resolve(start: start,end: end,duration: duration)) != nil }
  @MainActor static func main() throws {
   let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
   let app = Studio(draftURL: root.appendingPathComponent("draft.quiz"))
@@ -208,6 +209,35 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   assert(themed.quiz.appearance?.imageDimming == 0.6 && themed.referencedAssets.count == 2)
   themed.quiz.appearance = nil; assert(themed.presentationFontName == nil && themed.referencedAssets.isEmpty)
   print("PASS: repeat announcement and timing, suspense reveal from last place, simultaneous ties, paused reveal, reveal-all and reset, legacy appearance defaults, embedded custom font/background and font registration after import")
+
+
+  let reorder = Studio(draftURL: root.appendingPathComponent("reorder.workspace")); reorder.timer?.invalidate()
+  var a = Question(); a.text = "А"; a.answer = "Ответ А"
+  var b = Question(); b.text = "Б"; b.answer = "Ответ Б"; b.explanation = "Объяснение Б"
+  var c = Question(); c.text = "В"; c.answer = "Ответ В"
+  var d = Question(); d.text = "Г"; d.answer = "Ответ Г"
+  reorder.quiz.rounds = [Round(title: "Первый",questions: [a,b,c]),Round(title: "Второй",questions: [d])]
+  let firstRound = reorder.quiz.rounds[0].id, secondRound = reorder.quiz.rounds[1].id
+  let binding = reorder.questionBinding(b.id)
+  assert(reorder.moveQuestion(c.id,toRound: firstRound,before: a.id)); assert(reorder.quiz.rounds[0].questions.map(\.id) == [c.id,a.id,b.id])
+  assert(reorder.moveQuestion(b.id,toRound: secondRound,before: d.id)); assert(reorder.quiz.rounds[1].questions.map(\.id) == [b.id,d.id])
+  assert(binding.wrappedValue == b)
+  var modified = binding.wrappedValue; modified.text = "Б после переноса"; binding.wrappedValue = modified
+  assert(reorder.quiz.rounds[1].questions[0].text == "Б после переноса" && reorder.quiz.rounds[0].questions[1].text == "А")
+  assert(reorder.moveQuestion(d.id,toRound: firstRound)); assert(reorder.quiz.rounds[0].questions.last?.id == d.id)
+  assert(reorder.moveQuestion(b.id,toRound: firstRound)); assert(reorder.quiz.rounds[1].questions.isEmpty)
+  assert(Set(reorder.quiz.rounds.flatMap(\.questions).map(\.id)).count == 4)
+  let snapshot = reorder.quiz; assert(!reorder.moveQuestion(a.id,toRound: UUID()) && reorder.quiz == snapshot)
+  assert(!reorder.moveQuestion(a.id,toRound: firstRound,before: a.id))
+  let reorderedFile = root.appendingPathComponent("reordered.quiz"); try reorder.write(to: reorderedFile)
+  let reorderedLoad = Studio(draftURL: root.appendingPathComponent("reordered-load.workspace")); reorderedLoad.timer?.invalidate(); assert(reorderedLoad.load(reorderedFile))
+  assert(reorderedLoad.quiz.rounds[1].questions.isEmpty && reorderedLoad.quiz.rounds[0].questions.map(\.id) == reorder.quiz.rounds[0].questions.map(\.id))
+  reorderedLoad.start(); assert(!reorderedLoad.playing && !reorderedLoad.incompleteQuestions.isEmpty)
+  reorderedLoad.roundIndex = 1; reorderedLoad.addQuestion(); assert(reorderedLoad.selectedQuestion != nil)
+  reorderedLoad.deleteSelectedQuestion(); assert(reorderedLoad.selectedQuestion == nil)
+  let validRange = try MediaRange.resolve(start: 10,end: 200,duration: 100); assert(validRange == MediaRange(start: 10,end: 100))
+  assert(tryRange(start: 100,end: 0,duration: 100) == false && tryRange(start: .nan,end: 0,duration: 100) == false)
+  print("PASS: drag reorder, cross-round move, stable editor binding, empty-round save/load, empty-round start validation, refill/delete empty round, media range clamping and invalid ranges")
 
   print("PASS: schedule, per-round defaults, pause, automatic transitions, back, untimed question, save/load, portable assets, scores")
  }

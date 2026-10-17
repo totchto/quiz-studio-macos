@@ -3,6 +3,7 @@ import AppKit
 import AVKit
 import UniformTypeIdentifiers
 import CoreText
+import Combine
 
 struct MatchPair: Codable, Identifiable, Equatable {
     var id = UUID()
@@ -114,6 +115,144 @@ struct Step {
     var duration: Int
     var showsTimer: Bool { [.question,.repeated,.pause].contains(kind) }
 }
+
+struct MediaRange: Equatable {
+    let start: Double
+    let end: Double
+    static func resolve(start: Double,end: Double,duration: Double) throws -> MediaRange {
+        guard start.isFinite, end.isFinite, start >= 0, end >= 0, duration.isFinite, duration > 0, start < duration else {
+            throw NSError(domain: "QuizMedia",code: 1,userInfo: [NSLocalizedDescriptionKey: "Начало фрагмента должно находиться внутри записи."])
+        }
+        let stop = end == 0 ? duration : min(end,duration)
+        guard stop > start else { throw NSError(domain: "QuizMedia",code: 2,userInfo: [NSLocalizedDescriptionKey: "Конец фрагмента должен быть позже начала."]) }
+        return MediaRange(start: start,end: stop)
+    }
+}
+@MainActor final class MediaSession: ObservableObject {
+    @Published var player: AVPlayer?
+    @Published var loading = false
+    @Published var finished = true
+    @Published var error: String?
+    @Published var hasVideo = false
+    @Published var position: Double = 0
+    @Published var clip: MediaRange?
+    private var task: Task<Void,Never>?
+    private var observation: NSKeyValueObservation?
+    private var endObserver: NSObjectProtocol?
+    private var failureObserver: NSObjectProtocol?
+    private var timeObserver: Any?
+    private var nativePlayer: AVPlayer?
+    private var generation = UUID()
+    private var wantsPlayback = true
+    private var seekStarted = false
+    private var prepared = false
+    func start(url: URL,start: Double = 0,end: Double = 0,autoplay: Bool = true) {
+        stop()
+        let token = generation
+        wantsPlayback = autoplay; loading = true; finished = false; error = nil
+        task = Task { [weak self] in
+            do {
+                guard FileManager.default.fileExists(atPath: url.path) else { throw CocoaError(.fileNoSuchFile) }
+                let asset = AVURLAsset(url: url)
+                guard try await asset.load(.isPlayable) else { throw NSError(domain: "QuizMedia",code: 3,userInfo: [NSLocalizedDescriptionKey: "Этот файл не поддерживается проигрывателем macOS."]) }
+                let duration = try await asset.load(.duration).seconds
+                let range = try MediaRange.resolve(start: start,end: end,duration: duration)
+                let video = try await asset.loadTracks(withMediaType: .video)
+                guard !Task.isCancelled, let self, self.generation == token else { return }
+                self.clip = range; self.hasVideo = !video.isEmpty; self.position = range.start
+                let item = AVPlayerItem(asset: asset)
+                item.forwardPlaybackEndTime = CMTime(seconds: range.end,preferredTimescale: 600)
+                let p = AVPlayer(playerItem: item)
+                p.volume = 1; p.isMuted = false
+                self.player = p; self.nativePlayer = p
+                self.endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime,object: item,queue: .main) { [weak self] _ in
+                    Task { @MainActor in guard self?.generation == token else { return }; self?.finish() }
+                }
+                self.failureObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime,object: item,queue: .main) { [weak self] note in
+                    let message = (note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)?.localizedDescription ?? "Не удалось воспроизвести запись."
+                    Task { @MainActor in guard self?.generation == token else { return }; self?.finish(message) }
+                }
+                self.timeObserver = p.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.2,preferredTimescale: 600),queue: .main) { [weak self] time in
+                    Task { @MainActor in guard let self, self.generation == token else { return }; if time.seconds.isFinite { self.position = time.seconds }; if self.prepared && !self.finished && time.seconds >= range.end { self.finish() } }
+                }
+                self.observation = item.observe(\.status,options: [.initial,.new]) { [weak self] item,_ in
+                    Task { @MainActor in
+                        guard let self, self.generation == token else { return }
+                        if item.status == .failed { self.finish(item.error?.localizedDescription ?? "Ошибка открытия записи.") }
+                        else if item.status == .readyToPlay { self.seekAndPlay(token: token) }
+                    }
+                }
+            } catch {
+                guard !Task.isCancelled, let self, self.generation == token else { return }
+                self.finish(error.localizedDescription)
+            }
+        }
+    }
+    private func seekAndPlay(token: UUID) {
+        guard !seekStarted, let player, let clip else { return }
+        seekStarted = true
+        player.seek(to: CMTime(seconds: clip.start,preferredTimescale: 600),toleranceBefore: .zero,toleranceAfter: .zero) { [weak self] success in
+            Task { @MainActor in
+                guard let self, self.generation == token, !self.finished else { return }
+                guard success else { self.finish("Не удалось перейти к началу фрагмента."); return }
+                self.prepared = true; self.loading = false
+                if self.wantsPlayback { self.player?.play() }
+            }
+        }
+    }
+    func setPaused(_ paused: Bool) {
+        wantsPlayback = !paused
+        if paused { player?.pause() } else if prepared && !finished { player?.play() }
+    }
+    func finish(_ message: String? = nil) {
+        player?.pause(); loading = false; finished = true; error = message
+    }
+    func stop() {
+        generation = UUID(); task?.cancel(); task = nil
+        observation?.invalidate(); observation = nil
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }; endObserver = nil
+        if let failureObserver { NotificationCenter.default.removeObserver(failureObserver) }; failureObserver = nil
+        if let timeObserver, let player { player.removeTimeObserver(timeObserver) }; timeObserver = nil
+        player?.pause(); player = nil; nativePlayer = nil; loading = false; finished = true; error = nil; hasVideo = false; clip = nil; position = 0; seekStarted = false; prepared = false
+    }
+    deinit {
+        task?.cancel(); observation?.invalidate()
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        if let failureObserver { NotificationCenter.default.removeObserver(failureObserver) }
+        if let timeObserver, let nativePlayer { nativePlayer.removeTimeObserver(timeObserver) }
+        nativePlayer?.pause()
+    }
+}
+// Use AppKit directly: SwiftUI's VideoPlayer crashes in _AVKit_SwiftUI on this host.
+struct NativeMediaView: NSViewRepresentable {
+    let player: AVPlayer
+    var controls = true
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView(); view.player = player; view.controlsStyle = controls ? .inline : .none
+        view.videoGravity = .resizeAspect; view.showsFullScreenToggleButton = false
+        return view
+    }
+    func updateNSView(_ view: AVPlayerView,context: Context) {
+        if view.player !== player { view.player = player }
+        view.controlsStyle = controls ? .inline : .none
+    }
+    static func dismantleNSView(_ view: AVPlayerView,coordinator: ()) { view.player = nil }
+}
+struct MediaPreview: View {
+    @ObservedObject var session: MediaSession
+    var body: some View {
+        VStack(alignment: .leading,spacing: 8) {
+            if session.loading { ProgressView("Открываем запись…") }
+            if let error = session.error { Text(error).foregroundStyle(.red).font(.caption) }
+            if let player = session.player {
+                if !session.hasVideo { Label("Аудиофрагмент",systemImage: "waveform") }
+                NativeMediaView(player: player).frame(height: session.hasVideo ? 200 : 60)
+                HStack { Text("\(session.position, specifier: "%.1f") сек").font(.caption.monospacedDigit()); Button("Остановить") { session.stop() } }
+            }
+        }
+    }
+}
+
 @MainActor final class Studio: ObservableObject {
     enum Screen { case home, library, createLibrary, editor, teams }
     @Published var screen: Screen = .home
@@ -138,7 +277,9 @@ struct Step {
     @Published var registeredFontName: String? = nil
     var scoreGroups: [[Team]] = []
     var scoreRevealElapsed: Double = 0
-    @Published var player: AVPlayer? = nil
+    let playback = MediaSession()
+    var player: AVPlayer? { playback.player }
+    var playbackSubscription: AnyCancellable?
     var steps: [Step] = []
     var matchLayouts: [UUID: MatchLayout] = [:]
     var folder: URL?
@@ -178,6 +319,7 @@ struct Step {
             }
         }
         if FileManager.default.fileExists(atPath: draft.path) { load(draft) }
+        playbackSubscription = playback.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, self.playing, event.modifierFlags.intersection([.command,.control,.option]).isEmpty else { return event }
             // Do not steal navigation or spaces from the score table's field editor.
@@ -285,7 +427,7 @@ struct Step {
         }
     }
     var incompleteQuestions: [String] {
-        quiz.rounds.flatMap { r in r.questions.enumerated().compactMap { i,q in q.issues.isEmpty ? nil : "\(r.title), вопрос \(i+1): \(q.issues.joined(separator: "; "))" } }
+        quiz.rounds.flatMap { r in (r.questions.isEmpty ? ["\(r.title): нет вопросов"] : []) + r.questions.enumerated().compactMap { i,q in q.issues.isEmpty ? nil : "\(r.title), вопрос \(i+1): \(q.issues.joined(separator: "; "))" } }
     }
     @discardableResult func save() -> Bool {
         let issues = incompleteQuestions
@@ -329,7 +471,7 @@ struct Step {
                     try data.write(to: media.appendingPathComponent(name),options: .atomic)
                 }
             }
-            guard !decoded.rounds.isEmpty, decoded.rounds.allSatisfy({ !$0.questions.isEmpty && $0.questions.allSatisfy { $0.choices.count == 4 } }) else { throw CocoaError(.fileReadCorruptFile) }
+            guard !decoded.rounds.isEmpty, decoded.rounds.allSatisfy({ $0.questions.allSatisfy { $0.choices.count == 4 } }) else { throw CocoaError(.fileReadCorruptFile) }
             quiz = decoded; folder = mediaFolder; documentURL = url.standardizedFileURL == draft.standardizedFileURL ? nil : url
             roundIndex = 0; questionIndex = 0; remember(url); status = ""
             registeredFontName = asset(quiz.appearance?.fontFile).flatMap { registerFont($0) }
@@ -420,6 +562,63 @@ struct Step {
         withAnimation(.easeInOut(duration: 0.85)) { scoreRevealedIDs = Set(scoreSnapshot.map(\.id)); scoreRevealGroup = scoreGroups.count }
     }
     func asset(_ name: String?) -> URL? { guard let name, let folder, name == (name as NSString).lastPathComponent, !name.contains("\\"), name != ".", name != ".." else { return nil }; return folder.appendingPathComponent("Media").appendingPathComponent(name) }
+
+    var selectedQuestion: Question? {
+        guard quiz.rounds.indices.contains(roundIndex), quiz.rounds[roundIndex].questions.indices.contains(questionIndex) else { return nil }
+        return quiz.rounds[roundIndex].questions[questionIndex]
+    }
+    func questionBinding(_ id: UUID) -> Binding<Question> {
+        let fallback = quiz.rounds.flatMap(\.questions).first { $0.id == id } ?? Question()
+        return Binding(get: { self.quiz.rounds.flatMap(\.questions).first { $0.id == id } ?? fallback },set: { value in
+            guard let r = self.quiz.rounds.firstIndex(where: { $0.questions.contains(where: { $0.id == id }) }), let q = self.quiz.rounds[r].questions.firstIndex(where: { $0.id == id }) else { return }
+            self.quiz.rounds[r].questions[q] = value
+        })
+    }
+    func roundBinding(_ id: UUID) -> Binding<Round> {
+        let fallback = quiz.rounds.first { $0.id == id } ?? Round()
+        return Binding(get: { self.quiz.rounds.first { $0.id == id } ?? fallback },set: { value in
+            guard let index = self.quiz.rounds.firstIndex(where: { $0.id == id }) else { return }
+            self.quiz.rounds[index] = value
+        })
+    }
+    @discardableResult func moveQuestion(_ id: UUID,toRound target: UUID,before anchor: UUID? = nil) -> Bool {
+        guard let source = quiz.rounds.firstIndex(where: { $0.questions.contains(where: { $0.id == id }) }),
+              let sourceIndex = quiz.rounds[source].questions.firstIndex(where: { $0.id == id }),
+              let destination = quiz.rounds.firstIndex(where: { $0.id == target }) else { return false }
+        if anchor == id { return false }
+        if let anchor, !quiz.rounds[destination].questions.contains(where: { $0.id == anchor }) { return false }
+        var updated = quiz
+        let question = updated.rounds[source].questions.remove(at: sourceIndex)
+        let insertion = anchor.flatMap { wanted in updated.rounds[destination].questions.firstIndex { $0.id == wanted } } ?? updated.rounds[destination].questions.count
+        updated.rounds[destination].questions.insert(question,at: insertion)
+        quiz = updated; roundIndex = destination; questionIndex = insertion
+        return true
+    }
+    func acceptQuestionDrop(_ providers: [NSItemProvider],toRound: UUID,before: UUID? = nil) -> Bool {
+        guard let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.text.identifier) }) else { return false }
+        provider.loadItem(forTypeIdentifier: UTType.text.identifier,options: nil) { [weak self] item,_ in
+            let text = (item as? String) ?? (item as? Data).flatMap { String(data: $0,encoding: .utf8) }
+            guard let text, let id = UUID(uuidString: text) else { return }
+            Task { @MainActor in _ = self?.moveQuestion(id,toRound: toRound,before: before) }
+        }
+        return true
+    }
+    func selectRound(_ id: UUID) {
+        guard let index = quiz.rounds.firstIndex(where: { $0.id == id }) else { return }
+        roundIndex = index; questionIndex = 0
+    }
+    func deleteEmptyRound(_ id: UUID) {
+        guard quiz.rounds.count > 1, let index = quiz.rounds.firstIndex(where: { $0.id == id }), quiz.rounds[index].questions.isEmpty else { return }
+        let active = quiz.rounds[roundIndex].id
+        quiz.rounds.remove(at: index)
+        roundIndex = quiz.rounds.firstIndex(where: { $0.id == active }) ?? min(index,quiz.rounds.count-1)
+        questionIndex = min(questionIndex,max(0,quiz.rounds[roundIndex].questions.count-1))
+    }
+    func deleteSelectedQuestion() {
+        guard quiz.rounds.indices.contains(roundIndex), quiz.rounds[roundIndex].questions.indices.contains(questionIndex) else { return }
+        quiz.rounds[roundIndex].questions.remove(at: questionIndex)
+        questionIndex = min(questionIndex,max(0,quiz.rounds[roundIndex].questions.count-1))
+    }
     func addRound() { quiz.rounds.append(Round(title: "Раунд \(quiz.rounds.count + 1)")); roundIndex = quiz.rounds.count-1; questionIndex = 0 }
     func applyTime() {
         let q = quiz.rounds[roundIndex].questions[questionIndex]
@@ -433,6 +632,7 @@ struct Step {
         quiz.rounds[roundIndex].questions.append(q); questionIndex = quiz.rounds[roundIndex].questions.count-1
     }
     func start() {
+        guard !quiz.rounds.contains(where: { $0.questions.isEmpty }) else { status = "Заполните пустой раунд или перенесите в него вопросы"; return }
         for name in referencedAssets { guard let url = asset(name), FileManager.default.fileExists(atPath: url.path) else { status = "Не найден медиафайл"; return } }
         for r in quiz.rounds { for q in r.questions {
             if !q.issues.isEmpty { status = "\(r.title): \(q.issues.joined(separator: "; "))"; return }
@@ -454,17 +654,16 @@ struct Step {
         playing = true; paused = false; index = 0; enter()
     }
     func enter() {
-        player?.pause(); bleep?.stop(); player = nil; transitionElapsed = 0; publishedScores = false; mediaDone = true; waitingForMedia = false; elapsed = 0
+        playback.stop(); bleep?.stop(); transitionElapsed = 0; publishedScores = false; mediaDone = true; waitingForMedia = false; elapsed = 0
         scoreSnapshot = []; scoreRevealedIDs = []; scoreGroups = []; scoreRevealGroup = 0; scoreRevealElapsed = 0
         guard let s = step else { return }; remaining = s.duration
         if s.kind == .roundIntro, let url = asset(quiz.rounds[s.round].intro?.media) {
-            let p = AVPlayer(url: url); player = p; mediaDone = false; if !paused { p.play() }; return
+            mediaDone = false; playback.start(url: url,autoplay: !paused); return
         }
         if [.question,.repeated,.answer].contains(s.kind), let q = currentQuestion, let url = asset(s.kind == .answer ? (q.explanationMedia ?? q.media) : q.media) {
             mediaDone = false; waitingForMedia = s.kind == .question && q.afterMedia
-            let p = AVPlayer(url: url); player = p
-            p.seek(to: CMTime(seconds: s.kind == .answer && q.explanationMedia != nil ? 0 : q.start, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
-            if !paused { p.play() }
+            let explanation = s.kind == .answer && q.explanationMedia != nil
+            playback.start(url: url,start: explanation ? 0 : q.start,end: explanation ? 0 : q.end,autoplay: !paused)
         }
     }
     func tick() {
@@ -474,11 +673,13 @@ struct Step {
             if scoreRevealElapsed >= Double(max(1,quiz.scoreRevealSeconds ?? 3)) { revealNextScoreGroup() }
             return
         }
-        if s.kind == .roundIntro, !mediaDone, let p = player {
-            let duration = p.currentItem?.duration.seconds ?? .nan
-            if (duration.isFinite && p.currentTime().seconds >= duration-0.15) || p.currentItem?.status == .failed { p.pause(); mediaDone = true }
+        if !mediaDone {
+            if playback.finished {
+                mediaDone = true; waitingForMedia = false; bleep?.stop()
+                if let error = playback.error { status = "Ошибка воспроизведения: " + error }
+            } else if playback.loading { return }
         }
-        if s.kind != .roundIntro, !mediaDone, let p = player, let q = currentQuestion {
+        if !mediaDone, s.kind != .roundIntro, let p = player, let q = currentQuestion {
             let t = p.currentTime().seconds
             let censored = s.kind != .answer && q.bleepRanges.split(separator: ",").contains { range in
                 let parts = range.split(separator: "-").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
@@ -486,21 +687,16 @@ struct Step {
             }
             p.volume = censored ? 0 : 1
             if censored { if bleep == nil { bleep = try? AVAudioPlayer(contentsOf: Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/bleep.wav")); bleep?.numberOfLoops = -1 }; if bleep?.isPlaying != true { bleep?.play() } } else { bleep?.stop() }
-            let duration = p.currentItem?.duration.seconds ?? .nan
-            let fragmentEnd = s.kind == .answer && q.explanationMedia != nil ? 0 : q.end
-            if (fragmentEnd > 0 && t >= fragmentEnd) || (duration.isFinite && t >= duration-0.15) || p.currentItem?.status == .failed {
-                p.pause(); bleep?.stop(); mediaDone = true; waitingForMedia = false
-            }
         }
         guard ![.standings,.finish].contains(s.kind), s.duration > 0, !waitingForMedia else { return }
         elapsed += 0.2
         if elapsed >= 1 { remaining = max(0, remaining-1); elapsed -= 1 }
         if remaining == 0 && mediaDone { transitionElapsed += 0.2; if [.introduction,.repeatIntro,.answerPrompt,.repeated].contains(s.kind) || transitionElapsed >= 2 { next() } }
     }
-    func togglePause() { paused.toggle(); if paused { player?.pause(); bleep?.stop() } else if !mediaDone { player?.play() } }
+    func togglePause() { paused.toggle(); playback.setPaused(paused); if paused { bleep?.stop() } }
     func next() { if index+1 < steps.count { index += 1; enter() } }
     func back() { if index > 0 { index -= 1; enter() } }
-    func stop() { autosave(); player?.pause(); bleep?.stop(); player = nil; playing = false; screen = .editor; tv?.close(); tv = nil }
+    func stop() { autosave(); playback.stop(); bleep?.stop(); playing = false; screen = .editor; tv?.close(); tv = nil }
     func returnToMenu() { stop(); screen = .home }
     func showTV() {
         if tv != nil { tv?.makeKeyAndOrderFront(nil); return }
@@ -513,10 +709,45 @@ struct Step {
     }
 }
 
+
+struct DraggableQuestionRow: View {
+    @ObservedObject var studio: Studio
+    let roundID: UUID
+    let question: Question
+    let number: Int
+    let selected: Bool
+    let select: () -> Void
+    @State var targeted = false
+    var body: some View {
+        Button(action: select) {
+            HStack {
+                Image(systemName: "line.3.horizontal").foregroundStyle(.secondary)
+                Image(systemName: !question.issues.isEmpty ? "exclamationmark.triangle.fill" : question.media == nil ? "text.bubble" : "play.rectangle")
+                Text("\(number). " + (question.text.isEmpty ? "Новый вопрос" : question.text)).lineLimit(1)
+            }.padding(8).frame(maxWidth: .infinity,alignment: .leading)
+                .background(targeted ? Color.green.opacity(0.2) : selected ? Color.indigo.opacity(0.15) : .clear,in: RoundedRectangle(cornerRadius: 8))
+        }.buttonStyle(.plain).foregroundStyle(question.issues.isEmpty ? Color.primary : .orange)
+            .help((question.issues.isEmpty ? "Перетащите для изменения порядка или переноса в другой раунд" : question.issues.joined(separator: "\n")))
+            .onDrag { NSItemProvider(object: question.id.uuidString as NSString) }
+            .onDrop(of: [UTType.text],isTargeted: $targeted) { studio.acceptQuestionDrop($0,toRound: roundID,before: question.id) }
+    }
+}
+struct RoundDropTarget: View {
+    @ObservedObject var studio: Studio
+    let roundID: UUID
+    @State var targeted = false
+    var body: some View {
+        Text("Перетащите в конец раунда").font(.caption).foregroundStyle(targeted ? Color.green : .secondary)
+            .frame(maxWidth: .infinity,minHeight: 30).padding(4)
+            .background(targeted ? Color.green.opacity(0.15) : .clear,in: RoundedRectangle(cornerRadius: 6))
+            .onDrop(of: [UTType.text],isTargeted: $targeted) { studio.acceptQuestionDrop($0,toRound: roundID) }
+    }
+}
+
 @main struct QuizStudioApp: App {
     @StateObject var studio = Studio()
     var body: some Scene {
-        WindowGroup("Квиз Студия · 0.7.0") { Content(studio: studio).frame(minWidth: 1050,minHeight: 720).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if !studio.playing && studio.load(url) { studio.prepareGame() } } }
+        WindowGroup("Квиз Студия · 0.7.1") { Content(studio: studio).frame(minWidth: 1050,minHeight: 720).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if !studio.playing && studio.load(url) { studio.prepareGame() } } }
         .commands { CommandGroup(replacing: .newItem) { Button("Создать квиз") { studio.newQuiz() }.keyboardShortcut("n").disabled(studio.playing); Button("Открыть квиз…") { studio.open() }.keyboardShortcut("o").disabled(studio.playing); Button("Сохранить квиз…") { studio.save() }.keyboardShortcut("s") } }
     }
 }
@@ -544,16 +775,15 @@ struct Editor: View {
                 Text("КВИЗ СТУДИЯ").font(.headline).foregroundStyle(.secondary).padding(.horizontal)
                 List {
                     ForEach(Array(studio.quiz.rounds.enumerated()),id: \.element.id) { ri,r in
-                        Section(r.title) {
+                        Section {
                             ForEach(Array(r.questions.enumerated()),id: \.element.id) { qi,q in
-                                Button { studio.roundIndex = ri; studio.questionIndex = qi } label: {
-                                    HStack { Image(systemName: !q.issues.isEmpty ? "exclamationmark.triangle.fill" : q.media == nil ? "text.bubble" : "play.rectangle"); Text(q.text.isEmpty ? "Вопрос \(qi+1)" : q.text).lineLimit(1) }
-                                    .padding(6).frame(maxWidth: .infinity,alignment: .leading)
-                                    .background(studio.roundIndex == ri && studio.questionIndex == qi ? Color.indigo.opacity(0.15) : .clear,in: RoundedRectangle(cornerRadius: 8))
-                                }.buttonStyle(.plain)
-                                .foregroundStyle(q.issues.isEmpty ? Color.primary : Color.orange)
-                                .help(q.issues.isEmpty ? "Вопрос заполнен" : q.issues.joined(separator: "\n"))
+                                DraggableQuestionRow(studio: studio,roundID: r.id,question: q,number: qi+1,selected: studio.selectedQuestion?.id == q.id) {
+                                    studio.roundIndex = ri; studio.questionIndex = qi
+                                }
                             }
+                            RoundDropTarget(studio: studio,roundID: r.id)
+                        } header: {
+                            Button { studio.selectRound(r.id) } label: { Text(r.title + " · \(r.questions.count)") }.buttonStyle(.plain).help("Открыть настройки раунда")
                         }
                     }
                 }
@@ -571,12 +801,14 @@ struct Editor: View {
                 Divider()
                 ScrollView { VStack(alignment: .leading,spacing: 24) {
                     AppearanceEditor(studio: studio)
-                    RoundSettings(studio: studio, round: $studio.quiz.rounds[studio.roundIndex])
-                    QuestionEditor(studio: studio,question: $studio.quiz.rounds[studio.roundIndex].questions[studio.questionIndex])
+                    RoundSettings(studio: studio, round: studio.roundBinding(studio.quiz.rounds[studio.roundIndex].id))
+                    if let selected = studio.selectedQuestion {
+                        QuestionEditor(studio: studio,question: studio.questionBinding(selected.id)).id(selected.id)
+                    } else { Text("В этом раунде пока нет вопросов. Добавьте вопрос или перетащите его из другого раунда.").foregroundStyle(.secondary).padding() }
                     HStack {
                         Button("Добавить вопрос",systemImage: "plus") { studio.addQuestion() }.buttonStyle(.borderedProminent)
-                        if studio.quiz.rounds[studio.roundIndex].questions.count > 1 {
-                            Button("Удалить вопрос",role: .destructive) { studio.quiz.rounds[studio.roundIndex].questions.remove(at: studio.questionIndex); studio.questionIndex = 0 }
+                        if studio.selectedQuestion != nil {
+                            Button("Удалить вопрос",role: .destructive) { studio.deleteSelectedQuestion() }
                         }
                     }
                 }.padding(24) }
@@ -593,6 +825,7 @@ struct RoundSettings: View {
         GroupBox {
             VStack(alignment: .leading,spacing: 12) {
                 TextField("Название раунда",text: $round.title).font(.title3.bold())
+                if round.questions.isEmpty && studio.quiz.rounds.count > 1 { Button("Удалить пустой раунд",role: .destructive) { studio.deleteEmptyRound(round.id) } }
                 HStack { Toggle("Повтор вопросов",isOn: $round.repeatQuestions); if round.repeatQuestions { Stepper("По \(round.repeatSeconds) сек",value: $round.repeatSeconds,in: 1...300) } }
                 if round.repeatQuestions { Stepper("Экран перед повтором: \(round.repeatIntroSeconds ?? 5) сек",value: Binding(get: { round.repeatIntroSeconds ?? 5 },set: { round.repeatIntroSeconds = $0 }),in: 2...30) }
                 Stepper("Сдача бланков: \(round.breakSeconds == 0 ? "до команды ведущего" : "\(round.breakSeconds) сек")",value: $round.breakSeconds,in: 0...600,step: 5)
@@ -614,8 +847,8 @@ struct RoundSettings: View {
 struct QuestionEditor: View {
     @ObservedObject var studio: Studio
     @Binding var question: Question
-    @State var preview: AVPlayer?
-    @State var explanationPreview: AVPlayer?
+    @StateObject var preview = MediaSession()
+    @StateObject var explanationPreview = MediaSession()
     var body: some View {
         VStack(alignment: .leading,spacing: 16) {
             HStack { Text("Вопрос \(studio.questionIndex+1)").font(.title.bold()); Spacer(); Picker("Тип",selection: $question.kind) { ForEach(["Открытый вопрос","Один из четырёх","Сопоставление"],id: \.self) { Text($0) } }.frame(width: 300) }
@@ -650,9 +883,9 @@ struct QuestionEditor: View {
                         Text("При показе ответа звучит оригинал. Предпросмотр ниже воспроизводит исходный фрагмент.").font(.caption).foregroundStyle(.secondary)
                         HStack { Button("Просмотреть фрагмент") {
                             guard let url = studio.asset(question.media) else { return }
-                            preview?.pause(); let p = AVPlayer(url: url); p.seek(to: CMTime(seconds: max(0,question.start),preferredTimescale: 600)); if question.end > 0 { p.currentItem?.forwardPlaybackEndTime = CMTime(seconds: question.end,preferredTimescale: 600) }; preview = p; p.play()
-                        }; Button("Убрать медиа") { preview?.pause(); preview = nil; question.media = nil } }
-                        if let preview { VideoPlayer(player: preview).frame(height: 200) }
+                            explanationPreview.stop(); preview.start(url: url,start: question.start,end: question.end)
+                        }; Button("Убрать медиа") { preview.stop(); question.media = nil } }
+                        MediaPreview(session: preview)
                     }.padding(8)
                 }
             }
@@ -669,10 +902,10 @@ struct QuestionEditor: View {
                     }
                     if let url = studio.asset(question.explanationMedia) {
                         HStack {
-                            Button("Предпросмотр объяснения") { explanationPreview?.pause(); preview?.pause(); explanationPreview = AVPlayer(url: url); explanationPreview?.play() }
-                            Button("Убрать медиа объяснения") { explanationPreview?.pause(); explanationPreview = nil; question.explanationMedia = nil }
+                            Button("Предпросмотр объяснения") { preview.stop(); explanationPreview.start(url: url) }
+                            Button("Убрать медиа объяснения") { explanationPreview.stop(); question.explanationMedia = nil }
                         }
-                        if let explanationPreview { VideoPlayer(player: explanationPreview).frame(height: 180) }
+                        MediaPreview(session: explanationPreview)
                         Text("При показе ответа этот файл воспроизводится вместо медиа вопроса и до конца.").font(.caption).foregroundStyle(.secondary)
                     }
                 }.padding(8)
@@ -682,8 +915,8 @@ struct QuestionEditor: View {
         .onChange(of: question.kind) { _,kind in
             if kind == "Сопоставление" && question.matchPairs == nil { question.matchPairs = [MatchPair(),MatchPair()] }
         }
-        .onChange(of: question.id) { _,_ in preview?.pause(); preview = nil; explanationPreview?.pause(); explanationPreview = nil }
-        .onDisappear { preview?.pause(); explanationPreview?.pause() }
+        .onChange(of: question.id) { _,_ in preview.stop(); explanationPreview.stop() }
+        .onDisappear { preview.stop(); explanationPreview.stop() }
     }
 }
 struct PlayerView: View {
@@ -745,7 +978,7 @@ struct Stage: View {
                             if let intro = studio.quiz.rounds[s.round].intro {
                                 Text(studio.quiz.rounds[s.round].title).font(studio.stageFont(size: 46,weight: .bold))
                                 Text(intro.text).font(studio.stageFont(size: 28)).multilineTextAlignment(.center)
-                                if let player = studio.player { VideoPlayer(player: player).disabled(true).frame(height: geometry.size.height*0.35) }
+                                if let player = studio.player { if studio.playback.hasVideo { NativeMediaView(player: player,controls: false).frame(height: geometry.size.height*0.35) } else { Label("Аудиофрагмент",systemImage: "waveform") } }
                                 if let url = studio.asset(intro.image), let image = NSImage(contentsOf: url) { Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: geometry.size.height*0.3) }
                             }
                         case .repeatIntro:
@@ -774,12 +1007,14 @@ struct Stage: View {
                                 if s.kind == .answer, let explanation = q.explanation, !explanation.isEmpty { Text(explanation).font(studio.stageFont(size: 24)).multilineTextAlignment(.center) }
                                 if s.kind != .answer && q.kind == "Один из четырёх" { LazyVGrid(columns: [GridItem(.flexible()),GridItem(.flexible())],spacing: 12) { ForEach(0..<4,id: \.self) { i in Text("\(i+1). \(q.choices[i])").font(studio.stageFont(size: 24)).padding().frame(maxWidth: .infinity,alignment: .leading).background(.white.opacity(0.08),in: RoundedRectangle(cornerRadius: 12)) } } }
                                 if let p = studio.player {
-                                    if s.kind == .answer ? (q.explanationMedia != nil || q.answerVideo) : !q.audioOnly { VideoPlayer(player: p).disabled(true).frame(height: geometry.size.height*0.38) }
+                                    if studio.playback.hasVideo && (s.kind == .answer ? (q.explanationMedia != nil || q.answerVideo) : !q.audioOnly) { NativeMediaView(player: p,controls: false).frame(height: geometry.size.height*0.38) }
                                     else { Label("Аудиофрагмент",systemImage: "waveform").font(studio.stageFont(size: 28)).padding(30) }
                                 }
                                 if let url = studio.asset(s.kind == .answer ? (q.explanationImage ?? q.image) : q.image), let image = NSImage(contentsOf: url) { Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: geometry.size.height*(studio.player == nil ? 0.4 : 0.2)) }
                             }
                         }
+                        if studio.playback.loading { Text("Открываем фрагмент…").font(.caption) }
+                        if studio.playback.error != nil { Text("Не удалось воспроизвести фрагмент. Ведущий может вернуться в редактор.").font(.caption).foregroundStyle(.orange) }
                         if s.showsTimer { Text(studio.waitingForMedia ? "Слушаем и смотрим…" : (s.duration == 0 ? "Продолжит ведущий" : (studio.remaining == 0 ? (s.kind == .repeated ? "" : "Время вышло") : "\(studio.remaining / 60):\(String(format: "%02d",studio.remaining % 60))"))).font(.system(size: 36,weight: .medium,design: .monospaced)).foregroundStyle(studio.remaining <= 10 && !studio.waitingForMedia ? .orange : .white) }
                         if studio.paused { Text("ПАУЗА").font(studio.stageFont(size: 17,weight: .semibold)).tracking(4).foregroundStyle(.orange) }
                     }.padding(40).padding(.bottom,50).frame(maxWidth: 1100).frame(maxWidth: .infinity,maxHeight: .infinity,alignment: [.answerPrompt,.answer].contains(s.kind) ? .top : .center)
@@ -1032,7 +1267,7 @@ struct RoundIntroEditor: View {
     @ObservedObject var studio: Studio
     @Binding var intro: RoundIntro
     @Environment(\.dismiss) var dismiss
-    @State var preview: AVPlayer?
+    @StateObject var preview = MediaSession()
     var body: some View {
         VStack(alignment: .leading,spacing: 18) {
             Text("Объяснение раунда").font(.largeTitle.bold())
@@ -1047,13 +1282,13 @@ struct RoundIntroEditor: View {
                 Button("Убрать картинку") { intro.image = nil }
             }
             if let url = studio.asset(intro.media) {
-                HStack { Button("Предпросмотр") { preview?.pause(); preview = AVPlayer(url: url); preview?.play() }; Button("Убрать медиа") { preview?.pause(); preview = nil; intro.media = nil } }
-                if let preview { VideoPlayer(player: preview).frame(height: 160) }
+                HStack { Button("Предпросмотр") { preview.start(url: url) }; Button("Убрать медиа") { preview.stop(); intro.media = nil } }
+                MediaPreview(session: preview)
             }
             Stepper("Показ: \(intro.seconds == 0 ? "до команды ведущего" : "\(intro.seconds) сек")",value: $intro.seconds,in: 0...300,step: 5)
             Text("Если есть медиа, переход дождётся окончания записи. Таймер зрителям не показывается.").font(.caption).foregroundStyle(.secondary)
             HStack { Spacer(); Button("Готово") { dismiss() }.buttonStyle(.borderedProminent) }
-        }.padding(28).frame(width: 650).onDisappear { preview?.pause() }
+        }.padding(28).frame(width: 650).onDisappear { preview.stop() }
     }
 }
 
