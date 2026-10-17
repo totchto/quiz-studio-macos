@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import AVKit
 import UniformTypeIdentifiers
+import CoreText
 
 struct MatchPair: Codable, Identifiable, Equatable {
     var id = UUID()
@@ -72,6 +73,7 @@ struct Round: Codable, Identifiable, Equatable {
     var questions = [Question()]
     var repeatQuestions = false
     var repeatSeconds = 10
+    var repeatIntroSeconds: Int? = nil
     var breakSeconds = 30
     var showAnswers = true
     var standings = false
@@ -85,10 +87,19 @@ struct Team: Codable, Identifiable, Equatable {
     var scores: [String: Int] = [:]
     var total: Int { scores.values.reduce(0,+) }
 }
+struct QuizAppearance: Codable, Equatable {
+    var fontName: String? = nil
+    var fontFile: String? = nil
+    var background = "Стандартный"
+    var backgroundImage: String? = nil
+    var imageDimming = 0.55
+}
 struct Quiz: Codable, Equatable {
     var title = "Новый квиз"
     var rounds = [Round()]
     var teams: [Team] = []
+    var appearance: QuizAppearance? = nil
+    var scoreRevealSeconds: Int? = nil
 }
 struct QuizFile: Codable {
     var version = 1
@@ -96,7 +107,7 @@ struct QuizFile: Codable {
     var assets: [String: Data]
 }
 struct Step {
-    enum Kind { case introduction, roundIntro, question, repeated, answerPrompt, answer, pause, standings, finish }
+    enum Kind { case introduction, roundIntro, question, repeatIntro, repeated, answerPrompt, answer, pause, standings, finish }
     var kind: Kind
     var round: Int
     var question: Int = 0
@@ -121,6 +132,12 @@ struct Step {
     @Published var index = 0
     @Published var status = ""
     @Published var publishedScores = false
+    @Published var scoreSnapshot: [Team] = []
+    @Published var scoreRevealedIDs: Set<UUID> = []
+    @Published var scoreRevealGroup = 0
+    @Published var registeredFontName: String? = nil
+    var scoreGroups: [[Team]] = []
+    var scoreRevealElapsed: Double = 0
     @Published var player: AVPlayer? = nil
     var steps: [Step] = []
     var matchLayouts: [UUID: MatchLayout] = [:]
@@ -238,7 +255,7 @@ struct Step {
         try JSONEncoder().encode(quiz.teams).write(to: url.appendingPathComponent("game-results.json"),options: .atomic)
     }
     var referencedAssets: [String] {
-        Array(Set(quiz.rounds.flatMap { r in
+        Array(Set([quiz.appearance?.fontFile,quiz.appearance?.backgroundImage].compactMap({$0}) + quiz.rounds.flatMap { r in
             [r.intro?.image,r.intro?.media].compactMap({$0}) + r.questions.flatMap { q in [q.image,q.media,q.explanationImage,q.explanationMedia].compactMap({$0}) }
         })).sorted()
     }
@@ -314,10 +331,13 @@ struct Step {
             }
             guard !decoded.rounds.isEmpty, decoded.rounds.allSatisfy({ !$0.questions.isEmpty && $0.questions.allSatisfy { $0.choices.count == 4 } }) else { throw CocoaError(.fileReadCorruptFile) }
             quiz = decoded; folder = mediaFolder; documentURL = url.standardizedFileURL == draft.standardizedFileURL ? nil : url
-            roundIndex = 0; questionIndex = 0; remember(url); status = ""; return true
+            roundIndex = 0; questionIndex = 0; remember(url); status = ""
+            registeredFontName = asset(quiz.appearance?.fontFile).flatMap { registerFont($0) }
+            if quiz.appearance?.fontFile != nil && registeredFontName == nil { status = "Шрифт не удалось открыть — используется системный" }
+            return true
         } catch { status = "Не удалось открыть квиз: \(error.localizedDescription)"; return false }
     }
-    func newQuiz() { autosave(); screen = .editor; quiz = Quiz(); folder = nil; documentURL = nil; roundIndex = 0; questionIndex = 0; status = "Создан новый квиз" }
+    func newQuiz() { autosave(); screen = .editor; quiz = Quiz(); registeredFontName = nil; folder = nil; documentURL = nil; roundIndex = 0; questionIndex = 0; status = "Создан новый квиз" }
     func attach(image: Bool, explanation: Bool = false, roundIntro: Bool = false) {
         let panel = NSOpenPanel(); panel.allowedContentTypes = image ? [.image] : [.audio,.movie]
         if panel.runModal() == .OK, let url = panel.url {
@@ -337,6 +357,67 @@ struct Step {
                 else { quiz.rounds[roundIndex].questions[questionIndex].media = name }
             } catch { status = error.localizedDescription }
         }
+    }
+    var presentationFontName: String? {
+        quiz.appearance?.fontFile != nil ? registeredFontName : quiz.appearance?.fontName
+    }
+    func stageFont(size: CGFloat,weight: Font.Weight = .regular) -> Font {
+        if let name = presentationFontName { return .custom(name,size: size).weight(weight) }
+        return .system(size: size,weight: weight)
+    }
+    func registerFont(_ url: URL) -> String? {
+        CTFontManagerRegisterFontsForURL(url as CFURL,.process,nil)
+        guard let descriptors = CTFontManagerCreateFontDescriptorsFromURL(url as CFURL) as? [CTFontDescriptor],
+              let descriptor = descriptors.first,
+              let name = CTFontDescriptorCopyAttribute(descriptor,kCTFontNameAttribute) as? String,
+              NSFont(name: name,size: 24) != nil else { return nil }
+        return name
+    }
+    func importAppearance(font: Bool) {
+        let panel = NSOpenPanel()
+        panel.title = font ? "Выберите файл шрифта" : "Выберите фон квиза"
+        panel.allowedContentTypes = font ? ["ttf","otf","ttc"].compactMap { UTType(filenameExtension: $0) } : [.image]
+        guard panel.runModal() == .OK, let source = panel.url else { return }
+        do {
+            let root = folder ?? draft
+            let dir = root.appendingPathComponent("Media")
+            try FileManager.default.createDirectory(at: dir,withIntermediateDirectories: true)
+            let name = UUID().uuidString + "." + source.pathExtension
+            let dest = dir.appendingPathComponent(name)
+            try FileManager.default.copyItem(at: source,to: dest)
+            var appearance = quiz.appearance ?? QuizAppearance()
+            if font {
+                guard let registered = registerFont(dest) else { status = "Не удалось открыть шрифт. Выберите TTF, OTF или TTC."; return }
+                registeredFontName = registered; appearance.fontName = registered; appearance.fontFile = name
+            } else {
+                guard NSImage(contentsOf: dest) != nil else { status = "Не удалось открыть картинку фона"; return }
+                appearance.backgroundImage = name
+            }
+            folder = root; quiz.appearance = appearance
+            status = font ? "Шрифт добавлен в квиз" : "Фон добавлен в квиз"
+        } catch { status = error.localizedDescription }
+    }
+    func publishScores() {
+        scoreSnapshot = quiz.teams.sorted { $0.total == $1.total ? $0.name.localizedStandardCompare($1.name) == .orderedAscending : $0.total > $1.total }
+        let grouped = Dictionary(grouping: scoreSnapshot,by: \.total)
+        scoreGroups = grouped.keys.sorted().map { grouped[$0]! }
+        scoreRevealedIDs = []; scoreRevealGroup = 0; scoreRevealElapsed = 0
+        publishedScores = true
+    }
+    var scoresFullyRevealed: Bool { scoreRevealGroup >= scoreGroups.count }
+    var nextScoreRank: Int? {
+        guard scoreGroups.indices.contains(scoreRevealGroup), let team = scoreGroups[scoreRevealGroup].first else { return nil }
+        return 1 + scoreSnapshot.filter { $0.total > team.total }.count
+    }
+    func revealNextScoreGroup() {
+        guard scoreGroups.indices.contains(scoreRevealGroup) else { return }
+        withAnimation(.easeInOut(duration: 0.85)) {
+            scoreRevealedIDs.formUnion(scoreGroups[scoreRevealGroup].map(\.id)); scoreRevealGroup += 1
+        }
+        scoreRevealElapsed = 0
+    }
+    func revealAllScores() {
+        withAnimation(.easeInOut(duration: 0.85)) { scoreRevealedIDs = Set(scoreSnapshot.map(\.id)); scoreRevealGroup = scoreGroups.count }
     }
     func asset(_ name: String?) -> URL? { guard let name, let folder, name == (name as NSString).lastPathComponent, !name.contains("\\"), name != ".", name != ".." else { return nil }; return folder.appendingPathComponent("Media").appendingPathComponent(name) }
     func addRound() { quiz.rounds.append(Round(title: "Раунд \(quiz.rounds.count + 1)")); roundIndex = quiz.rounds.count-1; questionIndex = 0 }
@@ -364,7 +445,7 @@ struct Step {
         for (ri,r) in quiz.rounds.enumerated() {
             if let intro = r.intro { steps.append(Step(kind: .roundIntro,round: ri,duration: intro.seconds)) }
             for (qi,q) in r.questions.enumerated() { steps.append(Step(kind: .question,round: ri,question: qi,duration: q.seconds)) }
-            if r.repeatQuestions { for qi in r.questions.indices { steps.append(Step(kind: .repeated,round: ri,question: qi,duration: r.repeatSeconds)) } }
+            if r.repeatQuestions { steps.append(Step(kind: .repeatIntro,round: ri,duration: r.repeatIntroSeconds ?? 5)); for qi in r.questions.indices { steps.append(Step(kind: .repeated,round: ri,question: qi,duration: r.repeatSeconds)) } }
             steps.append(Step(kind: .pause,round: ri,duration: r.breakSeconds))
             if r.showAnswers { for (qi,q) in r.questions.enumerated() { steps.append(Step(kind: .answerPrompt,round: ri,question: qi,duration: 4)); steps.append(Step(kind: .answer,round: ri,question: qi,duration: q.answerSeconds)) } }
             if r.standings { steps.append(Step(kind: .standings,round: ri,duration: 0)) }
@@ -374,6 +455,7 @@ struct Step {
     }
     func enter() {
         player?.pause(); bleep?.stop(); player = nil; transitionElapsed = 0; publishedScores = false; mediaDone = true; waitingForMedia = false; elapsed = 0
+        scoreSnapshot = []; scoreRevealedIDs = []; scoreGroups = []; scoreRevealGroup = 0; scoreRevealElapsed = 0
         guard let s = step else { return }; remaining = s.duration
         if s.kind == .roundIntro, let url = asset(quiz.rounds[s.round].intro?.media) {
             let p = AVPlayer(url: url); player = p; mediaDone = false; if !paused { p.play() }; return
@@ -387,6 +469,11 @@ struct Step {
     }
     func tick() {
         guard playing, !paused, let s = step else { return }
+        if s.kind == .standings && publishedScores && !scoresFullyRevealed {
+            scoreRevealElapsed += 0.2
+            if scoreRevealElapsed >= Double(max(1,quiz.scoreRevealSeconds ?? 3)) { revealNextScoreGroup() }
+            return
+        }
         if s.kind == .roundIntro, !mediaDone, let p = player {
             let duration = p.currentItem?.duration.seconds ?? .nan
             if (duration.isFinite && p.currentTime().seconds >= duration-0.15) || p.currentItem?.status == .failed { p.pause(); mediaDone = true }
@@ -408,7 +495,7 @@ struct Step {
         guard ![.standings,.finish].contains(s.kind), s.duration > 0, !waitingForMedia else { return }
         elapsed += 0.2
         if elapsed >= 1 { remaining = max(0, remaining-1); elapsed -= 1 }
-        if remaining == 0 && mediaDone { transitionElapsed += 0.2; if [.introduction,.answerPrompt,.repeated].contains(s.kind) || transitionElapsed >= 2 { next() } }
+        if remaining == 0 && mediaDone { transitionElapsed += 0.2; if [.introduction,.repeatIntro,.answerPrompt,.repeated].contains(s.kind) || transitionElapsed >= 2 { next() } }
     }
     func togglePause() { paused.toggle(); if paused { player?.pause(); bleep?.stop() } else if !mediaDone { player?.play() } }
     func next() { if index+1 < steps.count { index += 1; enter() } }
@@ -429,7 +516,7 @@ struct Step {
 @main struct QuizStudioApp: App {
     @StateObject var studio = Studio()
     var body: some Scene {
-        WindowGroup("Квиз Студия · 0.6.0") { Content(studio: studio).frame(minWidth: 1050,minHeight: 720).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if !studio.playing && studio.load(url) { studio.prepareGame() } } }
+        WindowGroup("Квиз Студия · 0.7.0") { Content(studio: studio).frame(minWidth: 1050,minHeight: 720).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if !studio.playing && studio.load(url) { studio.prepareGame() } } }
         .commands { CommandGroup(replacing: .newItem) { Button("Создать квиз") { studio.newQuiz() }.keyboardShortcut("n").disabled(studio.playing); Button("Открыть квиз…") { studio.open() }.keyboardShortcut("o").disabled(studio.playing); Button("Сохранить квиз…") { studio.save() }.keyboardShortcut("s") } }
     }
 }
@@ -483,6 +570,7 @@ struct Editor: View {
                 }.padding(22)
                 Divider()
                 ScrollView { VStack(alignment: .leading,spacing: 24) {
+                    AppearanceEditor(studio: studio)
                     RoundSettings(studio: studio, round: $studio.quiz.rounds[studio.roundIndex])
                     QuestionEditor(studio: studio,question: $studio.quiz.rounds[studio.roundIndex].questions[studio.questionIndex])
                     HStack {
@@ -506,6 +594,7 @@ struct RoundSettings: View {
             VStack(alignment: .leading,spacing: 12) {
                 TextField("Название раунда",text: $round.title).font(.title3.bold())
                 HStack { Toggle("Повтор вопросов",isOn: $round.repeatQuestions); if round.repeatQuestions { Stepper("По \(round.repeatSeconds) сек",value: $round.repeatSeconds,in: 1...300) } }
+                if round.repeatQuestions { Stepper("Экран перед повтором: \(round.repeatIntroSeconds ?? 5) сек",value: Binding(get: { round.repeatIntroSeconds ?? 5 },set: { round.repeatIntroSeconds = $0 }),in: 2...30) }
                 Stepper("Сдача бланков: \(round.breakSeconds == 0 ? "до команды ведущего" : "\(round.breakSeconds) сек")",value: $round.breakSeconds,in: 0...600,step: 5)
                 Toggle("Показать ответы после раунда",isOn: $round.showAnswers)
                 Toggle("Промежуточные итоги после раунда",isOn: $round.standings)
@@ -617,6 +706,7 @@ struct PlayerView: View {
                     Button(studio.paused ? "Продолжить" : "Пауза") { studio.togglePause() }
                     Button("Вперёд") { studio.next() }
                     Button("+30 сек") { studio.remaining += 30 }
+                    if studio.step?.kind == .standings && studio.publishedScores && !studio.scoresFullyRevealed { Button("Показать все места") { studio.revealAllScores() } }
                     Button("Заново") { studio.enter() }
                     Button("Экран ТВ") { studio.showTV() }
                     Button("На весь экран") { NSApp.keyWindow?.toggleFullScreen(nil) }
@@ -640,53 +730,58 @@ struct Stage: View {
     var body: some View {
         GeometryReader { geometry in
             ZStack {
-                LinearGradient(colors: [Color(red: 0.06,green: 0.07,blue: 0.17),Color(red: 0.18,green: 0.12,blue: 0.35)],startPoint: .topLeading,endPoint: .bottomTrailing)
+                QuizBackground(studio: studio)
                 if let s = studio.step {
                     VStack(spacing: 24) {
-                        Text(studio.quiz.title.uppercased()).font(.system(size: 18,weight: .semibold)).tracking(4).foregroundStyle(.white.opacity(0.5))
+                        Text(studio.quiz.title.uppercased()).font(studio.stageFont(size: 18,weight: .semibold)).tracking(4).foregroundStyle(.white.opacity(0.5))
                         switch s.kind {
                         case .introduction:
                             if studio.quiz.teams.indices.contains(s.question) {
-                                Text("Встречаем команду!").font(.title).foregroundStyle(.white.opacity(0.7))
-                                Text(studio.quiz.teams[s.question].name).font(.system(size: 64,weight: .bold)).multilineTextAlignment(.center)
-                                Text("Ваши аплодисменты").font(.title2).foregroundStyle(.orange)
+                                Text("Встречаем команду!").font(studio.stageFont(size: 28)).foregroundStyle(.white.opacity(0.7))
+                                Text(studio.quiz.teams[s.question].name).font(studio.stageFont(size: 64,weight: .bold)).multilineTextAlignment(.center)
+                                Text("Ваши аплодисменты").font(studio.stageFont(size: 24)).foregroundStyle(.orange)
                             }
                         case .roundIntro:
                             if let intro = studio.quiz.rounds[s.round].intro {
-                                Text(studio.quiz.rounds[s.round].title).font(.system(size: 46,weight: .bold))
-                                Text(intro.text).font(.title).multilineTextAlignment(.center)
+                                Text(studio.quiz.rounds[s.round].title).font(studio.stageFont(size: 46,weight: .bold))
+                                Text(intro.text).font(studio.stageFont(size: 28)).multilineTextAlignment(.center)
                                 if let player = studio.player { VideoPlayer(player: player).disabled(true).frame(height: geometry.size.height*0.35) }
                                 if let url = studio.asset(intro.image), let image = NSImage(contentsOf: url) { Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: geometry.size.height*0.3) }
                             }
-                        case .pause: Text("Сдаём бланки").font(.system(size: 52,weight: .bold)); Text("Спасибо! Скоро продолжим").font(.title)
-                        case .finish: Text("Спасибо за игру!").font(.system(size: 56,weight: .bold))
+                        case .repeatIntro:
+                            Image(systemName: "arrow.counterclockwise").font(studio.stageFont(size: 52))
+                            Text("Сейчас повторим вопросы").font(studio.stageFont(size: 48,weight: .bold))
+                            Text("Проверьте записи и дополните ответы").font(studio.stageFont(size: 26))
+                            Text(studio.quiz.rounds[s.round].title).font(studio.stageFont(size: 22)).foregroundStyle(.white.opacity(0.65))
+                        case .pause: Text("Сдаём бланки").font(studio.stageFont(size: 52,weight: .bold)); Text("Спасибо! Скоро продолжим").font(studio.stageFont(size: 28))
+                        case .finish: Text("Спасибо за игру!").font(studio.stageFont(size: 56,weight: .bold))
                         case .standings:
-                            if studio.publishedScores { Scores(studio: studio) } else { Text("Подводим итоги").font(.system(size: 52,weight: .bold)); Text("Небольшой перерыв").font(.title) }
+                            if studio.publishedScores { Scores(studio: studio) } else { Text("Подводим итоги").font(studio.stageFont(size: 52,weight: .bold)); Text("Небольшой перерыв").font(studio.stageFont(size: 28)) }
                         default:
                             if let q = studio.currentQuestion {
-                                Text("\(studio.quiz.rounds[s.round].title) · \(s.kind == .answer ? "Ответ" : s.kind == .answerPrompt ? "Ответ" : s.kind == .repeated ? "Повтор" : "Вопрос") \(s.question+1)").font(.title3).foregroundStyle(.white.opacity(0.65))
-                                Text(q.text).font(.system(size: min(48,geometry.size.width/22),weight: .semibold)).multilineTextAlignment(.center).fixedSize(horizontal: false,vertical: true)
+                                Text("\(studio.quiz.rounds[s.round].title) · \(s.kind == .answer ? "Ответ" : s.kind == .answerPrompt ? "Ответ" : s.kind == .repeated ? "Повтор" : "Вопрос") \(s.question+1)").font(studio.stageFont(size: 20)).foregroundStyle(.white.opacity(0.65))
+                                Text(q.text).font(studio.stageFont(size: min(48,geometry.size.width/22),weight: .semibold)).multilineTextAlignment(.center).fixedSize(horizontal: false,vertical: true)
                                 if s.kind == .answer || s.kind == .answerPrompt {
                                     Group {
                                         if s.kind == .answer && !(q.kind == "Сопоставление" && q.matchPairs != nil) {
-                                            Text(q.correctAnswer).font(.system(size: 38,weight: .bold)).foregroundStyle(.green).multilineTextAlignment(.center)
-                                        } else if s.kind == .answerPrompt { Text(" ").font(.system(size: 38,weight: .bold)) }
+                                            Text(q.correctAnswer).font(studio.stageFont(size: 38,weight: .bold)).foregroundStyle(.green).multilineTextAlignment(.center)
+                                        } else if s.kind == .answerPrompt { Text(" ").font(studio.stageFont(size: 38,weight: .bold)) }
                                     }.frame(maxWidth: .infinity,minHeight: 70).padding(12).background(.white.opacity(s.kind == .answer ? 0.07 : 0),in: RoundedRectangle(cornerRadius: 12))
                                 }
                                 if q.kind == "Сопоставление", let pairs = q.matchPairs {
-                                    MatchingBoard(pairs: pairs,layout: studio.matchLayouts[q.id] ?? MatchLayout(left: pairs.map(\.id),right: pairs.map(\.id)),reveal: s.kind == .answer)
+                                    MatchingBoard(pairs: pairs,layout: studio.matchLayouts[q.id] ?? MatchLayout(left: pairs.map(\.id),right: pairs.map(\.id)),reveal: s.kind == .answer,font: studio.stageFont(size: 24))
                                 }
-                                if s.kind == .answer, let explanation = q.explanation, !explanation.isEmpty { Text(explanation).font(.title2).multilineTextAlignment(.center) }
-                                if s.kind != .answer && q.kind == "Один из четырёх" { LazyVGrid(columns: [GridItem(.flexible()),GridItem(.flexible())],spacing: 12) { ForEach(0..<4,id: \.self) { i in Text("\(i+1). \(q.choices[i])").font(.title2).padding().frame(maxWidth: .infinity,alignment: .leading).background(.white.opacity(0.08),in: RoundedRectangle(cornerRadius: 12)) } } }
+                                if s.kind == .answer, let explanation = q.explanation, !explanation.isEmpty { Text(explanation).font(studio.stageFont(size: 24)).multilineTextAlignment(.center) }
+                                if s.kind != .answer && q.kind == "Один из четырёх" { LazyVGrid(columns: [GridItem(.flexible()),GridItem(.flexible())],spacing: 12) { ForEach(0..<4,id: \.self) { i in Text("\(i+1). \(q.choices[i])").font(studio.stageFont(size: 24)).padding().frame(maxWidth: .infinity,alignment: .leading).background(.white.opacity(0.08),in: RoundedRectangle(cornerRadius: 12)) } } }
                                 if let p = studio.player {
                                     if s.kind == .answer ? (q.explanationMedia != nil || q.answerVideo) : !q.audioOnly { VideoPlayer(player: p).disabled(true).frame(height: geometry.size.height*0.38) }
-                                    else { Label("Аудиофрагмент",systemImage: "waveform").font(.title).padding(30) }
+                                    else { Label("Аудиофрагмент",systemImage: "waveform").font(studio.stageFont(size: 28)).padding(30) }
                                 }
                                 if let url = studio.asset(s.kind == .answer ? (q.explanationImage ?? q.image) : q.image), let image = NSImage(contentsOf: url) { Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: geometry.size.height*(studio.player == nil ? 0.4 : 0.2)) }
                             }
                         }
                         if s.showsTimer { Text(studio.waitingForMedia ? "Слушаем и смотрим…" : (s.duration == 0 ? "Продолжит ведущий" : (studio.remaining == 0 ? (s.kind == .repeated ? "" : "Время вышло") : "\(studio.remaining / 60):\(String(format: "%02d",studio.remaining % 60))"))).font(.system(size: 36,weight: .medium,design: .monospaced)).foregroundStyle(studio.remaining <= 10 && !studio.waitingForMedia ? .orange : .white) }
-                        if studio.paused { Text("ПАУЗА").font(.headline).tracking(4).foregroundStyle(.orange) }
+                        if studio.paused { Text("ПАУЗА").font(studio.stageFont(size: 17,weight: .semibold)).tracking(4).foregroundStyle(.orange) }
                     }.padding(40).padding(.bottom,50).frame(maxWidth: 1100).frame(maxWidth: .infinity,maxHeight: .infinity,alignment: [.answerPrompt,.answer].contains(s.kind) ? .top : .center)
                 }
             }.foregroundStyle(.white)
@@ -711,7 +806,7 @@ struct ScoreEditor: View {
                     }
                 }.textFieldStyle(.roundedBorder)
             }
-            HStack { Button("Показать итоги") { studio.publishedScores = true }.buttonStyle(.borderedProminent) }
+            HStack { Button("Показать итоги") { studio.publishScores() }.buttonStyle(.borderedProminent) }
             Spacer()
         }.padding(40).padding(.bottom,70)
     }
@@ -719,10 +814,31 @@ struct ScoreEditor: View {
 struct Scores: View {
     @ObservedObject var studio: Studio
     var body: some View {
-        VStack(spacing: 12) {
-            Text("Результаты игры").font(.system(size: 44,weight: .bold))
-            ForEach(studio.quiz.teams.sorted { $0.total == $1.total ? $0.name.localizedStandardCompare($1.name) == .orderedAscending : $0.total > $1.total }) { team in
-                HStack { Text("\(1 + studio.quiz.teams.filter { $0.total > team.total }.count)").foregroundStyle(.orange).frame(width: 50); Text(team.name); Spacer(); Text("\(team.total)").bold() }.font(.title).padding(10).background(.white.opacity(0.07),in: RoundedRectangle(cornerRadius: 10))
+        VStack(spacing: 16) {
+            Text("Промежуточные итоги").font(studio.stageFont(size: 44,weight: .bold))
+            if let rank = studio.nextScoreRank {
+                Text("Сейчас узнаем, кто занимает \(rank)-е место…").font(studio.stageFont(size: 24)).foregroundStyle(.white.opacity(0.75)).id(rank).transition(.opacity)
+            } else { Text("Все результаты объявлены").font(studio.stageFont(size: 24)).foregroundStyle(.white.opacity(0.65)) }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(spacing: 12) {
+                        ForEach(studio.scoreSnapshot) { team in
+                            let rank = 1 + studio.scoreSnapshot.filter { $0.total > team.total }.count
+                            HStack {
+                                Text("\(rank)").foregroundStyle(rank <= 3 ? .yellow : .orange).frame(width: 55)
+                                if studio.scoreRevealedIDs.contains(team.id) {
+                                    Text(team.name).transition(.opacity.combined(with: .move(edge: .bottom)))
+                                    Spacer()
+                                    Text("\(team.total)").bold().transition(.opacity.combined(with: .scale(scale: 0.8)))
+                                } else { Text("•••").foregroundStyle(.white.opacity(0.25)); Spacer() }
+                            }.font(studio.stageFont(size: 28)).padding(16)
+                                .background(.white.opacity(studio.scoreRevealedIDs.contains(team.id) ? 0.12 : 0.035),in: RoundedRectangle(cornerRadius: 12)).id(team.id)
+                        }
+                    }
+                }.frame(maxHeight: 500)
+                .onChange(of: studio.scoreRevealedIDs) { _,ids in
+                    if let newest = studio.scoreSnapshot.first(where: { ids.contains($0.id) }) { withAnimation(.easeInOut(duration: 0.8)) { proxy.scrollTo(newest.id,anchor: .center) } }
+                }
             }
         }
     }
@@ -848,6 +964,7 @@ struct MatchingBoard: View {
     let pairs: [MatchPair]
     let layout: MatchLayout
     let reveal: Bool
+    var font: Font = .title2
     var body: some View {
         HStack(alignment: .top,spacing: 35) {
             VStack(alignment: .leading,spacing: 14) {
@@ -862,7 +979,7 @@ struct MatchingBoard: View {
                     if let pair = pairs.first(where: { $0.id == id }) { HStack(alignment: .top) { Text("\(MatchLayout.letter(i)).").foregroundStyle(.orange); Text(pair.right) }.frame(maxWidth: .infinity,alignment: .leading) }
                 }
             }
-        }.font(.title2).padding(20).background(.white.opacity(0.06),in: RoundedRectangle(cornerRadius: 14))
+        }.font(font).padding(20).background(.white.opacity(0.06),in: RoundedRectangle(cornerRadius: 14))
     }
 }
 class SelectableScoreTextField: NSTextField {
@@ -937,5 +1054,61 @@ struct RoundIntroEditor: View {
             Text("Если есть медиа, переход дождётся окончания записи. Таймер зрителям не показывается.").font(.caption).foregroundStyle(.secondary)
             HStack { Spacer(); Button("Готово") { dismiss() }.buttonStyle(.borderedProminent) }
         }.padding(28).frame(width: 650).onDisappear { preview?.pause() }
+    }
+}
+
+struct QuizBackground: View {
+    @ObservedObject var studio: Studio
+    var colors: [Color] {
+        switch studio.quiz.appearance?.background ?? "Стандартный" {
+        case "Ночной": return [.black,Color(white: 0.12)]
+        case "Океан": return [Color(red: 0.02,green: 0.1,blue: 0.2),Color(red: 0.04,green: 0.3,blue: 0.38)]
+        case "Лес": return [Color(red: 0.03,green: 0.12,blue: 0.1),Color(red: 0.14,green: 0.28,blue: 0.16)]
+        case "Бордовый": return [Color(red: 0.15,green: 0.04,blue: 0.1),Color(red: 0.35,green: 0.09,blue: 0.2)]
+        default: return [Color(red: 0.06,green: 0.07,blue: 0.17),Color(red: 0.18,green: 0.12,blue: 0.35)]
+        }
+    }
+    var body: some View {
+        GeometryReader { g in
+            ZStack {
+                LinearGradient(colors: colors,startPoint: .topLeading,endPoint: .bottomTrailing)
+                if let url = studio.asset(studio.quiz.appearance?.backgroundImage), let image = NSImage(contentsOf: url) {
+                    Image(nsImage: image).resizable().scaledToFill().frame(width: g.size.width,height: g.size.height).clipped()
+                    Color.black.opacity(min(0.9,max(0,studio.quiz.appearance?.imageDimming ?? 0.55)))
+                }
+            }
+        }.clipped()
+    }
+}
+struct AppearanceEditor: View {
+    @ObservedObject var studio: Studio
+    @State var expanded = false
+    let families = NSFontManager.shared.availableFontFamilies.sorted()
+    var appearance: Binding<QuizAppearance> { Binding(get: { studio.quiz.appearance ?? QuizAppearance() },set: { studio.quiz.appearance = $0 }) }
+    var body: some View {
+        DisclosureGroup("Оформление квиза и показ результатов",isExpanded: $expanded) {
+            VStack(alignment: .leading,spacing: 14) {
+                Picker("Шрифт на экране",selection: Binding(get: { studio.quiz.appearance?.fontName ?? "" },set: { name in
+                    var style = studio.quiz.appearance ?? QuizAppearance(); style.fontName = name.isEmpty ? nil : name; style.fontFile = nil; studio.registeredFontName = nil; studio.quiz.appearance = style
+                })) {
+                    Text("Стандартный системный").tag("")
+                    if let file = studio.quiz.appearance?.fontFile, !file.isEmpty, let name = studio.quiz.appearance?.fontName { Text("Из файла: " + name).tag(name) }
+                    ForEach(families,id: \.self) { family in
+                        if let font = NSFontManager.shared.font(withFamily: family,traits: [],weight: 5,size: 24), studio.quiz.appearance?.fontFile == nil || font.fontName != studio.quiz.appearance?.fontName { Text(family).tag(font.fontName) }
+                    }
+                }
+                HStack { Button("Добавить шрифт файлом…") { studio.importAppearance(font: true) }; Text("TTF, OTF, TTC · файлы сохраняются внутри .quiz").font(.caption).foregroundStyle(.secondary) }
+                Picker("Фон",selection: Binding(get: { studio.quiz.appearance?.background ?? "Стандартный" },set: { value in var style = studio.quiz.appearance ?? QuizAppearance(); style.background = value; style.backgroundImage = nil; studio.quiz.appearance = style })) { ForEach(["Стандартный","Ночной","Океан","Лес","Бордовый"],id: \.self) { Text($0) } }
+                HStack {
+                    Button("Выбрать картинку фона…") { studio.importAppearance(font: false) }
+                    if studio.quiz.appearance?.backgroundImage != nil { Button("Убрать картинку") { studio.quiz.appearance?.backgroundImage = nil } }
+                }
+                if studio.quiz.appearance?.backgroundImage != nil { HStack { Text("Затемнение"); Slider(value: appearance.imageDimming,in: 0...0.9) } }
+                ZStack { QuizBackground(studio: studio); Text("Так выглядит вопрос квиза").font(studio.stageFont(size: 28,weight: .semibold)).foregroundStyle(.white).padding() }.frame(height: 110).clipShape(RoundedRectangle(cornerRadius: 12))
+                Stepper("Пауза между раскрытием мест: \(studio.quiz.scoreRevealSeconds ?? 3) сек",value: Binding(get: { studio.quiz.scoreRevealSeconds ?? 3 },set: { studio.quiz.scoreRevealSeconds = $0 }),in: 1...10)
+                Text("Результаты открываются от последнего места к первому. Команды с одинаковой суммой появляются вместе.").font(.caption).foregroundStyle(.secondary)
+                Button("Вернуть стандартное оформление") { studio.quiz.appearance = nil; studio.registeredFontName = nil }
+            }.padding(.top,12)
+        }.padding(14).background(.quaternary.opacity(0.35),in: RoundedRectangle(cornerRadius: 12))
     }
 }

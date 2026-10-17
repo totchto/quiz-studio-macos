@@ -14,7 +14,7 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   app.quiz.rounds[0].repeatQuestions = true
   app.quiz.rounds[0].standings = true
   app.start()
-  assert(app.steps.map(\.kind) == [.question,.question,.repeated,.repeated,.pause,.answerPrompt,.answer,.answerPrompt,.answer,.standings,.finish])
+  assert(app.steps.map(\.kind) == [.question,.question,.repeatIntro,.repeated,.repeated,.pause,.answerPrompt,.answer,.answerPrompt,.answer,.standings,.finish])
   app.paused = true; app.tick(); assert(app.remaining == 5)
   app.paused = false
   for _ in 0..<38 { app.tick() }
@@ -168,6 +168,46 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   reloadedLibrary.showLibrary(editing: false); assert(reloadedLibrary.screen == .library)
   reloadedLibrary.newQuiz(); assert(reloadedLibrary.screen == .editor && reloadedLibrary.documentURL == nil && reloadedLibrary.quiz.title == "Новый квиз")
   print("PASS: creation library, open for editing, non-destructive removal, hidden discovery after restart, explicit restore, duplicate prevention, play library and new blank quiz")
+
+
+  let presentation = Studio(draftURL: root.appendingPathComponent("presentation.workspace")); presentation.timer?.invalidate()
+  presentation.quiz.rounds[0].questions[0].text = "Вопрос"; presentation.quiz.rounds[0].questions[0].answer = "Ответ"
+  presentation.quiz.rounds[0].repeatQuestions = true; presentation.quiz.rounds[0].repeatIntroSeconds = 2; presentation.quiz.rounds[0].standings = true
+  presentation.quiz.teams = [Team(name: "Лидер",scores: ["r":10]),Team(name: "Вторая",scores: ["r":7]),Team(name: "Тоже вторая",scores: ["r":7]),Team(name: "Четвёртая",scores: ["r":2])]
+  presentation.quiz.scoreRevealSeconds = 1
+  presentation.start()
+  let repeatedIndex = presentation.steps.firstIndex { $0.kind == .repeated }!
+  assert(presentation.steps[repeatedIndex-1].kind == .repeatIntro && !presentation.steps[repeatedIndex-1].showsTimer)
+  presentation.index = repeatedIndex-1; presentation.enter()
+  for _ in 0..<12 { presentation.tick() }; assert(presentation.step!.kind == .repeated)
+  presentation.index = presentation.steps.firstIndex { $0.kind == .standings }!; presentation.enter(); presentation.publishScores()
+  assert(presentation.scoreRevealedIDs.isEmpty && presentation.nextScoreRank == 4)
+  for _ in 0..<6 { presentation.tick() }; assert(presentation.scoreRevealedIDs.count == 1 && presentation.nextScoreRank == 2)
+  presentation.paused = true
+  for _ in 0..<50 { presentation.tick() }; assert(presentation.scoreRevealedIDs.count == 1)
+  presentation.paused = false
+  for _ in 0..<6 { presentation.tick() }; assert(presentation.scoreRevealedIDs.count == 3 && presentation.nextScoreRank == 1)
+  for _ in 0..<6 { presentation.tick() }; assert(presentation.scoresFullyRevealed && presentation.scoreRevealedIDs.count == 4)
+  presentation.publishScores(); presentation.revealAllScores(); assert(presentation.scoresFullyRevealed)
+  presentation.back(); assert(!presentation.publishedScores && presentation.scoreRevealedIDs.isEmpty)
+  assert(legacy.appearance == nil && legacy.scoreRevealSeconds == nil)
+  let media = root.appendingPathComponent("theme-store/Media"); try FileManager.default.createDirectory(at: media,withIntermediateDirectories: true)
+  let fontFiles = FileManager.default.enumerator(at: URL(fileURLWithPath: "/System/Library/Fonts"),includingPropertiesForKeys: nil)!.allObjects.compactMap { $0 as? URL }
+  let fontURL = fontFiles.first { ["ttf","otf","ttc"].contains($0.pathExtension.lowercased()) }!
+  let embeddedFont = "custom." + fontURL.pathExtension
+  try FileManager.default.copyItem(at: fontURL,to: media.appendingPathComponent(embeddedFont))
+  try Data([1,2,3]).write(to: media.appendingPathComponent("background.png"))
+  presentation.folder = media.deletingLastPathComponent()
+  let fontName = presentation.registerFont(media.appendingPathComponent(embeddedFont))!
+  presentation.quiz.appearance = QuizAppearance(fontName: fontName,fontFile: embeddedFont,background: "Лес",backgroundImage: "background.png",imageDimming: 0.6)
+  let themedURL = root.appendingPathComponent("themed.quiz"); try presentation.write(to: themedURL)
+  let themeArchive = try JSONDecoder().decode(QuizFile.self,from: Data(contentsOf: themedURL))
+  assert(themeArchive.assets.count == 2 && themeArchive.quiz.appearance?.background == "Лес")
+  let themed = Studio(draftURL: root.appendingPathComponent("themed.workspace")); themed.timer?.invalidate()
+  assert(themed.load(themedURL) && themed.registeredFontName == fontName && themed.presentationFontName == fontName)
+  assert(themed.quiz.appearance?.imageDimming == 0.6 && themed.referencedAssets.count == 2)
+  themed.quiz.appearance = nil; assert(themed.presentationFontName == nil && themed.referencedAssets.isEmpty)
+  print("PASS: repeat announcement and timing, suspense reveal from last place, simultaneous ties, paused reveal, reveal-all and reset, legacy appearance defaults, embedded custom font/background and font registration after import")
 
   print("PASS: schedule, per-round defaults, pause, automatic transitions, back, untimed question, save/load, portable assets, scores")
  }
