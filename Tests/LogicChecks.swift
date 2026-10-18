@@ -17,6 +17,10 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   app.quiz.rounds[0].standings = true
   app.start()
   assert(app.steps.map(\.kind) == [.question,.question,.repeatIntro,.repeated,.repeated,.pause,.answerPrompt,.answer,.answerPrompt,.answer,.standings,.finish])
+  let phones = Studio(draftURL: root.appendingPathComponent("phone-flow.quiz"))
+  phones.timer?.invalidate(); phones.quiz = app.quiz; phones.phoneMode = true; phones.start()
+  assert(phones.steps.map(\.kind) == [.question,.question,.answerPrompt,.answer,.answerPrompt,.answer,.standings,.finish])
+  phones.stop(); assert(!phones.playing && phones.screen == .home)
   app.paused = true; app.tick(); assert(app.remaining == 5)
   app.paused = false
   for _ in 0..<38 { app.tick() }
@@ -268,7 +272,7 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   let resumed = Studio(draftURL: reliable.draft); resumed.timer?.invalidate(); assert(resumed.recoveryAvailable)
   resumed.restoreGame(); assert(resumed.playing && resumed.paused && resumed.remaining == 17 && resumed.step?.kind == expectedStep)
   assert(resumed.quiz.teams[0].total == 1.5 && resumed.quiz.teams[1].total == -0.5)
-  resumed.stop(preserveRecovery: true); assert(resumed.recoveryAvailable)
+  resumed.stop(preserveRecovery: true); assert(resumed.recoveryAvailable && resumed.screen == .home)
   resumed.restoreGame(); resumed.stop(); assert(!resumed.recoveryAvailable)
   let undo = Studio(draftURL: root.appendingPathComponent("undo.workspace")); undo.timer?.invalidate(); undo.screen = .editor
   undo.quiz.rounds[0].questions[0].text = "До удаления"; undo.deleteSelectedQuestion(); assert(undo.selectedQuestion == nil)
