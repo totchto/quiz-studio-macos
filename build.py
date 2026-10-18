@@ -14,6 +14,13 @@ app = root / 'dist' / 'Квиз Студия.app'
 shutil.copy2(Path(bin_path) / 'QuizStudio', app / 'Contents/MacOS/QuizStudio')
 shutil.copy2(root / 'Resources/Info.plist', app / 'Contents/Info.plist')
 shutil.copy2(root / 'Resources/bleep.wav', app / 'Contents/Resources/bleep.wav')
+shutil.copy2(root / 'Resources/MUSIC-CREDITS.txt', app / 'Contents/Resources/MUSIC-CREDITS.txt')
+music = root / 'Resources/BackgroundMusic'
+installed_music = app / 'Contents/Resources/BackgroundMusic'
+if installed_music.exists():
+    shutil.rmtree(installed_music)
+if music.exists():
+    shutil.copytree(music, app / 'Contents/Resources/BackgroundMusic', dirs_exist_ok=True)
 subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(app)], check=True)
 subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
 archive = root / 'dist' / 'QuizStudio-macOS.zip'

@@ -65,8 +65,66 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   try await wait("quiz audio ready") { !quiz.playback.loading }; quiz.player?.volume=0
   try await wait("quiz audio finish") { quiz.playback.finished }; quiz.tick(); assert(!quiz.waitingForMedia)
   for _ in 0..<6 { quiz.tick() }; assert(quiz.remaining==4)
+  for afterMedia in [true,false] {
+   quiz.quiz.rounds[0].questions[0].afterMedia = afterMedia
+   quiz.readBeforeTimer = true; quiz.enter()
+   try await wait("reading media prepared") { !quiz.playback.loading }
+   quiz.player?.volume = 0
+   try await Task.sleep(nanoseconds:250_000_000)
+   for _ in 0..<10 { quiz.tick() }
+   assert(quiz.awaitingQuestionStart && quiz.remaining == 5 && quiz.player?.rate == 0)
+   assert(abs(quiz.player!.currentTime().seconds-0.4) < 0.1)
+   quiz.startQuestionTimer()
+   for _ in 0..<6 { quiz.tick() }
+   assert(quiz.remaining == (afterMedia ? 5 : 4))
+   try await wait("reading media finished") { quiz.playback.finished }; quiz.tick()
+   assert(!quiz.waitingForMedia)
+  }
+  print("PASS: media stays silent during reading; start launches clip with timer during/after media")
   quiz.stop(); assert(quiz.player==nil)
   print("PASS: quiz uses the same safe player, waits for media before discussion timer and stops on exit")
+  let musicDomain = "QuizStudio.MusicChecks." + UUID().uuidString
+  let musicDefaults = UserDefaults(suiteName: musicDomain)!
+  defer { musicDefaults.removePersistentDomain(forName: musicDomain) }
+  let supplied = CommandLine.arguments.count > 3 ? URL(fileURLWithPath: CommandLine.arguments[3]) : root.appendingPathComponent("NoSuppliedMusic")
+  let music = BackgroundMusic(localFolder: root.appendingPathComponent("LocalMusic"),suppliedFolder: supplied,defaults: musicDefaults)
+  if CommandLine.arguments.count > 3 {
+   assert(music.tracks.count == 9)
+   for track in music.tracks {
+    let asset = AVURLAsset(url: music.url(track))
+    let playable = try await asset.load(.isPlayable); assert(playable)
+    let audioTracks = try await asset.loadTracks(withMediaType: .audio); assert(!audioTracks.isEmpty)
+   }
+  }
+  await music.importFiles([wav,bad])
+  let custom = music.tracks.filter { !$0.supplied }; assert(custom.count == 1)
+  assert(music.url(custom[0]).deletingLastPathComponent().path == music.localFolder.path)
+  assert(FileManager.default.fileExists(atPath: music.url(custom[0]).path))
+  music.selected = Set(custom.map(\.id)); music.enabled = true; music.shuffle = false; music.volume = 0.3
+  let restoredMusic = BackgroundMusic(localFolder: music.localFolder,suppliedFolder: supplied,defaults: musicDefaults)
+  assert(restoredMusic.enabled && restoredMusic.volume == 0.3 && restoredMusic.selected == music.selected && restoredMusic.tracks == music.tracks)
+  music.beginGame(); music.tick(mediaActive:false)
+  try await wait("background ready") { !music.session.loading }
+  music.session.player?.isMuted = true
+  assert(music.session.player?.volume == 0)
+  for _ in 0..<12 { music.tick(mediaActive:false) }; assert(abs(music.session.player!.volume-0.3)<0.001)
+  for _ in 0..<8 { music.tick(mediaActive:true) }; assert(music.session.player?.volume == 0)
+  music.speaking = true
+  for _ in 0..<8 { music.tick(mediaActive:false) }; assert(abs(music.session.player!.volume-0.06)<0.001)
+  music.muted = true; for _ in 0..<8 { music.tick(mediaActive:false) }; assert(music.session.player?.volume == 0)
+  try await wait("background track end") { music.session.finished }
+  music.tick(mediaActive:false); assert(music.currentID == custom[0].id && music.session.loading)
+  music.enabled = false; music.tick(mediaActive:false); assert(music.session.player == nil)
+  music.enabled = true; music.tick(mediaActive:false); assert(music.session.loading)
+  music.stop(); assert(music.session.player == nil)
+  music.preview(custom[0]); assert(music.currentID == custom[0].id)
+  music.preview(custom[0]); assert(music.session.player == nil && music.currentID == nil)
+  let previousAssets = quiz.referencedAssets
+  quiz.background.enabled = true; quiz.background.volume = 0.1
+  assert(quiz.referencedAssets == previousAssets)
+  quiz.background.enabled = false
+  print("PASS: supplied music opens, custom import validation/local copy, saved local playlist, fade/duck/speech/mute, repeat, enable/disable, preview, music excluded from quiz assets")
+
   quiz.addRound(); let destination=quiz.quiz.rounds[1].id
   let provider=NSItemProvider(object:question.id.uuidString as NSString)
   assert(quiz.acceptQuestionDrop([provider],toRound:destination))

@@ -239,6 +239,26 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   assert(tryRange(start: 100,end: 0,duration: 100) == false && tryRange(start: .nan,end: 0,duration: 100) == false)
   print("PASS: drag reorder, cross-round move, stable editor binding, empty-round save/load, empty-round start validation, refill/delete empty round, media range clamping and invalid ranges")
 
+  let modes = Studio(draftURL: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "-modes.workspace"))
+  modes.steps = [Step(kind: .question,round: 0,question: 0,duration: 2),Step(kind: .finish,round: 0,duration: 0)]
+  modes.playing = true; modes.readBeforeTimer = true; modes.enter()
+  for _ in 0..<30 { modes.tick() }
+  assert(modes.awaitingQuestionStart && modes.remaining == 2 && modes.index == 0)
+  assert(modes.handleKey(49)); assert(!modes.awaitingQuestionStart && !modes.paused)
+  for _ in 0..<30 { modes.tick() }; assert(modes.index == 1)
+  modes.automaticAdvance = false; modes.index = 0; modes.enter(); modes.startQuestionTimer()
+  for _ in 0..<40 { modes.tick() }; assert(modes.remaining == 0 && modes.index == 0)
+  modes.togglePause(); assert(modes.paused); modes.togglePause(); assert(!modes.paused)
+  modes.handleKey(124); assert(modes.index == 1)
+  modes.back(); assert(modes.awaitingQuestionStart && modes.remaining == 2)
+  modes.readBeforeTimer = false; modes.enter(); assert(!modes.awaitingQuestionStart)
+  for _ in 0..<40 { modes.tick() }; assert(modes.remaining == 0 && modes.index == 0)
+  modes.steps = [Step(kind: .repeated,round: 0,question: 0,duration: 1),Step(kind: .finish,round: 0,duration: 0)]
+  modes.readBeforeTimer = true; modes.enter(); assert(!modes.awaitingQuestionStart)
+  for _ in 0..<20 { modes.tick() }; assert(modes.index == 0)
+  modes.automaticAdvance = true; modes.tick(); assert(modes.index == 1)
+  print("PASS: reading gate, space starts timer, automatic/manual advance, pause, next/back, repeat without reading gate")
+
   print("PASS: schedule, per-round defaults, pause, automatic transitions, back, untimed question, save/load, portable assets, scores")
  }
 }

@@ -146,7 +146,7 @@ struct MediaRange: Equatable {
     private var wantsPlayback = true
     private var seekStarted = false
     private var prepared = false
-    func start(url: URL,start: Double = 0,end: Double = 0,autoplay: Bool = true) {
+    func start(url: URL,start: Double = 0,end: Double = 0,autoplay: Bool = true,initialVolume: Float = 1) {
         stop()
         let token = generation
         wantsPlayback = autoplay; loading = true; finished = false; error = nil
@@ -163,7 +163,7 @@ struct MediaRange: Equatable {
                 let item = AVPlayerItem(asset: asset)
                 item.forwardPlaybackEndTime = CMTime(seconds: range.end,preferredTimescale: 600)
                 let p = AVPlayer(playerItem: item)
-                p.volume = 1; p.isMuted = false
+                p.volume = min(1,max(0,initialVolume)); p.isMuted = false
                 self.player = p; self.nativePlayer = p
                 self.endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime,object: item,queue: .main) { [weak self] _ in
                     Task { @MainActor in guard self?.generation == token else { return }; self?.finish() }
@@ -253,11 +253,127 @@ struct MediaPreview: View {
     }
 }
 
+struct BackgroundTrack: Identifiable, Codable, Equatable {
+    var id: String
+    var title: String
+    var filename: String
+    var supplied: Bool
+}
+@MainActor final class BackgroundMusic: ObservableObject {
+    @Published var enabled = false { didSet { defaults.set(enabled,forKey: "MusicEnabled") } }
+    @Published var volume: Double = 0.2 { didSet { defaults.set(volume,forKey: "MusicVolume") } }
+    @Published var shuffle = true { didSet { defaults.set(shuffle,forKey: "MusicShuffle") } }
+    @Published var selected: Set<String> = [] { didSet { defaults.set(Array(selected),forKey: "MusicSelected") } }
+    @Published var tracks: [BackgroundTrack] = []
+    @Published var currentID: String?
+    @Published var message = ""
+    @Published var importing = false
+    @Published var muted = false
+    @Published var speaking = false
+    let session = MediaSession()
+    let defaults: UserDefaults
+    let localFolder: URL
+    let suppliedFolder: URL
+    private var subscription: AnyCancellable?
+    private var gameActive = false
+    private var previewing = false
+    private var failed: Set<String> = []
+    private var level: Float = 0
+    init(localFolder: URL? = nil,suppliedFolder: URL? = nil,defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        self.localFolder = localFolder ?? FileManager.default.urls(for: .applicationSupportDirectory,in: .userDomainMask)[0].appendingPathComponent("QuizStudio/BackgroundMusic")
+        self.suppliedFolder = suppliedFolder ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/BackgroundMusic")
+        enabled = defaults.bool(forKey: "MusicEnabled")
+        volume = defaults.object(forKey: "MusicVolume") == nil ? 0.2 : min(1,max(0,defaults.double(forKey: "MusicVolume")))
+        shuffle = defaults.object(forKey: "MusicShuffle") == nil ? true : defaults.bool(forKey: "MusicShuffle")
+        let bundled = ((try? FileManager.default.contentsOfDirectory(at: self.suppliedFolder,includingPropertiesForKeys: nil)) ?? []).filter { $0.pathExtension.lowercased() == "mp3" }.sorted { $0.lastPathComponent < $1.lastPathComponent }.map { BackgroundTrack(id: "supplied:" + $0.lastPathComponent,title: $0.deletingPathExtension().lastPathComponent,filename: $0.lastPathComponent,supplied: true) }
+        let custom = defaults.data(forKey: "MusicCustom").flatMap { try? JSONDecoder().decode([BackgroundTrack].self,from: $0) } ?? []
+        tracks = bundled + custom.filter { !$0.supplied && $0.filename == URL(fileURLWithPath: $0.filename).lastPathComponent }
+        selected = defaults.stringArray(forKey: "MusicSelected").map(Set.init) ?? Set(bundled.map(\.id))
+        subscription = session.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
+    }
+    var currentTitle: String { tracks.first { $0.id == currentID }?.title ?? "Музыка не играет" }
+    func url(_ track: BackgroundTrack) -> URL { (track.supplied ? suppliedFolder : localFolder).appendingPathComponent(track.filename) }
+    func setSelected(_ id: String,_ value: Bool) { if value { selected.insert(id) } else { selected.remove(id) } }
+    func beginGame() { stop(); gameActive = true; muted = false; speaking = false; failed = []; message = "" }
+    func stop() { session.stop(); gameActive = false; previewing = false; currentID = nil; level = 0 }
+    func play(_ track: BackgroundTrack) {
+        currentID = track.id; level = 0
+        session.start(url: url(track),initialVolume: 0)
+    }
+    func preview(_ track: BackgroundTrack) {
+        if previewing && currentID == track.id { stop(); return }
+        stop(); previewing = true; message = ""; play(track)
+    }
+    func nextTrack() {
+        let candidates = tracks.filter { selected.contains($0.id) && !failed.contains($0.id) }
+        guard !candidates.isEmpty else { session.stop(); currentID = nil; message = "Выберите доступные треки для фона."; return }
+        let track: BackgroundTrack
+        if shuffle {
+            let different = candidates.filter { $0.id != currentID }
+            track = (different.isEmpty ? candidates : different).randomElement()!
+        } else if let i = candidates.firstIndex(where: { $0.id == currentID }) { track = candidates[(i+1) % candidates.count] }
+        else { track = candidates[0] }
+        play(track)
+    }
+    func targetVolume(mediaActive: Bool) -> Float {
+        if gameActive && (!enabled || muted || mediaActive) { return 0 }
+        return Float(min(1,max(0,volume))) * (gameActive && speaking ? 0.2 : 1)
+    }
+    func tick(mediaActive: Bool) {
+        guard gameActive || previewing else { return }
+        if gameActive && !enabled { session.stop(); currentID = nil; level = 0; return }
+        if gameActive, let id = currentID, !selected.contains(id) { session.stop(); currentID = nil }
+        if session.finished {
+            if let error = session.error {
+                if let id = currentID { failed.insert(id) }
+                message = "Не удалось открыть «\(currentTitle)»: \(error)"
+            }
+            if previewing { session.stop(); previewing = false; currentID = nil; return }
+            nextTrack()
+        }
+        let target = targetVolume(mediaActive: mediaActive)
+        // Fade in about one second, fade out in less than half a second.
+        let change = max(Float(0.005),Float(min(1,max(0,volume))) * (target < level ? 0.5 : 0.2))
+        level += min(change,max(-change,target-level))
+        session.player?.volume = level
+    }
+    func chooseFiles() {
+        let panel = NSOpenPanel(); panel.allowedContentTypes = [.audio]; panel.allowsMultipleSelection = true
+        guard panel.runModal() == .OK else { return }
+        let urls = panel.urls
+        importing = true
+        Task { await importFiles(urls); importing = false }
+    }
+    func importFiles(_ urls: [URL]) async {
+        var added = 0; var errors: [String] = []
+        for source in urls {
+            let scoped = source.startAccessingSecurityScopedResource(); defer { if scoped { source.stopAccessingSecurityScopedResource() } }
+            do {
+                let asset = AVURLAsset(url: source)
+                guard try await asset.load(.isPlayable), !(try await asset.loadTracks(withMediaType: .audio)).isEmpty else { throw NSError(domain: "BackgroundMusic",code: 1,userInfo: [NSLocalizedDescriptionKey: "Нет доступной аудиодорожки."]) }
+                try FileManager.default.createDirectory(at: localFolder,withIntermediateDirectories: true)
+                let id = UUID().uuidString
+                let filename = id + "." + source.pathExtension.lowercased()
+                try FileManager.default.copyItem(at: source,to: localFolder.appendingPathComponent(filename))
+                let track = BackgroundTrack(id: id,title: source.deletingPathExtension().lastPathComponent,filename: filename,supplied: false)
+                tracks.append(track); selected.insert(id); added += 1
+            } catch { errors.append(source.lastPathComponent + ": " + error.localizedDescription) }
+        }
+        defaults.set(try? JSONEncoder().encode(tracks.filter { !$0.supplied }),forKey: "MusicCustom")
+        message = errors.isEmpty ? "Добавлено треков: \(added)." : "Добавлено: \(added). " + errors.joined(separator: "\n")
+        failed = []
+    }
+}
+
 @MainActor final class Studio: ObservableObject {
     enum Screen { case home, library, createLibrary, editor, teams }
     @Published var screen: Screen = .home
     @Published var introductionSeconds = 6
     @Published var resetScores = true
+    @Published var automaticAdvance = true
+    @Published var readBeforeTimer = false
+    @Published var awaitingQuestionStart = false
     @Published var recentQuizzes: [URL] = []
     var rememberRecent = true
     var hiddenQuizzes: Set<String> = []
@@ -277,6 +393,7 @@ struct MediaPreview: View {
     @Published var registeredFontName: String? = nil
     var scoreGroups: [[Team]] = []
     var scoreRevealElapsed: Double = 0
+    let background: BackgroundMusic
     let playback = MediaSession()
     var player: AVPlayer? { playback.player }
     var playbackSubscription: AnyCancellable?
@@ -299,6 +416,7 @@ struct MediaPreview: View {
         return quiz.rounds[s.round].questions[s.question]
     }
     init(draftURL: URL? = nil, libraryDefaults: UserDefaults? = nil, nearbyFolder: URL? = nil) {
+        background = BackgroundMusic(defaults: draftURL == nil ? .standard : UserDefaults(suiteName: "QuizStudio.Checks." + UUID().uuidString)!)
         self.libraryDefaults = libraryDefaults ?? .standard
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("QuizStudio")
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
@@ -651,23 +769,26 @@ struct MediaPreview: View {
             if r.standings { steps.append(Step(kind: .standings,round: ri,duration: 0)) }
         }
         steps.append(Step(kind: .finish,round: max(0,quiz.rounds.count-1),duration: 0))
-        playing = true; paused = false; index = 0; enter()
+        background.beginGame(); playing = true; paused = false; index = 0; enter()
     }
     func enter() {
         playback.stop(); bleep?.stop(); transitionElapsed = 0; publishedScores = false; mediaDone = true; waitingForMedia = false; elapsed = 0
         scoreSnapshot = []; scoreRevealedIDs = []; scoreGroups = []; scoreRevealGroup = 0; scoreRevealElapsed = 0
         guard let s = step else { return }; remaining = s.duration
+        awaitingQuestionStart = readBeforeTimer && s.kind == .question
         if s.kind == .roundIntro, let url = asset(quiz.rounds[s.round].intro?.media) {
             mediaDone = false; playback.start(url: url,autoplay: !paused); return
         }
         if [.question,.repeated,.answer].contains(s.kind), let q = currentQuestion, let url = asset(s.kind == .answer ? (q.explanationMedia ?? q.media) : q.media) {
             mediaDone = false; waitingForMedia = s.kind == .question && q.afterMedia
             let explanation = s.kind == .answer && q.explanationMedia != nil
-            playback.start(url: url,start: explanation ? 0 : q.start,end: explanation ? 0 : q.end,autoplay: !paused)
+            playback.start(url: url,start: explanation ? 0 : q.start,end: explanation ? 0 : q.end,autoplay: !paused && !awaitingQuestionStart)
         }
     }
+    var foregroundMediaActive: Bool { playing && !paused && !awaitingQuestionStart && !mediaDone }
     func tick() {
-        guard playing, !paused, let s = step else { return }
+        background.tick(mediaActive: foregroundMediaActive)
+        guard playing, !paused, !awaitingQuestionStart, let s = step else { return }
         if s.kind == .standings && publishedScores && !scoresFullyRevealed {
             scoreRevealElapsed += 0.2
             if scoreRevealElapsed >= Double(max(1,quiz.scoreRevealSeconds ?? 3)) { revealNextScoreGroup() }
@@ -691,12 +812,17 @@ struct MediaPreview: View {
         guard ![.standings,.finish].contains(s.kind), s.duration > 0, !waitingForMedia else { return }
         elapsed += 0.2
         if elapsed >= 1 { remaining = max(0, remaining-1); elapsed -= 1 }
-        if remaining == 0 && mediaDone { transitionElapsed += 0.2; if [.introduction,.repeatIntro,.answerPrompt,.repeated].contains(s.kind) || transitionElapsed >= 2 { next() } }
+        if automaticAdvance && remaining == 0 && mediaDone { transitionElapsed += 0.2; if [.introduction,.repeatIntro,.answerPrompt,.repeated].contains(s.kind) || transitionElapsed >= 2 { next() } }
     }
-    func togglePause() { paused.toggle(); playback.setPaused(paused); if paused { bleep?.stop() } }
+    func startQuestionTimer() {
+        guard awaitingQuestionStart else { return }
+        awaitingQuestionStart = false; elapsed = 0; transitionElapsed = 0
+        paused = false; playback.setPaused(false)
+    }
+    func togglePause() { if awaitingQuestionStart { startQuestionTimer(); return }; paused.toggle(); playback.setPaused(paused); if paused { bleep?.stop() } }
     func next() { if index+1 < steps.count { index += 1; enter() } }
     func back() { if index > 0 { index -= 1; enter() } }
-    func stop() { autosave(); playback.stop(); bleep?.stop(); playing = false; screen = .editor; tv?.close(); tv = nil }
+    func stop() { autosave(); background.stop(); playback.stop(); bleep?.stop(); playing = false; screen = .editor; tv?.close(); tv = nil }
     func returnToMenu() { stop(); screen = .home }
     func showTV() {
         if tv != nil { tv?.makeKeyAndOrderFront(nil); return }
@@ -710,6 +836,52 @@ struct MediaPreview: View {
 }
 
 
+// A native drag handle avoids Button/List gesture interception on macOS.
+struct QuestionDragHandle: NSViewRepresentable {
+    let id: UUID
+    func makeNSView(context: Context) -> QuestionDragHandleView { QuestionDragHandleView() }
+    func updateNSView(_ view: QuestionDragHandleView,context: Context) { view.questionID = id }
+}
+final class QuestionDragHandleView: NSView, NSDraggingSource {
+    var questionID = UUID()
+    private var origin: NSPoint?
+    override var intrinsicContentSize: NSSize { NSSize(width: 28,height: 32) }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.secondaryLabelColor.setStroke()
+        let path = NSBezierPath(); path.lineWidth = 1.5
+        for y in [12.0,16.0,20.0] { path.move(to: NSPoint(x: 7,y: y)); path.line(to: NSPoint(x: 21,y: y)) }
+        path.stroke()
+    }
+    override func resetCursorRects() { addCursorRect(bounds,cursor: .openHand) }
+    override func mouseDown(with event: NSEvent) { origin = event.locationInWindow }
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = origin, hypot(event.locationInWindow.x-start.x,event.locationInWindow.y-start.y) > 3 else { return }
+        origin = nil
+        let item = NSDraggingItem(pasteboardWriter: questionID.uuidString as NSString)
+        let image = NSImage(systemSymbolName: "text.bubble",accessibilityDescription: "Вопрос") ?? NSImage(size: NSSize(width: 24,height: 24))
+        item.setDraggingFrame(NSRect(origin: convert(event.locationInWindow,from: nil),size: NSSize(width: 28,height: 28)),contents: image)
+        beginDraggingSession(with: [item],event: event,source: self)
+    }
+    override func mouseUp(with event: NSEvent) { origin = nil }
+    func draggingSession(_ session: NSDraggingSession,sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { .move }
+}
+
+struct QuestionInsertionHint: View {
+    let visible: Bool
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle().fill(Color.accentColor).frame(width: 6,height: 6)
+            Rectangle().fill(Color.accentColor).frame(height: 2)
+            Text("Вставить сюда").font(.system(size: 10,weight: .medium)).foregroundStyle(Color.accentColor).fixedSize()
+            Rectangle().fill(Color.accentColor).frame(height: 2)
+        }
+        .frame(height: visible ? 28 : 0)
+        .opacity(visible ? 1 : 0)
+        .clipped()
+        .accessibilityHidden(!visible)
+        .allowsHitTesting(false)
+    }
+}
 struct DraggableQuestionRow: View {
     @ObservedObject var studio: Studio
     let roundID: UUID
@@ -719,17 +891,29 @@ struct DraggableQuestionRow: View {
     let select: () -> Void
     @State var targeted = false
     var body: some View {
-        Button(action: select) {
-            HStack {
-                Image(systemName: "line.3.horizontal").foregroundStyle(.secondary)
-                Image(systemName: !question.issues.isEmpty ? "exclamationmark.triangle.fill" : question.media == nil ? "text.bubble" : "play.rectangle")
-                Text("\(number). " + (question.text.isEmpty ? "Новый вопрос" : question.text)).lineLimit(1)
-            }.padding(8).frame(maxWidth: .infinity,alignment: .leading)
-                .background(targeted ? Color.green.opacity(0.2) : selected ? Color.indigo.opacity(0.15) : .clear,in: RoundedRectangle(cornerRadius: 8))
-        }.buttonStyle(.plain).foregroundStyle(question.issues.isEmpty ? Color.primary : .orange)
-            .help((question.issues.isEmpty ? "Перетащите для изменения порядка или переноса в другой раунд" : question.issues.joined(separator: "\n")))
-            .onDrag { NSItemProvider(object: question.id.uuidString as NSString) }
-            .onDrop(of: [UTType.text],isTargeted: $targeted) { studio.acceptQuestionDrop($0,toRound: roundID,before: question.id) }
+        // Keep the hint inside the drop region so opening the gap does not
+        // move the pointer out of its target and repeatedly collapse it.
+        VStack(spacing: 0) {
+            QuestionInsertionHint(visible: targeted)
+            HStack(spacing: 0) {
+                QuestionDragHandle(id: question.id).frame(width: 28,height: 32)
+                    .help("Потяните за полоски, чтобы перенести вопрос")
+                Button(action: select) {
+                    HStack {
+                        Image(systemName: !question.issues.isEmpty ? "exclamationmark.triangle.fill" : question.media == nil ? "text.bubble" : "play.rectangle")
+                        Text("\(number). " + (question.text.isEmpty ? "Новый вопрос" : question.text)).lineLimit(1)
+                    }.padding(8).frame(maxWidth: .infinity,alignment: .leading)
+                        .background(selected ? Color.indigo.opacity(0.15) : .clear,in: RoundedRectangle(cornerRadius: 8))
+                }.buttonStyle(.plain)
+            }.foregroundStyle(question.issues.isEmpty ? Color.primary : .orange)
+        }
+        .contentShape(Rectangle())
+        .animation(.easeInOut(duration: 0.18),value: targeted)
+        .help(question.issues.isEmpty ? "Перетащите для изменения порядка или переноса в другой раунд" : question.issues.joined(separator: "\n"))
+        .onDrop(of: [UTType.text],isTargeted: $targeted) { providers in
+            targeted = false
+            return studio.acceptQuestionDrop(providers,toRound: roundID,before: question.id)
+        }
     }
 }
 struct RoundDropTarget: View {
@@ -737,17 +921,24 @@ struct RoundDropTarget: View {
     let roundID: UUID
     @State var targeted = false
     var body: some View {
-        Text("Перетащите в конец раунда").font(.caption).foregroundStyle(targeted ? Color.green : .secondary)
-            .frame(maxWidth: .infinity,minHeight: 30).padding(4)
-            .background(targeted ? Color.green.opacity(0.15) : .clear,in: RoundedRectangle(cornerRadius: 6))
-            .onDrop(of: [UTType.text],isTargeted: $targeted) { studio.acceptQuestionDrop($0,toRound: roundID) }
+        VStack(spacing: 0) {
+            QuestionInsertionHint(visible: targeted)
+            Text("Перетащите в конец раунда").font(.caption).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity,minHeight: 30).padding(4)
+        }
+        .contentShape(Rectangle())
+        .animation(.easeInOut(duration: 0.18),value: targeted)
+        .onDrop(of: [UTType.text],isTargeted: $targeted) { providers in
+            targeted = false
+            return studio.acceptQuestionDrop(providers,toRound: roundID)
+        }
     }
 }
 
 @main struct QuizStudioApp: App {
     @StateObject var studio = Studio()
     var body: some Scene {
-        WindowGroup("Квиз Студия · 0.7.1") { Content(studio: studio).frame(minWidth: 1050,minHeight: 720).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if !studio.playing && studio.load(url) { studio.prepareGame() } } }
+        WindowGroup("Квиз Студия · 0.8.0") { Content(studio: studio).frame(minWidth: 1050,minHeight: 720).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if !studio.playing && studio.load(url) { studio.prepareGame() } } }
         .commands { CommandGroup(replacing: .newItem) { Button("Создать квиз") { studio.newQuiz() }.keyboardShortcut("n").disabled(studio.playing); Button("Открыть квиз…") { studio.open() }.keyboardShortcut("o").disabled(studio.playing); Button("Сохранить квиз…") { studio.save() }.keyboardShortcut("s") } }
     }
 }
@@ -773,7 +964,8 @@ struct Editor: View {
         NavigationSplitView {
             VStack(alignment: .leading,spacing: 16) {
                 Text("КВИЗ СТУДИЯ").font(.headline).foregroundStyle(.secondary).padding(.horizontal)
-                List {
+                ScrollView {
+                    LazyVStack(alignment: .leading,spacing: 8,pinnedViews: [.sectionHeaders]) {
                     ForEach(Array(studio.quiz.rounds.enumerated()),id: \.element.id) { ri,r in
                         Section {
                             ForEach(Array(r.questions.enumerated()),id: \.element.id) { qi,q in
@@ -786,6 +978,7 @@ struct Editor: View {
                             Button { studio.selectRound(r.id) } label: { Text(r.title + " · \(r.questions.count)") }.buttonStyle(.plain).help("Открыть настройки раунда")
                         }
                     }
+                    }.padding(.horizontal,8)
                 }
                 Button("Следующий раунд",systemImage: "plus.rectangle.on.rectangle") { studio.addRound() }.padding()
             }.padding(.top)
@@ -932,13 +1125,14 @@ struct PlayerView: View {
         .overlay(alignment: .bottom) {
             if studio.step?.kind == .finish {
                 Button("Вернуться в меню") { studio.returnToMenu() }.buttonStyle(.borderedProminent).controlSize(.large).padding(28)
-            } else if controls || studio.paused {
+            } else if controls || studio.paused || studio.awaitingQuestionStart {
                 HStack(spacing: 18) {
                     Button("Редактор") { studio.stop() }
                     Button("Назад") { studio.back() }
-                    Button(studio.paused ? "Продолжить" : "Пауза") { studio.togglePause() }
+                    Button(studio.awaitingQuestionStart ? "Запустить таймер" : (studio.paused ? "Продолжить" : "Пауза")) { studio.togglePause() }
                     Button("Вперёд") { studio.next() }
                     Button("+30 сек") { studio.remaining += 30 }
+                    BackgroundMusicControls(music: studio.background)
                     if studio.step?.kind == .standings && studio.publishedScores && !studio.scoresFullyRevealed { Button("Показать все места") { studio.revealAllScores() } }
                     Button("Заново") { studio.enter() }
                     Button("Экран ТВ") { studio.showTV() }
@@ -1015,7 +1209,7 @@ struct Stage: View {
                         }
                         if studio.playback.loading { Text("Открываем фрагмент…").font(.caption) }
                         if studio.playback.error != nil { Text("Не удалось воспроизвести фрагмент. Ведущий может вернуться в редактор.").font(.caption).foregroundStyle(.orange) }
-                        if s.showsTimer { Text(studio.waitingForMedia ? "Слушаем и смотрим…" : (s.duration == 0 ? "Продолжит ведущий" : (studio.remaining == 0 ? (s.kind == .repeated ? "" : "Время вышло") : "\(studio.remaining / 60):\(String(format: "%02d",studio.remaining % 60))"))).font(.system(size: 36,weight: .medium,design: .monospaced)).foregroundStyle(studio.remaining <= 10 && !studio.waitingForMedia ? .orange : .white) }
+                        if s.showsTimer && !studio.awaitingQuestionStart { Text(studio.waitingForMedia ? "Слушаем и смотрим…" : (s.duration == 0 ? "Продолжит ведущий" : (studio.remaining == 0 ? (s.kind == .repeated ? "" : "Время вышло") : "\(studio.remaining / 60):\(String(format: "%02d",studio.remaining % 60))"))).font(.system(size: 36,weight: .medium,design: .monospaced)).foregroundStyle(studio.remaining <= 10 && !studio.waitingForMedia ? .orange : .white) }
                         if studio.paused { Text("ПАУЗА").font(studio.stageFont(size: 17,weight: .semibold)).tracking(4).foregroundStyle(.orange) }
                     }.padding(40).padding(.bottom,50).frame(maxWidth: 1100).frame(maxWidth: .infinity,maxHeight: .infinity,alignment: [.answerPrompt,.answer].contains(s.kind) ? .top : .center)
                 }
@@ -1146,6 +1340,7 @@ struct QuizLibrary: View {
 }
 struct TeamSetup: View {
     @ObservedObject var studio: Studio
+    @State private var musicSettings = false
     var body: some View {
         VStack(alignment: .leading,spacing: 20) {
             HStack { Button("Назад") { studio.screen = .library }; Spacer(); Button("Открыть редактор") { studio.screen = .editor } }
@@ -1164,10 +1359,99 @@ struct TeamSetup: View {
             }
             Button("Добавить команду",systemImage: "plus") { studio.quiz.teams.append(Team(name: "")) }
             Stepper("Представление каждой команды: \(studio.introductionSeconds) сек",value: $studio.introductionSeconds,in: 3...30)
+            VStack(alignment: .leading,spacing: 10) {
+                Text("Проведение квиза").font(.headline)
+                Picker("Переключение экранов",selection: $studio.automaticAdvance) {
+                    Text("Автоматически").tag(true)
+                    Text("Вручную ведущим").tag(false)
+                }.pickerStyle(.segmented)
+                Text(studio.automaticAdvance ? "После окончания времени квиз продолжится сам. Итоги и экраны без времени переключает ведущий." : "После окончания времени экран останется до нажатия «Вперёд» или стрелки вправо.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Запускать время вопроса после чтения ведущим",isOn: $studio.readBeforeTimer)
+                Text("Вопрос появится без отсчёта. После чтения нажмите «Запустить таймер» или пробел. Для аудио/видео эта кнопка запускает запись; отсчёт идёт во время фрагмента или после него по настройке вопроса.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            BackgroundMusicSetup(music: studio.background,showSettings: $musicSettings)
             Toggle("Начать новую игру — обнулить прошлые баллы",isOn: $studio.resetScores)
             Text("Снимите галочку, чтобы сохранить уже введённые результаты. Названия команд сохраняются в обоих случаях.").font(.caption).foregroundStyle(.secondary)
             HStack { Text(studio.status).foregroundStyle(.secondary); Spacer(); Button("Начать игру",systemImage: "play.fill") { studio.beginGame() }.buttonStyle(.borderedProminent).disabled(studio.quiz.teams.isEmpty) }
         }.padding(36)
+    }
+}
+
+struct BackgroundMusicSetup: View {
+    @ObservedObject var music: BackgroundMusic
+    @Binding var showSettings: Bool
+    var body: some View {
+        HStack {
+            Toggle("Фоновая музыка",isOn: $music.enabled)
+            Text("Выбрано: \(music.tracks.filter { music.selected.contains($0.id) }.count) · громкость \(Int(music.volume*100))%")
+                .font(.caption).foregroundStyle(.secondary)
+            Spacer()
+            Button("Выбрать музыку…") { showSettings = true }
+        }
+        .sheet(isPresented: $showSettings) { BackgroundMusicSettings(music: music) }
+    }
+}
+struct BackgroundMusicSettings: View {
+    @ObservedObject var music: BackgroundMusic
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        VStack(alignment: .leading,spacing: 16) {
+            HStack { Text("Фоновая музыка").font(.title.bold()); Spacer(); Button("Готово") { dismiss() }.keyboardShortcut(.defaultAction) }
+            Text("Музыка хранится на этом Mac отдельно от квиза. Свои файлы копируются в музыкальную библиотеку приложения.")
+                .font(.callout).foregroundStyle(.secondary)
+            HStack {
+                Text("Предложенные треки: Kevin MacLeod (incompetech.com)").font(.caption)
+                Link("CC BY 4.0",destination: URL(string: "https://creativecommons.org/licenses/by/4.0/")!)
+            }
+            Toggle("Включить фон во время игры",isOn: $music.enabled)
+            HStack {
+                Text("Громкость")
+                Slider(value: $music.volume,in: 0...1)
+                Text("\(Int(music.volume*100))%").monospacedDigit().frame(width: 45)
+            }
+            Toggle("Перемешивать треки",isOn: $music.shuffle)
+            Text("Выбранные треки повторяются по кругу. Во время записи вопроса, объяснения или видео фон затихает. На паузе игры музыка продолжается.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Button("Выбрать все") { music.selected = Set(music.tracks.map(\.id)) }
+                Button("Снять выбор") { music.selected = [] }
+                Spacer()
+                Button("Добавить свои файлы…",systemImage: "plus") { music.chooseFiles() }.disabled(music.importing)
+            }
+            List(music.tracks) { track in
+                HStack {
+                    Toggle(isOn: Binding(get: { music.selected.contains(track.id) },set: { music.setSelected(track.id,$0) })) {
+                        VStack(alignment: .leading) {
+                            Text(track.title)
+                            Text(track.supplied ? "Kevin MacLeod · CC BY 4.0" : "Своя музыка · на этом Mac").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    Button(music.currentID == track.id ? "Остановить" : "Послушать") { music.preview(track) }
+                }.padding(.vertical,4)
+            }.frame(minHeight: 220)
+            if music.importing { ProgressView("Добавляем музыку…") }
+            Text(music.message).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+        }.padding(24).frame(width: 650,height: 650)
+        .onDisappear { music.stop() }
+    }
+}
+struct BackgroundMusicControls: View {
+    @ObservedObject var music: BackgroundMusic
+    var body: some View {
+        Menu {
+            Text(music.currentTitle)
+            if !music.message.isEmpty { Text(music.message) }
+            Button(music.enabled ? "Выключить фон" : "Включить фон") { music.enabled.toggle() }
+            Button(music.muted ? "Вернуть звук фона" : "Выключить звук фона") { music.muted.toggle() }
+            Button(music.speaking ? "Вернуть громкость после речи" : "Говорит ведущий — приглушить") { music.speaking.toggle() }
+            Button("Следующий трек") { music.nextTrack() }.disabled(!music.enabled)
+            Divider()
+            Button("Тише") { music.volume = max(0,music.volume-0.05) }
+            Button("Громче") { music.volume = min(1,music.volume+0.05) }
+        } label: { Label("Музыка",systemImage: !music.enabled || music.muted ? "speaker.slash" : "music.note") }
     }
 }
 

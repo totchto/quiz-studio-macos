@@ -5,3 +5,6 @@ dist/
 *.xcuserstate
 xcuserdata/
 Downloads/
+
+# Local music supplied for testing; not published with source.
+Resources/BackgroundMusic/
