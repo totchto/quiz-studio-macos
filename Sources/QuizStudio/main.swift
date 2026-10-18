@@ -4,13 +4,14 @@ import AVKit
 import UniformTypeIdentifiers
 import CoreText
 import Combine
+import CoreAudio
 
 struct MatchPair: Codable, Identifiable, Equatable {
     var id = UUID()
     var left = ""
     var right = ""
 }
-struct MatchLayout {
+struct MatchLayout: Codable {
     var left: [UUID]
     var right: [UUID]
     static func make(_ pairs: [MatchPair]) -> MatchLayout {
@@ -42,6 +43,7 @@ struct Question: Codable, Identifiable, Equatable {
     var bleepRanges = ""
     var selectedChoice: Int? = nil
     var matchPairs: [MatchPair]? = nil
+    var hostNotes: String? = nil
     var explanation: String? = nil
     var explanationImage: String? = nil
     var explanationMedia: String? = nil
@@ -81,12 +83,16 @@ struct Round: Codable, Identifiable, Equatable {
     var defaultSeconds = 60
     var defaultAfterMedia = true
     var intro: RoundIntro? = nil
+    var muteBackground: Bool? = nil
+    var tieBreaker: Bool? = nil
+    var hostNotes: String? = nil
 }
+func scoreText(_ value: Double) -> String { value.formatted(.number.precision(.fractionLength(0...2))) }
 struct Team: Codable, Identifiable, Equatable {
     var id = UUID()
     var name = "Новая команда"
-    var scores: [String: Int] = [:]
-    var total: Int { scores.values.reduce(0,+) }
+    var scores: [String: Double] = [:]
+    var total: Double { (scores.values.reduce(0,+) * 100).rounded() / 100 }
 }
 struct QuizAppearance: Codable, Equatable {
     var fontName: String? = nil
@@ -107,8 +113,8 @@ struct QuizFile: Codable {
     var quiz: Quiz
     var assets: [String: Data]
 }
-struct Step {
-    enum Kind { case introduction, roundIntro, question, repeatIntro, repeated, answerPrompt, answer, pause, standings, finish }
+struct Step: Codable {
+    enum Kind: String, Codable { case introduction, roundIntro, question, repeatIntro, repeated, answerPrompt, answer, pause, standings, finish }
     var kind: Kind
     var round: Int
     var question: Int = 0
@@ -129,6 +135,7 @@ struct MediaRange: Equatable {
     }
 }
 @MainActor final class MediaSession: ObservableObject {
+    var outputDevice: String? { didSet { player?.audioOutputDeviceUniqueID = outputDevice } }
     @Published var player: AVPlayer?
     @Published var loading = false
     @Published var finished = true
@@ -163,6 +170,7 @@ struct MediaRange: Equatable {
                 let item = AVPlayerItem(asset: asset)
                 item.forwardPlaybackEndTime = CMTime(seconds: range.end,preferredTimescale: 600)
                 let p = AVPlayer(playerItem: item)
+                p.audioOutputDeviceUniqueID = self.outputDevice
                 p.volume = min(1,max(0,initialVolume)); p.isMuted = false
                 self.player = p; self.nativePlayer = p
                 self.endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime,object: item,queue: .main) { [weak self] _ in
@@ -378,7 +386,27 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
     var rememberRecent = true
     var hiddenQuizzes: Set<String> = []
     let libraryDefaults: UserDefaults
-    @Published var quiz = Quiz()
+    @Published var quiz = Quiz() {
+        didSet {
+            if screen == .editor && !suppressUndo && oldValue != quiz { undoHistory.append(oldValue); if undoHistory.count > 100 { undoHistory.removeFirst() } }
+        }
+    }
+    @Published var undoHistory: [Quiz] = []
+    var suppressUndo = false
+    @Published var recoveryAvailable = false
+    var checkpointTicks = 0
+    @Published var checkingQuiz = false
+    @Published var preflightIssues: [String] = []
+    @Published var showPreflight = false
+    @Published var showScoreInputLocally = false
+    @Published var showJump = false
+    @Published var selectedScreen = 0
+    @Published var audioOutputUID = "" { didSet { setAudioOutput() } }
+    @Published var signalsEnabled = false
+    @Published var signalVolume = 0.4
+    var signalPlayer: AVAudioPlayer?
+    var startSignalSent = false
+
     @Published var roundIndex = 0
     @Published var questionIndex = 0
     @Published var playing = false
@@ -445,10 +473,12 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
             if event.isARepeat { return [49,123,124].contains(event.keyCode) ? nil : event }
             return self.handleKey(event.keyCode) ? nil : event
         }
+        selectedScreen = NSScreen.screens.count > 1 ? 1 : 0
+        recoveryAvailable = FileManager.default.fileExists(atPath: recoveryURL.path)
         timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
     }
     func autosave() { do { try writeDirectory(to: draft)
-        if playing || screen == .teams { try persistResults() }
+        if playing || screen == .teams { try persistResults() }; if playing { checkpoint() }
     } catch { status = "Ошибка автосохранения: \(error.localizedDescription)" } }
     func persistResults() throws {
         guard let documentURL else { return }
@@ -594,10 +624,11 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
             roundIndex = 0; questionIndex = 0; remember(url); status = ""
             registeredFontName = asset(quiz.appearance?.fontFile).flatMap { registerFont($0) }
             if quiz.appearance?.fontFile != nil && registeredFontName == nil { status = "Шрифт не удалось открыть — используется системный" }
+            undoHistory = []
             return true
         } catch { status = "Не удалось открыть квиз: \(error.localizedDescription)"; return false }
     }
-    func newQuiz() { autosave(); screen = .editor; quiz = Quiz(); registeredFontName = nil; folder = nil; documentURL = nil; roundIndex = 0; questionIndex = 0; status = "Создан новый квиз" }
+    func newQuiz() { autosave(); screen = .editor; quiz = Quiz(); registeredFontName = nil; folder = nil; documentURL = nil; roundIndex = 0; questionIndex = 0; status = "Создан новый квиз"; undoHistory = [] }
     func attach(image: Bool, explanation: Bool = false, roundIntro: Bool = false) {
         let panel = NSOpenPanel(); panel.allowedContentTypes = image ? [.image] : [.audio,.movie]
         if panel.runModal() == .OK, let url = panel.url {
@@ -761,6 +792,7 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
         for r in quiz.rounds { for q in r.questions { if let pairs = q.matchPairs { matchLayouts[q.id] = MatchLayout.make(pairs) } } }
         for i in quiz.teams.indices { steps.append(Step(kind: .introduction,round: 0,question: i,duration: introductionSeconds)) }
         for (ri,r) in quiz.rounds.enumerated() {
+            if r.tieBreaker == true { continue }
             if let intro = r.intro { steps.append(Step(kind: .roundIntro,round: ri,duration: intro.seconds)) }
             for (qi,q) in r.questions.enumerated() { steps.append(Step(kind: .question,round: ri,question: qi,duration: q.seconds)) }
             if r.repeatQuestions { steps.append(Step(kind: .repeatIntro,round: ri,duration: r.repeatIntroSeconds ?? 5)); for qi in r.questions.indices { steps.append(Step(kind: .repeated,round: ri,question: qi,duration: r.repeatSeconds)) } }
@@ -768,14 +800,24 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
             if r.showAnswers { for (qi,q) in r.questions.enumerated() { steps.append(Step(kind: .answerPrompt,round: ri,question: qi,duration: 4)); steps.append(Step(kind: .answer,round: ri,question: qi,duration: q.answerSeconds)) } }
             if r.standings { steps.append(Step(kind: .standings,round: ri,duration: 0)) }
         }
+        for (ri,r) in quiz.rounds.enumerated() where r.tieBreaker == true {
+            for (qi,q) in r.questions.enumerated() {
+                steps.append(Step(kind: .question,round: ri,question: qi,duration: q.seconds))
+                steps.append(Step(kind: .answerPrompt,round: ri,question: qi,duration: 4))
+                steps.append(Step(kind: .answer,round: ri,question: qi,duration: q.answerSeconds))
+            }
+            steps.append(Step(kind: .standings,round: ri,duration: 0))
+        }
         steps.append(Step(kind: .finish,round: max(0,quiz.rounds.count-1),duration: 0))
-        background.beginGame(); playing = true; paused = false; index = 0; enter()
+        background.beginGame(); playing = true; paused = false; index = 0; enter(); checkpoint(copyAssets: true)
     }
     func enter() {
-        playback.stop(); bleep?.stop(); transitionElapsed = 0; publishedScores = false; mediaDone = true; waitingForMedia = false; elapsed = 0
+        showScoreInputLocally = false
+        playback.stop(); bleep?.stop(); signalPlayer?.stop(); startSignalSent = false; transitionElapsed = 0; publishedScores = false; mediaDone = true; waitingForMedia = false; elapsed = 0
         scoreSnapshot = []; scoreRevealedIDs = []; scoreGroups = []; scoreRevealGroup = 0; scoreRevealElapsed = 0
         guard let s = step else { return }; remaining = s.duration
         awaitingQuestionStart = readBeforeTimer && s.kind == .question
+        if s.kind == .standings && NSScreen.screens.count > 1 { showTV() }
         if s.kind == .roundIntro, let url = asset(quiz.rounds[s.round].intro?.media) {
             mediaDone = false; playback.start(url: url,autoplay: !paused); return
         }
@@ -786,8 +828,10 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
         }
     }
     var foregroundMediaActive: Bool { playing && !paused && !awaitingQuestionStart && !mediaDone }
+    var roundMutesBackground: Bool { guard let s = step, quiz.rounds.indices.contains(s.round), s.kind != .introduction else { return false }; return quiz.rounds[s.round].muteBackground == true }
     func tick() {
-        background.tick(mediaActive: foregroundMediaActive)
+        background.tick(mediaActive: foregroundMediaActive || roundMutesBackground)
+        if playing { checkpointTicks += 1; if checkpointTicks >= 5 { checkpointTicks = 0; checkpoint() } }
         guard playing, !paused, !awaitingQuestionStart, let s = step else { return }
         if s.kind == .standings && publishedScores && !scoresFullyRevealed {
             scoreRevealElapsed += 0.2
@@ -810,8 +854,12 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
             if censored { if bleep == nil { bleep = try? AVAudioPlayer(contentsOf: Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/bleep.wav")); bleep?.numberOfLoops = -1 }; if bleep?.isPlaying != true { bleep?.play() } } else { bleep?.stop() }
         }
         guard ![.standings,.finish].contains(s.kind), s.duration > 0, !waitingForMedia else { return }
+        if signalsEnabled && s.kind == .question && !startSignalSent { signal(1.3); startSignalSent = true }
         elapsed += 0.2
-        if elapsed >= 1 { remaining = max(0, remaining-1); elapsed -= 1 }
+        if elapsed >= 1 {
+            let old = remaining; remaining = max(0, remaining-1); elapsed -= 1
+            if signalsEnabled && [.question,.repeated].contains(s.kind) && old != remaining && remaining <= 5 { signal(remaining == 0 ? 0.65 : 1) }
+        }
         if automaticAdvance && remaining == 0 && mediaDone { transitionElapsed += 0.2; if [.introduction,.repeatIntro,.answerPrompt,.repeated].contains(s.kind) || transitionElapsed >= 2 { next() } }
     }
     func startQuestionTimer() {
@@ -820,23 +868,287 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
         paused = false; playback.setPaused(false)
     }
     func togglePause() { if awaitingQuestionStart { startQuestionTimer(); return }; paused.toggle(); playback.setPaused(paused); if paused { bleep?.stop() } }
-    func next() { if index+1 < steps.count { index += 1; enter() } }
-    func back() { if index > 0 { index -= 1; enter() } }
-    func stop() { autosave(); background.stop(); playback.stop(); bleep?.stop(); playing = false; screen = .editor; tv?.close(); tv = nil }
+    func next() {
+        var target = index+1
+        if let s = step, quiz.rounds[s.round].tieBreaker != true {
+            while steps.indices.contains(target), steps[target].kind != .finish, quiz.rounds[steps[target].round].tieBreaker == true { target += 1 }
+        }
+        if steps.indices.contains(target) { index = target; enter(); if step?.kind == .finish { clearRecovery() } else { checkpoint() } }
+    }
+    func back() { if index > 0 { index -= 1; enter(); checkpoint() } }
+    func stop(preserveRecovery: Bool = false) { autosave(); if !preserveRecovery { clearRecovery() }; signalPlayer?.stop(); background.stop(); playback.stop(); bleep?.stop(); playing = false; screen = .editor; tv?.close(); tv = nil }
     func returnToMenu() { stop(); screen = .home }
     func showTV() {
         if tv != nil { tv?.makeKeyAndOrderFront(nil); return }
-        let screen = NSScreen.screens.dropFirst().first ?? NSScreen.main!
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return }
+        let screen = screens[min(max(0,selectedScreen),screens.count-1)]
         let window = NSWindow(contentRect: screen.visibleFrame, styleMask: [.titled,.closable,.resizable,.miniaturizable], backing: .buffered, defer: false)
         window.title = "Квиз — экран участников"; window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: Stage(studio: self, audience: true))
         window.makeKeyAndOrderFront(nil); tv = window
-        if NSScreen.screens.count > 1 { window.toggleFullScreen(nil) }
+        if NSScreen.screens.count > 1 && screen != NSScreen.main { window.toggleFullScreen(nil) }
     }
 }
 
 
 // A native drag handle avoids Button/List gesture interception on macOS.
+struct GameRecovery: Codable {
+    var quiz: Quiz
+    var steps: [Step]
+    var layouts: [UUID: MatchLayout]
+    var index: Int
+    var remaining: Int
+    var elapsed: Double
+    var awaiting: Bool
+    var mediaDone: Bool
+    var position: Double
+    var automatic: Bool
+    var readFirst: Bool
+    var document: String?
+    var published: Bool
+    var snapshot: [Team]
+    var revealed: Set<UUID>
+    var groups: [[Team]]
+    var revealGroup: Int
+    var revealElapsed: Double
+}
+struct AudioOutput: Identifiable {
+    var id: String
+    var name: String
+    static func available() -> [AudioOutput] {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,mScope: kAudioObjectPropertyScopeGlobal,mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject),&address,0,nil,&size) == noErr else { return [] }
+        var devices = [AudioDeviceID](repeating: 0,count: Int(size)/MemoryLayout<AudioDeviceID>.size)
+        let result = devices.withUnsafeMutableBytes { AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),&address,0,nil,&size,$0.baseAddress!) }
+        guard result == noErr else { return [] }
+        return devices.compactMap { device in
+            var channels = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration,mScope: kAudioDevicePropertyScopeOutput,mElement: kAudioObjectPropertyElementMain)
+            var bytes: UInt32 = 0
+            guard AudioObjectGetPropertyDataSize(device,&channels,0,nil,&bytes) == noErr, bytes > 0 else { return nil }
+            let pointer = UnsafeMutableRawPointer.allocate(byteCount: Int(bytes),alignment: MemoryLayout<AudioBufferList>.alignment); defer { pointer.deallocate() }
+            guard AudioObjectGetPropertyData(device,&channels,0,nil,&bytes,pointer) == noErr else { return nil }
+            let list = UnsafeMutableAudioBufferListPointer(pointer.assumingMemoryBound(to: AudioBufferList.self))
+            guard list.contains(where: { $0.mNumberChannels > 0 }) else { return nil }
+            func string(_ selector: AudioObjectPropertySelector) -> String? {
+                var a = AudioObjectPropertyAddress(mSelector: selector,mScope: kAudioObjectPropertyScopeGlobal,mElement: kAudioObjectPropertyElementMain)
+                var n = UInt32(MemoryLayout<CFString?>.size)
+                let pointer = UnsafeMutablePointer<CFString?>.allocate(capacity: 1)
+                pointer.initialize(to: nil)
+                defer { pointer.deinitialize(count: 1); pointer.deallocate() }
+                guard AudioObjectGetPropertyData(device,&a,0,nil,&n,pointer) == noErr else { return nil }
+                return pointer.pointee as String?
+            }
+            guard let uid = string(kAudioDevicePropertyDeviceUID), let name = string(kAudioObjectPropertyName) else { return nil }
+            return AudioOutput(id: uid,name: name)
+        }
+    }
+}
+extension Studio {
+    var recoveryFolder: URL { draft.deletingLastPathComponent().appendingPathComponent(draft.lastPathComponent + ".recovery") }
+    var recoveryURL: URL { recoveryFolder.appendingPathComponent("session.json") }
+    func checkpoint(copyAssets: Bool = false) {
+        guard playing, let s = step, s.kind != .finish else { return }
+        do {
+            if copyAssets {
+                if folder?.standardizedFileURL != recoveryFolder.standardizedFileURL {
+                    try? FileManager.default.removeItem(at: recoveryFolder.appendingPathComponent("Media"))
+                }
+                try writeDirectory(to: recoveryFolder)
+            }
+            let state = GameRecovery(quiz: quiz,steps: steps,layouts: matchLayouts,index: index,remaining: remaining,elapsed: elapsed,awaiting: awaitingQuestionStart,mediaDone: mediaDone || playback.finished,position: playback.player?.currentTime().seconds ?? 0,automatic: automaticAdvance,readFirst: readBeforeTimer,document: documentURL?.path,published: publishedScores,snapshot: scoreSnapshot,revealed: scoreRevealedIDs,groups: scoreGroups,revealGroup: scoreRevealGroup,revealElapsed: scoreRevealElapsed)
+            try FileManager.default.createDirectory(at: recoveryFolder,withIntermediateDirectories: true)
+            try JSONEncoder().encode(state).write(to: recoveryURL,options: .atomic)
+            recoveryAvailable = true
+        } catch { status = "Не удалось сохранить точку восстановления: " + error.localizedDescription }
+    }
+    func clearRecovery() { try? FileManager.default.removeItem(at: recoveryURL); recoveryAvailable = false }
+    func restoreGame() {
+        do {
+            let state = try JSONDecoder().decode(GameRecovery.self,from: Data(contentsOf: recoveryURL))
+            guard !state.quiz.rounds.isEmpty, state.steps.indices.contains(state.index), state.steps.allSatisfy({ s in
+                state.quiz.rounds.indices.contains(s.round) && (s.kind == .introduction ? state.quiz.teams.indices.contains(s.question) : [.question,.repeated,.answer,.answerPrompt].contains(s.kind) ? state.quiz.rounds[s.round].questions.indices.contains(s.question) : true)
+            }) else { throw CocoaError(.fileReadCorruptFile) }
+            quiz = state.quiz; folder = recoveryFolder
+            documentURL = state.document.map { URL(fileURLWithPath: $0) }
+            steps = state.steps; matchLayouts = state.layouts; index = state.index
+            automaticAdvance = state.automatic; readBeforeTimer = state.readFirst
+            playing = true; paused = true; background.beginGame(); background.muted = true
+            enter(); remaining = max(0,state.remaining); elapsed = max(0,min(1,state.elapsed)); awaitingQuestionStart = state.awaiting
+            if state.mediaDone { playback.stop(); mediaDone = true; waitingForMedia = false }
+            else if step?.kind == .roundIntro, let s = step, let url = asset(quiz.rounds[s.round].intro?.media) {
+                playback.start(url: url,start: state.position.isFinite ? max(0,state.position) : 0,autoplay: false)
+            }
+            else if let clip = currentQuestion, let url = asset(step?.kind == .answer ? (clip.explanationMedia ?? clip.media) : clip.media) {
+                let explanation = step?.kind == .answer && clip.explanationMedia != nil
+                let start = explanation ? 0 : clip.start
+                let end = explanation ? 0 : clip.end
+                let position = state.position.isFinite && state.position >= start && (end == 0 || state.position < end) ? state.position : start
+                playback.start(url: url,start: position,end: end,autoplay: false)
+            }
+            publishedScores = state.published; scoreSnapshot = state.snapshot; scoreRevealedIDs = state.revealed
+            scoreGroups = state.groups; scoreRevealGroup = state.revealGroup; scoreRevealElapsed = state.revealElapsed
+            registeredFontName = asset(quiz.appearance?.fontFile).flatMap { registerFont($0) }
+            status = "Игра восстановлена на паузе. Проверьте экран и нажмите «Продолжить». Фон выключен до вашей команды."
+            undoHistory = []; checkpoint()
+        } catch { status = "Не удалось восстановить игру: " + error.localizedDescription }
+    }
+    func undoEdit() {
+        guard let previous = undoHistory.popLast() else { return }
+        suppressUndo = true; quiz = previous; suppressUndo = false
+        roundIndex = min(roundIndex,max(0,quiz.rounds.count-1)); questionIndex = min(questionIndex,max(0,quiz.rounds[roundIndex].questions.count-1))
+        autosave()
+    }
+    func stepTitle(_ index: Int) -> String {
+        guard steps.indices.contains(index) else { return "" }
+        let s = steps[index]; let r = quiz.rounds[s.round]
+        switch s.kind {
+        case .introduction: return "Представление: " + quiz.teams[s.question].name
+        case .roundIntro: return r.title + " — правила"
+        case .question: return r.title + " — вопрос \(s.question+1)"
+        case .repeated: return r.title + " — повтор \(s.question+1)"
+        case .answerPrompt: return r.title + " — вопрос перед ответом \(s.question+1)"
+        case .answer: return r.title + " — ответ \(s.question+1)"
+        case .repeatIntro: return r.title + " — объявление повторов"
+        case .pause: return r.title + " — сдача бланков"
+        case .standings: return r.title + " — итоги"
+        case .finish: return "Завершение игры"
+        }
+    }
+    func jump(to target: Int) {
+        guard steps.indices.contains(target) else { return }
+        paused = true; index = target; enter(); if step?.kind == .finish { clearRecovery() } else { checkpoint() }
+    }
+    func confirmExit() {
+        let alert = NSAlert(); alert.messageText = "Выйти из игры?"; alert.informativeText = "Команды и баллы сохранятся. Для продолжения текущего этапа выберите «Сохранить и выйти»."
+        alert.addButton(withTitle: "Остаться"); alert.addButton(withTitle: "Сохранить и выйти"); alert.addButton(withTitle: "Завершить игру")
+        let result = alert.runModal()
+        if result == .alertSecondButtonReturn { checkpoint(); stop(preserveRecovery: true) }
+        else if result == .alertThirdButtonReturn { stop() }
+    }
+    func setAudioOutput() {
+        let uid = audioOutputUID.isEmpty ? nil : audioOutputUID
+        playback.outputDevice = uid; background.session.outputDevice = uid; bleep?.currentDevice = uid; signalPlayer?.currentDevice = uid
+    }
+    func signal(_ rate: Float = 1) {
+        guard let url = Bundle.main.url(forResource: "bleep",withExtension: "wav"), let p = try? AVAudioPlayer(contentsOf: url) else { return }
+        signalPlayer?.stop(); p.currentDevice = audioOutputUID.isEmpty ? nil : audioOutputUID; p.volume = Float(signalVolume); p.enableRate = true; p.rate = rate; p.play(); signalPlayer = p
+    }
+    func validateQuiz() async {
+        guard !checkingQuiz else { return }
+        checkingQuiz = true; defer { checkingQuiz = false }
+        var issues = incompleteQuestions
+        for name in referencedAssets {
+            guard let url = asset(name), FileManager.default.fileExists(atPath: url.path) else { issues.append("Нет файла: " + name); continue }
+            if ["png","jpg","jpeg","gif","heic","tiff","webp"].contains(url.pathExtension.lowercased()), NSImage(contentsOf: url) == nil { issues.append("Не читается изображение: " + name) }
+        }
+        var checked: [String: Double] = [:]
+        for round in quiz.rounds {
+            let entries = round.questions.flatMap { q -> [(String,Double,Double,String)] in
+                var a: [(String,Double,Double,String)] = []
+                if let name = q.media { a.append((name,q.start,q.end,round.title + ": " + q.text)) }
+                if let name = q.explanationMedia { a.append((name,0,0,"Объяснение: " + q.text)) }; return a
+            } + (round.intro?.media.map { [($0,0.0,0.0,"Правила: " + round.title)] } ?? [])
+            for (name,start,end,label) in entries {
+                do {
+                    guard let url = asset(name), FileManager.default.fileExists(atPath: url.path) else { continue }
+                    let duration: Double
+                    if let value = checked[name] { duration = value } else {
+                        let asset = AVURLAsset(url: url)
+                        guard try await asset.load(.isPlayable) else { throw CocoaError(.fileReadCorruptFile) }
+                        duration = try await asset.load(.duration).seconds; checked[name] = duration
+                    }
+                    _ = try MediaRange.resolve(start: start,end: end,duration: duration)
+                    if end > duration { issues.append(label + ": конец фрагмента позже конца записи.") }
+                } catch { issues.append(label + ": " + error.localizedDescription) }
+            }
+        }
+        preflightIssues = Array(Set(issues)).sorted()
+    }
+    func beginCheckedGame() {
+        Task { let checked = quiz; await validateQuiz(); guard checked == quiz else { status = "Квиз изменился во время проверки. Нажмите старт ещё раз."; return }; if preflightIssues.isEmpty { beginGame() } else { showPreflight = true } }
+    }
+}
+
+final class GameWindowGuard: NSObject, NSWindowDelegate {
+    weak var studio: Studio?
+    let original: NSWindowDelegate?
+    init(studio: Studio,original: NSWindowDelegate?) { self.studio = studio; self.original = original }
+    override func responds(to selector: Selector!) -> Bool { super.responds(to: selector) || (original?.responds(to: selector) ?? false) }
+    override func forwardingTarget(for selector: Selector!) -> Any? { original?.responds(to: selector) == true ? original : super.forwardingTarget(for: selector) }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if let studio, studio.playing { studio.confirmExit(); if studio.playing { return false } }
+        return original?.windowShouldClose?(sender) ?? true
+    }
+}
+final class GameAppDelegate: NSObject, NSApplicationDelegate {
+    weak var studio: Studio?
+    var guards: [GameWindowGuard] = []
+    func install(_ studio: Studio) {
+        self.studio = studio
+        guard let window = NSApp.windows.first(where: { $0.title.hasPrefix("Квиз Студия") }), !(window.delegate is GameWindowGuard) else { return }
+        let guarder = GameWindowGuard(studio: studio,original: window.delegate); guards.append(guarder); window.delegate = guarder
+    }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let studio, studio.playing else { return .terminateNow }
+        studio.confirmExit(); return studio.playing ? .terminateCancel : .terminateNow
+    }
+}
+
+extension Studio {
+    func duplicateQuiz(from source: URL,to destination: URL) throws {
+        guard source.standardizedFileURL != destination.standardizedFileURL else { throw CocoaError(.fileWriteFileExists) }
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let copy = Studio(draftURL: scratch.appendingPathComponent("Draft.workspace")); copy.timer?.invalidate()
+        guard copy.load(source) else { throw NSError(domain: "QuizCopy",code: 1,userInfo: [NSLocalizedDescriptionKey: copy.status]) }
+        defer { if (try? source.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true, let unpacked = copy.folder { try? FileManager.default.removeItem(at: unpacked) } }
+        copy.quiz.title += " — копия"
+        for i in copy.quiz.teams.indices { copy.quiz.teams[i].scores = [:] }
+        try copy.write(to: destination); remember(destination)
+        status = "Создана копия: " + destination.lastPathComponent
+    }
+    func duplicateQuiz(_ source: URL) {
+        let panel = NSSavePanel(); panel.allowedContentTypes = [UTType(exportedAs: "local.quizstudio.quiz",conformingTo: .data)]; panel.nameFieldStringValue = source.deletingPathExtension().lastPathComponent + " — копия.quiz"
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        do { try duplicateQuiz(from: source,to: destination) } catch { status = "Не удалось создать копию: " + error.localizedDescription }
+    }
+    func saveCopy() {
+        let panel = NSSavePanel(); panel.allowedContentTypes = [UTType(exportedAs: "local.quizstudio.quiz",conformingTo: .data)]; panel.nameFieldStringValue = quiz.title + " — копия.quiz"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard url.standardizedFileURL != documentURL?.standardizedFileURL else { status = "Для копии выберите другое имя файла."; return }
+        do { try write(to: url); remember(url); status = "Копия сохранена. Вы продолжаете редактировать исходный квиз." } catch { status = error.localizedDescription }
+    }
+    var audienceScreenReady: Bool {
+        guard let tv, let display = tv.screen, NSScreen.screens.count > 1 else { return false }
+        let host = NSApp.windows.first { $0.title.hasPrefix("Квиз Студия") }?.screen ?? NSScreen.main
+        return display != host
+    }
+    var hostNote: String {
+        guard let s = step, quiz.rounds.indices.contains(s.round) else { return "" }
+        let round = quiz.rounds[s.round]
+        let q = [.question,.repeated,.answer,.answerPrompt].contains(s.kind) ? currentQuestion?.hostNotes : nil
+        return [round.hostNotes,q].compactMap { $0 }.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.joined(separator: "\n\n")
+    }
+}
+
+struct AnimatedQuizImage: NSViewRepresentable {
+    let url: URL
+    func makeNSView(context: Context) -> NSImageView {
+        let view = NSImageView(); view.imageScaling = .scaleProportionallyUpOrDown; view.imageAlignment = .alignCenter
+        view.setContentCompressionResistancePriority(.defaultLow,for: .horizontal); view.setContentCompressionResistancePriority(.defaultLow,for: .vertical)
+        view.animates = true; view.setContentHuggingPriority(.defaultLow,for: .horizontal); view.setContentHuggingPriority(.defaultLow,for: .vertical)
+        return view
+    }
+    func updateNSView(_ view: NSImageView,context: Context) {
+        if view.identifier?.rawValue != url.path {
+            view.image = NSImage(contentsOf: url); view.identifier = NSUserInterfaceItemIdentifier(url.path)
+        }
+        view.animates = true
+    }
+    static func dismantleNSView(_ view: NSImageView,coordinator: ()) { view.animates = false; view.image = nil }
+}
 struct QuestionDragHandle: NSViewRepresentable {
     let id: UUID
     func makeNSView(context: Context) -> QuestionDragHandleView { QuestionDragHandleView() }
@@ -936,9 +1248,10 @@ struct RoundDropTarget: View {
 }
 
 @main struct QuizStudioApp: App {
+    @NSApplicationDelegateAdaptor(GameAppDelegate.self) var appDelegate
     @StateObject var studio = Studio()
     var body: some Scene {
-        WindowGroup("Квиз Студия · 0.8.0") { Content(studio: studio).frame(minWidth: 1050,minHeight: 720).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if !studio.playing && studio.load(url) { studio.prepareGame() } } }
+        WindowGroup("Квиз Студия · 0.9.1") { Content(studio: studio).onAppear { appDelegate.install(studio) }.frame(minWidth: 1050,minHeight: 720).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if !studio.playing && studio.load(url) { studio.prepareGame() } } }
         .commands { CommandGroup(replacing: .newItem) { Button("Создать квиз") { studio.newQuiz() }.keyboardShortcut("n").disabled(studio.playing); Button("Открыть квиз…") { studio.open() }.keyboardShortcut("o").disabled(studio.playing); Button("Сохранить квиз…") { studio.save() }.keyboardShortcut("s") } }
     }
 }
@@ -991,6 +1304,7 @@ struct Editor: View {
                     Button("Завершить и сохранить") { studio.save() }
                     Button("Старт",systemImage: "play.fill") { studio.prepareGame() }.buttonStyle(.borderedProminent)
                 }.padding(22)
+                HStack { Button("Отменить изменение") { studio.undoEdit() }.disabled(studio.undoHistory.isEmpty); Button("Бланки…") { studio.printSheets() }; Button("Сохранить копию…") { studio.saveCopy() }; Spacer() }.padding(.horizontal,22).padding(.bottom,10)
                 Divider()
                 ScrollView { VStack(alignment: .leading,spacing: 24) {
                     AppearanceEditor(studio: studio)
@@ -1018,12 +1332,16 @@ struct RoundSettings: View {
         GroupBox {
             VStack(alignment: .leading,spacing: 12) {
                 TextField("Название раунда",text: $round.title).font(.title3.bold())
+                DisclosureGroup("Заметки ведущего о раунде") { TextEditor(text: Binding(get: { round.hostNotes ?? "" },set: { round.hostNotes = $0 })).frame(height: 90); Text("На экран участников не выводятся.").font(.caption).foregroundStyle(.secondary) }
+                Toggle("Дополнительный раунд при ничьей",isOn: Binding(get: { round.tieBreaker ?? false },set: { round.tieBreaker = $0 }))
+                if round.tieBreaker == true { Text("Пропускается в обычной игре. Ведущий запускает его через «Перейти…», в том числе с финального экрана.").font(.caption).foregroundStyle(.secondary) }
                 if round.questions.isEmpty && studio.quiz.rounds.count > 1 { Button("Удалить пустой раунд",role: .destructive) { studio.deleteEmptyRound(round.id) } }
                 HStack { Toggle("Повтор вопросов",isOn: $round.repeatQuestions); if round.repeatQuestions { Stepper("По \(round.repeatSeconds) сек",value: $round.repeatSeconds,in: 1...300) } }
                 if round.repeatQuestions { Stepper("Экран перед повтором: \(round.repeatIntroSeconds ?? 5) сек",value: Binding(get: { round.repeatIntroSeconds ?? 5 },set: { round.repeatIntroSeconds = $0 }),in: 2...30) }
                 Stepper("Сдача бланков: \(round.breakSeconds == 0 ? "до команды ведущего" : "\(round.breakSeconds) сек")",value: $round.breakSeconds,in: 0...600,step: 5)
                 Toggle("Показать ответы после раунда",isOn: $round.showAnswers)
                 Toggle("Промежуточные итоги после раунда",isOn: $round.standings)
+                Toggle("Отключить фоновую музыку в этом раунде",isOn: Binding(get: { round.muteBackground ?? false },set: { round.muteBackground = $0 }))
                 HStack {
                     Button(round.intro == nil ? "Добавить объяснение раунда" : "Редактировать объяснение раунда",systemImage: "info.bubble") {
                         if round.intro == nil { round.intro = RoundIntro() }; editingIntro = true
@@ -1046,6 +1364,7 @@ struct QuestionEditor: View {
         VStack(alignment: .leading,spacing: 16) {
             HStack { Text("Вопрос \(studio.questionIndex+1)").font(.title.bold()); Spacer(); Picker("Тип",selection: $question.kind) { ForEach(["Открытый вопрос","Один из четырёх","Сопоставление"],id: \.self) { Text($0) } }.frame(width: 300) }
             TextEditor(text: $question.text).font(.title3).frame(height: 100).padding(8).background(.background,in: RoundedRectangle(cornerRadius: 10)).overlay(RoundedRectangle(cornerRadius: 10).stroke(.quaternary))
+            DisclosureGroup("Заметки ведущего к вопросу") { TextEditor(text: Binding(get: { question.hostNotes ?? "" },set: { question.hostNotes = $0 })).frame(height: 90); Text("Произношение, допустимые ответы и подсказки. Видны ведущему при отдельном экране участников.").font(.caption).foregroundStyle(.secondary) }
             if question.kind == "Один из четырёх" {
                 Text("Нажмите кружок рядом с правильным вариантом").font(.caption).foregroundStyle(.secondary)
                 ForEach(0..<4,id: \.self) { i in
@@ -1061,8 +1380,8 @@ struct QuestionEditor: View {
             } else { TextField("Правильный ответ",text: $question.answer) }
             HStack { Stepper("Время: \(question.seconds == 0 ? "без таймера" : "\(question.seconds) сек")",value: $question.seconds,in: 0...600,step: 5); Button("Применить время и запуск таймера ко всему раунду") { studio.applyTime() } }
             HStack { Button("Добавить картинку",systemImage: "photo") { studio.attach(image: true) }; Button("Добавить аудио / видео",systemImage: "film") { studio.attach(image: false) } }
-            if let url = studio.asset(question.image), let image = NSImage(contentsOf: url) {
-                Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: 200)
+            if let url = studio.asset(question.image) {
+                AnimatedQuizImage(url: url).frame(height: 200)
                 Button("Убрать картинку") { question.image = nil }
             }
             if question.media != nil {
@@ -1089,8 +1408,8 @@ struct QuestionEditor: View {
                         Button("Добавить картинку") { studio.attach(image: true,explanation: true) }
                         Button("Добавить аудио / видео") { studio.attach(image: false,explanation: true) }
                     }
-                    if let url = studio.asset(question.explanationImage), let image = NSImage(contentsOf: url) {
-                        Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: 160)
+                    if let url = studio.asset(question.explanationImage) {
+                        AnimatedQuizImage(url: url).frame(height: 160)
                         Button("Убрать картинку объяснения") { question.explanationImage = nil }
                     }
                     if let url = studio.asset(question.explanationMedia) {
@@ -1119,15 +1438,17 @@ struct PlayerView: View {
     var body: some View {
         VStack(spacing: 0) {
             if studio.step?.kind == .standings && !studio.publishedScores {
-                ScoreEditor(studio: studio)
+                if studio.audienceScreenReady || studio.showScoreInputLocally { ScoreEditor(studio: studio) } else { StandingsBreakHost(studio: studio) }
             } else { Stage(studio: studio,audience: false) }
+            if studio.audienceScreenReady { HostNotes(studio: studio) }
         }
         .overlay(alignment: .bottom) {
             if studio.step?.kind == .finish {
-                Button("Вернуться в меню") { studio.returnToMenu() }.buttonStyle(.borderedProminent).controlSize(.large).padding(28)
+                HStack { Button("Вернуться в меню") { studio.returnToMenu() }; Button("Дополнительный вопрос / этап…") { studio.showJump = true } }.buttonStyle(.borderedProminent).controlSize(.large).padding(28)
             } else if controls || studio.paused || studio.awaitingQuestionStart {
                 HStack(spacing: 18) {
-                    Button("Редактор") { studio.stop() }
+                    Button("Выход") { studio.confirmExit() }
+                    Button("Перейти…") { studio.showJump = true }
                     Button("Назад") { studio.back() }
                     Button(studio.awaitingQuestionStart ? "Запустить таймер" : (studio.paused ? "Продолжить" : "Пауза")) { studio.togglePause() }
                     Button("Вперёд") { studio.next() }
@@ -1139,7 +1460,8 @@ struct PlayerView: View {
                     Button("На весь экран") { NSApp.keyWindow?.toggleFullScreen(nil) }
                 }.buttonStyle(.bordered).padding().background(.regularMaterial,in: Capsule()).padding(20)
             }
-        }.onAppear {
+        }.sheet(isPresented: $studio.showJump) { JumpMenu(studio: studio) }
+        .onAppear {
             hideTask = Task { try? await Task.sleep(for: .seconds(3)); if !Task.isCancelled && !studio.paused { controls = false } }
         }.onDisappear { hideTask?.cancel() }
         .onChange(of: studio.paused) { _,paused in
@@ -1173,7 +1495,7 @@ struct Stage: View {
                                 Text(studio.quiz.rounds[s.round].title).font(studio.stageFont(size: 46,weight: .bold))
                                 Text(intro.text).font(studio.stageFont(size: 28)).multilineTextAlignment(.center)
                                 if let player = studio.player { if studio.playback.hasVideo { NativeMediaView(player: player,controls: false).frame(height: geometry.size.height*0.35) } else { Label("Аудиофрагмент",systemImage: "waveform") } }
-                                if let url = studio.asset(intro.image), let image = NSImage(contentsOf: url) { Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: geometry.size.height*0.3) }
+                                if let url = studio.asset(intro.image) { AnimatedQuizImage(url: url).frame(height: geometry.size.height*0.3) }
                             }
                         case .repeatIntro:
                             Image(systemName: "arrow.counterclockwise").font(studio.stageFont(size: 52))
@@ -1183,7 +1505,7 @@ struct Stage: View {
                         case .pause: Text("Сдаём бланки").font(studio.stageFont(size: 52,weight: .bold)); Text("Спасибо! Скоро продолжим").font(studio.stageFont(size: 28))
                         case .finish: Text("Спасибо за игру!").font(studio.stageFont(size: 56,weight: .bold))
                         case .standings:
-                            if studio.publishedScores { Scores(studio: studio) } else { Text("Подводим итоги").font(studio.stageFont(size: 52,weight: .bold)); Text("Небольшой перерыв").font(studio.stageFont(size: 28)) }
+                            if studio.publishedScores { Scores(studio: studio) } else { Text("Перерыв").font(studio.stageFont(size: 52,weight: .bold)); Text("Мы подсчитываем баллы. Можно немного отдохнуть — скоро покажем результаты.").font(studio.stageFont(size: 28)).multilineTextAlignment(.center) }
                         default:
                             if let q = studio.currentQuestion {
                                 Text("\(studio.quiz.rounds[s.round].title) · \(s.kind == .answer ? "Ответ" : s.kind == .answerPrompt ? "Ответ" : s.kind == .repeated ? "Повтор" : "Вопрос") \(s.question+1)").font(studio.stageFont(size: 20)).foregroundStyle(.white.opacity(0.65))
@@ -1204,7 +1526,7 @@ struct Stage: View {
                                     if studio.playback.hasVideo && (s.kind == .answer ? (q.explanationMedia != nil || q.answerVideo) : !q.audioOnly) { NativeMediaView(player: p,controls: false).frame(height: geometry.size.height*0.38) }
                                     else { Label("Аудиофрагмент",systemImage: "waveform").font(studio.stageFont(size: 28)).padding(30) }
                                 }
-                                if let url = studio.asset(s.kind == .answer ? (q.explanationImage ?? q.image) : q.image), let image = NSImage(contentsOf: url) { Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: geometry.size.height*(studio.player == nil ? 0.4 : 0.2)) }
+                                if let url = studio.asset(s.kind == .answer ? (q.explanationImage ?? q.image) : q.image) { AnimatedQuizImage(url: url).frame(height: geometry.size.height*(studio.player == nil ? 0.4 : 0.2)) }
                             }
                         }
                         if studio.playback.loading { Text("Открываем фрагмент…").font(.caption) }
@@ -1222,7 +1544,7 @@ struct ScoreEditor: View {
     var body: some View {
         VStack(alignment: .leading,spacing: 20) {
             Text("Промежуточные итоги").font(.largeTitle.bold())
-            Text("На отдельном экране ТВ остаётся заставка. В режиме дублирования экрана таблица ввода будет видна всем.").foregroundStyle(.secondary)
+            Text("На отдельном экране ТВ — перерыв. Нажмите «Показать итоги», когда все баллы проверены.").foregroundStyle(.secondary)
             ScrollView([.horizontal,.vertical]) {
                 VStack(alignment: .leading) {
                     HStack { Text("Команда").frame(width: 200); ForEach(studio.quiz.rounds) { r in Text(r.title).frame(width: 100) }; Text("Всего").frame(width: 70) }
@@ -1230,11 +1552,12 @@ struct ScoreEditor: View {
                         HStack {
                             Text(team.name).frame(width: 200,alignment: .leading)
                             ForEach(studio.quiz.rounds) { r in ScoreField(value: Binding(get: { team.scores[r.id.uuidString] ?? 0 },set: { team.scores[r.id.uuidString] = $0 })).frame(width: 100) }
-                            Text("\(team.total)").frame(width: 70)
+                            Text(scoreText(team.total)).frame(width: 70)
                         }
                     }
                 }.textFieldStyle(.roundedBorder)
             }
+            Text("Можно вводить дробные баллы через точку или запятую и отрицательные значения для штрафов. При равной сумме команды получают одинаковое место.").font(.caption).foregroundStyle(.secondary)
             HStack { Button("Показать итоги") { studio.publishScores() }.buttonStyle(.borderedProminent) }
             Spacer()
         }.padding(40).padding(.bottom,70)
@@ -1258,7 +1581,7 @@ struct Scores: View {
                                 if studio.scoreRevealedIDs.contains(team.id) {
                                     Text(team.name).transition(.opacity.combined(with: .move(edge: .bottom)))
                                     Spacer()
-                                    Text("\(team.total)").bold().transition(.opacity.combined(with: .scale(scale: 0.8)))
+                                    Text(scoreText(team.total)).bold().transition(.opacity.combined(with: .scale(scale: 0.8)))
                                 } else { Text("•••").foregroundStyle(.white.opacity(0.25)); Spacer() }
                             }.font(studio.stageFont(size: 28)).padding(16)
                                 .background(.white.opacity(studio.scoreRevealedIDs.contains(team.id) ? 0.12 : 0.035),in: RoundedRectangle(cornerRadius: 12)).id(team.id)
@@ -1284,6 +1607,7 @@ struct Welcome: View {
                 Button { studio.showLibrary(editing: true) } label: { entry("Создать квиз","Новый квиз или редактирование готового","square.and.pencil") }
                 Button { studio.showLibrary(editing: false) } label: { entry("Запустить квиз","Выбрать игру и представить команды","play.rectangle") }
             }.buttonStyle(.plain)
+            if studio.recoveryAvailable { Button("Восстановить незавершённую игру") { studio.restoreGame() }.buttonStyle(.borderedProminent) }
             Button("Продолжить редактирование черновика") { studio.screen = .editor }
             Text(studio.status).foregroundStyle(.secondary)
         }.padding(40).frame(maxWidth: .infinity,maxHeight: .infinity).background(Color.indigo.opacity(0.04))
@@ -1299,8 +1623,16 @@ struct QuizLibrary: View {
     @ObservedObject var studio: Studio
     var editing = false
     @State var search = ""
+    @State private var newestFirst = true
     var visibleQuizzes: [URL] {
-        studio.recentQuizzes.filter { search.isEmpty || $0.deletingPathExtension().lastPathComponent.localizedCaseInsensitiveContains(search) }
+        studio.recentQuizzes.filter { search.isEmpty || $0.deletingPathExtension().lastPathComponent.localizedCaseInsensitiveContains(search) }.sorted { a,b in
+            if newestFirst {
+                let ad = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let bd = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                if ad != bd { return ad > bd }
+            }
+            return a.lastPathComponent.localizedStandardCompare(b.lastPathComponent) == .orderedAscending
+        }
     }
     var body: some View {
         VStack(alignment: .leading,spacing: 24) {
@@ -1312,7 +1644,7 @@ struct QuizLibrary: View {
             }
             Text(editing ? "Создать или редактировать квиз" : "Запустить квиз").font(.largeTitle.bold())
             Text(editing ? "Откройте сохранённый квиз для правок или начните новый с нуля." : "Выберите квиз для проведения. Его также можно открыть для редактирования.").foregroundStyle(.secondary)
-            TextField("Найти квиз по названию",text: $search).textFieldStyle(.roundedBorder)
+            HStack { TextField("Найти квиз по названию",text: $search).textFieldStyle(.roundedBorder); Picker("Порядок",selection: $newestFirst) { Text("По дате изменения").tag(true); Text("По названию").tag(false) }.frame(width: 260) }
             if studio.recentQuizzes.isEmpty {
                 ContentUnavailableView("Пока нет сохранённых квизов",systemImage: "rectangle.stack",description: Text(editing ? "Создайте квиз с нуля или откройте файл на Mac." : "Нажмите «Открыть квиз на Mac…» и укажите файл .quiz"))
             } else if visibleQuizzes.isEmpty {
@@ -1323,9 +1655,11 @@ struct QuizLibrary: View {
                         Image(systemName: "doc.text").font(.title2).foregroundStyle(.indigo)
                         VStack(alignment: .leading,spacing: 5) {
                             Text(url.deletingPathExtension().lastPathComponent).font(.headline)
+                            if let date = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate { Text("Изменён: " + date.formatted(date: .abbreviated,time: .shortened)).font(.caption).foregroundStyle(.secondary) }
                             Text(((try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true ? "Папка старого формата · " : "Файл .quiz · ") + url.path).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         }
                         Spacer()
+                        Button("Создать копию") { studio.duplicateQuiz(url) }
                         Button("Редактировать",systemImage: "square.and.pencil") { studio.editQuiz(url) }
                         if !editing { Button("Запустить",systemImage: "play.fill") { if studio.load(url) { studio.prepareGame() } }.buttonStyle(.borderedProminent) }
                         Button { studio.removeFromLibrary(url) } label: { Image(systemName: "xmark.circle") }
@@ -1341,8 +1675,9 @@ struct QuizLibrary: View {
 struct TeamSetup: View {
     @ObservedObject var studio: Studio
     @State private var musicSettings = false
+    @State private var deviceSettings = false
     var body: some View {
-        VStack(alignment: .leading,spacing: 20) {
+        ScrollView { VStack(alignment: .leading,spacing: 20) {
             HStack { Button("Назад") { studio.screen = .library }; Spacer(); Button("Открыть редактор") { studio.screen = .editor } }
             Text("Команды на игру").font(.largeTitle.bold())
             Text(studio.quiz.title).font(.title2).foregroundStyle(.secondary)
@@ -1352,11 +1687,12 @@ struct TeamSetup: View {
                     HStack {
                         Image(systemName: "person.3.fill").foregroundStyle(.indigo)
                         TextField("Название команды",text: $team.name).textFieldStyle(.roundedBorder)
-                        if team.total != 0 { Text("\(team.total) баллов").foregroundStyle(.secondary) }
+                        if team.total != 0 { Text(scoreText(team.total) + " баллов").foregroundStyle(.secondary) }
                         Button("Удалить",role: .destructive) { studio.quiz.teams.removeAll { $0.id == team.id } }
                     }.padding(6)
                 }
             }
+            .frame(height: 180)
             Button("Добавить команду",systemImage: "plus") { studio.quiz.teams.append(Team(name: "")) }
             Stepper("Представление каждой команды: \(studio.introductionSeconds) сек",value: $studio.introductionSeconds,in: 3...30)
             VStack(alignment: .leading,spacing: 10) {
@@ -1371,11 +1707,14 @@ struct TeamSetup: View {
                 Text("Вопрос появится без отсчёта. После чтения нажмите «Запустить таймер» или пробел. Для аудио/видео эта кнопка запускает запись; отсчёт идёт во время фрагмента или после него по настройке вопроса.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            HStack { Button("Проверить квиз") { studio.showPreflight = true; Task { await studio.validateQuiz() } }; Button("Экран и звук…") { deviceSettings = true }; Button("Печатные бланки…") { studio.printSheets() } }
             BackgroundMusicSetup(music: studio.background,showSettings: $musicSettings)
             Toggle("Начать новую игру — обнулить прошлые баллы",isOn: $studio.resetScores)
             Text("Снимите галочку, чтобы сохранить уже введённые результаты. Названия команд сохраняются в обоих случаях.").font(.caption).foregroundStyle(.secondary)
-            HStack { Text(studio.status).foregroundStyle(.secondary); Spacer(); Button("Начать игру",systemImage: "play.fill") { studio.beginGame() }.buttonStyle(.borderedProminent).disabled(studio.quiz.teams.isEmpty) }
-        }.padding(36)
+            HStack { Text(studio.status).foregroundStyle(.secondary); Spacer(); Button("Начать игру",systemImage: "play.fill") { studio.beginCheckedGame() }.buttonStyle(.borderedProminent).disabled(studio.quiz.teams.isEmpty || studio.checkingQuiz) }
+        }.padding(36) }
+        .sheet(isPresented: $deviceSettings) { DeviceSettings(studio: studio) }
+        .sheet(isPresented: $studio.showPreflight) { PreflightReport(studio: studio) }
     }
 }
 
@@ -1518,16 +1857,16 @@ class SelectableScoreTextField: NSTextField {
     }
 }
 struct ScoreField: NSViewRepresentable {
-    @Binding var value: Int
+    @Binding var value: Double
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     func makeNSView(context: Context) -> SelectableScoreTextField {
         let field = SelectableScoreTextField(); field.delegate = context.coordinator; field.isBezeled = true; field.bezelStyle = .roundedBezel
-        field.stringValue = String(value); field.alignment = .right; field.setContentHuggingPriority(.defaultLow,for: .horizontal)
+        field.stringValue = scoreText(value); field.alignment = .right; field.setContentHuggingPriority(.defaultLow,for: .horizontal)
         return field
     }
     func updateNSView(_ field: SelectableScoreTextField,context: Context) {
         context.coordinator.parent = self
-        if field.currentEditor() == nil { field.stringValue = String(value) }
+        if field.currentEditor() == nil { field.stringValue = scoreText(value) }
     }
     final class Coordinator: NSObject,NSTextFieldDelegate {
         var parent: ScoreField
@@ -1538,11 +1877,11 @@ struct ScoreField: NSViewRepresentable {
         }
         func controlTextDidChange(_ notification: Notification) {
             guard let field = notification.object as? NSTextField else { return }
-            if let number = Int(field.stringValue) { parent.value = number }
+            if let number = Double(field.stringValue.replacingOccurrences(of: ",",with: ".").replacingOccurrences(of: "\u{00a0}",with: "").replacingOccurrences(of: "\u{202f}",with: "").replacingOccurrences(of: " ",with: "")), number.isFinite { parent.value = (number*100).rounded()/100 }
             else if field.stringValue.isEmpty { parent.value = 0 }
         }
         func controlTextDidEndEditing(_ notification: Notification) {
-            guard let field = notification.object as? NSTextField else { return }; field.stringValue = String(parent.value)
+            guard let field = notification.object as? NSTextField else { return }; field.stringValue = scoreText(parent.value)
         }
     }
 }
@@ -1561,8 +1900,8 @@ struct RoundIntroEditor: View {
                 Button("Добавить картинку") { studio.attach(image: true,roundIntro: true) }
                 Button("Добавить аудио / видео") { studio.attach(image: false,roundIntro: true) }
             }
-            if let url = studio.asset(intro.image), let image = NSImage(contentsOf: url) {
-                Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: 150)
+            if let url = studio.asset(intro.image) {
+                AnimatedQuizImage(url: url).frame(height: 150)
                 Button("Убрать картинку") { intro.image = nil }
             }
             if let url = studio.asset(intro.media) {
@@ -1629,5 +1968,141 @@ struct AppearanceEditor: View {
                 Button("Вернуть стандартное оформление") { studio.quiz.appearance = nil; studio.registeredFontName = nil }
             }.padding(.top,12)
         }.padding(14).background(.quaternary.opacity(0.35),in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+struct PreflightReport: View {
+    @ObservedObject var studio: Studio
+    @Environment(\.dismiss) var dismiss
+    var body: some View {
+        VStack(alignment: .leading,spacing: 16) {
+            Text("Проверка перед игрой").font(.title.bold())
+            if studio.checkingQuiz { ProgressView("Проверяем вопросы, файлы и границы записей…") }
+            else if studio.preflightIssues.isEmpty { Label("Проблем не найдено",systemImage: "checkmark.circle.fill").foregroundStyle(.green) }
+            List(Array(studio.preflightIssues.enumerated()),id: \.offset) { _,issue in Text(issue).foregroundStyle(.orange) }
+            Text("Проверка не заменяет пробный показ на телевизоре. Звук можно проверить в настройках экрана и звука.").font(.caption).foregroundStyle(.secondary)
+            HStack { Button("Проверить снова") { Task { await studio.validateQuiz() } }.disabled(studio.checkingQuiz); Spacer(); Button("Закрыть") { dismiss() } }
+        }.padding(24).frame(width: 650,height: 450)
+    }
+}
+struct JumpMenu: View {
+    @ObservedObject var studio: Studio
+    @Environment(\.dismiss) var dismiss
+    var body: some View {
+        VStack(alignment: .leading) {
+            Text("Перейти к этапу").font(.title.bold())
+            Text("Переход откроет этап на паузе. Баллы сохранятся. Меню видно только ведущему на отдельном экране Mac.").font(.callout).foregroundStyle(.secondary)
+            List(Array(studio.steps.indices),id: \.self) { i in
+                Button { studio.jump(to: i); dismiss() } label: {
+                    HStack { Text(studio.stepTitle(i)); Spacer(); if i == studio.index { Image(systemName: "checkmark") } }
+                }.buttonStyle(.plain).padding(4)
+            }
+            Button("Закрыть") { dismiss() }
+        }.padding(24).frame(width: 600,height: 560)
+    }
+}
+struct DeviceSettings: View {
+    @ObservedObject var studio: Studio
+    @Environment(\.dismiss) var dismiss
+    @State private var outputs = AudioOutput.available()
+    @State private var testWindow: NSWindow?
+    var body: some View {
+        VStack(alignment: .leading,spacing: 18) {
+            Text("Экран и звук").font(.title.bold())
+            Picker("Экран участников",selection: $studio.selectedScreen) {
+                ForEach(Array(NSScreen.screens.enumerated()),id: \.offset) { i,s in Text("\(i+1). " + s.localizedName).tag(i) }
+            }
+            Button("Проверить изображение") {
+                testWindow?.close(); let screens = NSScreen.screens
+                guard screens.indices.contains(studio.selectedScreen) else { return }
+                let window = NSWindow(contentRect: screens[studio.selectedScreen].visibleFrame,styleMask: [.titled,.closable],backing: .buffered,defer: false)
+                window.isReleasedWhenClosed = false; window.title = "Проверка экрана"
+                window.contentView = NSHostingView(rootView: ZStack { Color.indigo; VStack(spacing: 30) { Text("КВИЗ СТУДИЯ").font(.system(size: 60,weight: .bold)); Text("Здесь будет экран участников").font(.largeTitle) }.foregroundStyle(.white) })
+                window.makeKeyAndOrderFront(nil); testWindow = window
+            }
+            Picker("Устройство звука",selection: $studio.audioOutputUID) {
+                Text("Системное по умолчанию").tag("")
+                ForEach(outputs) { Text($0.name).tag($0.id) }
+            }
+            HStack { Button("Обновить устройства") { outputs = AudioOutput.available() }; Button("Проверить звук") { studio.signal() } }
+            Text("Выбор применяется к записям, фоновой музыке и сигналам приложения. При отключении устройства выберите другое или системное по умолчанию.").font(.caption).foregroundStyle(.secondary)
+            Divider()
+            Toggle("Звуковые сигналы начала и окончания обсуждения",isOn: $studio.signalsEnabled)
+            HStack { Text("Громкость сигналов"); Slider(value: $studio.signalVolume,in: 0...1); Text("\(Int(studio.signalVolume*100))%") }
+            Text("Последние пять секунд отмечаются короткими сигналами. Громкость не зависит от фоновой музыки.").font(.caption).foregroundStyle(.secondary)
+            Spacer()
+            Button("Готово") { dismiss() }.keyboardShortcut(.defaultAction)
+        }.padding(24).frame(width: 620,height: 500)
+        .onDisappear { testWindow?.close(); studio.signalPlayer?.stop() }
+    }
+}
+extension Studio {
+    func printSheets() {
+        let choice = NSAlert(); choice.messageText = "Подготовить PDF для печати"; choice.informativeText = "Бланки создаются для каждой команды с номерами вопросов. Лист проверяющего содержит ответы и текстовые объяснения."
+        choice.addButton(withTitle: "Бланки команд"); choice.addButton(withTitle: "Ответы для проверки"); choice.addButton(withTitle: "Отмена")
+        let result = choice.runModal(); guard result != .alertThirdButtonReturn else { return }
+        let answers = result == .alertSecondButtonReturn
+        let panel = NSSavePanel(); panel.allowedContentTypes = [.pdf]; panel.nameFieldStringValue = answers ? "Ответы.pdf" : "Бланки.pdf"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try exportSheets(to: url,answers: answers); status = "PDF сохранён: " + url.lastPathComponent }
+        catch { status = "Не удалось создать PDF: " + error.localizedDescription }
+    }
+    func exportSheets(to url: URL,answers: Bool) throws {
+        var box = CGRect(x: 0,y: 0,width: 595,height: 842)
+        guard let consumer = CGDataConsumer(url: url as CFURL), let context = CGContext(consumer: consumer,mediaBox: &box,nil) else { throw CocoaError(.fileWriteUnknown) }
+        func page(_ title: String,_ body: String) {
+            context.beginPDFPage(nil); context.saveGState(); context.translateBy(x: 0,y: 842); context.scaleBy(x: 1,y: -1)
+            NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(cgContext: context,flipped: true)
+            (title as NSString).draw(in: NSRect(x: 40,y: 35,width: 515,height: 70),withAttributes: [.font:NSFont.boldSystemFont(ofSize: 18),.foregroundColor:NSColor.black])
+            (body as NSString).draw(in: NSRect(x: 40,y: 115,width: 515,height: 680),withAttributes: [.font:NSFont.systemFont(ofSize: 13),.foregroundColor:NSColor.black])
+            NSGraphicsContext.restoreGraphicsState(); context.restoreGState(); context.endPDFPage()
+        }
+        if answers {
+            for round in quiz.rounds { for (i,q) in round.questions.enumerated() {
+                let correct = q.kind == "Сопоставление" && q.matchPairs != nil ? q.matchPairs!.map { $0.left + " — " + $0.right }.joined(separator: "\n") : q.correctAnswer
+                // Split long content to preserve every character on printed pages.
+                let text = q.text + "\n\nОтвет:\n" + correct + "\n\nОбъяснение:\n" + (q.explanation ?? "")
+                var chunks: [String] = []; var rest = text as NSString
+                while rest.length > 0 {
+                    let storage = NSTextStorage(string: rest as String,attributes: [.font:NSFont.systemFont(ofSize: 13)])
+                    let layout = NSLayoutManager(); let container = NSTextContainer(size: NSSize(width: 515,height: 675)); container.lineFragmentPadding = 0
+                    layout.addTextContainer(container); storage.addLayoutManager(layout)
+                    let glyphs = layout.glyphRange(for: container)
+                    let range = layout.characterRange(forGlyphRange: glyphs,actualGlyphRange: nil)
+                    guard range.length > 0 else { throw CocoaError(.fileWriteUnknown) }
+                    chunks.append(rest.substring(with: range)); rest = rest.substring(from: range.length) as NSString
+                }
+                for (part,chunk) in chunks.enumerated() { page(quiz.title + " · " + round.title + " · \(i+1)" + (part > 0 ? " (продолжение)" : ""),chunk) }
+            } }
+        } else {
+            let names = quiz.teams.isEmpty ? ["Команда: ____________________"] : quiz.teams.map(\.name)
+            for name in names { for round in quiz.rounds { for start in stride(from: 0,to: round.questions.count,by: 5) {
+                let body = (start..<min(start+5,round.questions.count)).map { "Вопрос \($0+1)\n\n________________________________________________________\n\n________________________________________________________\n\n" }.joined()
+                page(quiz.title + " · " + round.title + "\n" + name,body)
+            } } }
+        }
+        context.closePDF()
+    }
+}
+
+struct HostNotes: View {
+    @ObservedObject var studio: Studio
+    var body: some View {
+        if !studio.hostNote.isEmpty {
+            DisclosureGroup("Заметки ведущего") { ScrollView { Text(studio.hostNote).frame(maxWidth: .infinity,alignment: .leading).textSelection(.enabled) }.frame(maxHeight: 120) }
+                .padding(12).background(.regularMaterial)
+        }
+    }
+}
+struct StandingsBreakHost: View {
+    @ObservedObject var studio: Studio
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Перерыв · подсчёт баллов").font(.largeTitle.bold())
+            Text("Чтобы таблица ввода не была видна участникам, подключите ТВ как отдельный экран, без дублирования рабочего стола.").multilineTextAlignment(.center)
+            Button("Открыть экран участников") { studio.showTV(); studio.objectWillChange.send() }.disabled(NSScreen.screens.count < 2)
+            Button("Зрители не видят этот Mac — открыть ввод баллов") { studio.showScoreInputLocally = true }
+            Text("На отдельном экране участников остаётся заставка перерыва до команды «Показать итоги».").font(.caption).foregroundStyle(.secondary)
+        }.padding(40).frame(maxWidth: .infinity,maxHeight: .infinity)
     }
 }

@@ -1,3 +1,4 @@
+import ImageIO
 struct Stage: View { var studio: Studio; var audience: Bool; var body: some View { EmptyView() } }
 @main struct MediaChecks {
  @MainActor static func wait(_ name: String,_ predicate: () -> Bool) async throws {
@@ -125,6 +126,45 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   quiz.background.enabled = false
   print("PASS: supplied music opens, custom import validation/local copy, saved local playlist, fade/duck/speech/mute, repeat, enable/disable, preview, music excluded from quiz assets")
 
+  quiz.quiz.rounds[0].questions[0].start = 100
+  await quiz.validateQuiz(); assert(!quiz.preflightIssues.isEmpty)
+  quiz.quiz.rounds[0].questions[0].start = 0.4
+  await quiz.validateQuiz(); assert(quiz.preflightIssues.isEmpty)
+  quiz.quiz.rounds[0].questions[0].image = "missing.png"
+  await quiz.validateQuiz(); assert(quiz.preflightIssues.contains { $0.contains("missing.png") })
+  quiz.quiz.rounds[0].questions[0].image = nil
+  quiz.start(); quiz.startQuestionTimer()
+  try await wait("recovery source playing") { !quiz.playback.loading }
+  quiz.player?.volume = 0; quiz.remaining = 3; quiz.checkpoint()
+  let recovered = Studio(draftURL: quiz.draft); recovered.timer?.invalidate(); recovered.restoreGame()
+  assert(recovered.playing && recovered.paused && recovered.remaining == 3)
+  assert(FileManager.default.fileExists(atPath: recovered.asset("tone.wav")!.path))
+  try await wait("recovered recording prepared") { !recovered.playback.loading }
+  assert(recovered.player?.rate == 0 && recovered.playback.error == nil)
+  recovered.stop(); quiz.stop()
+  let outputs = AudioOutput.available()
+  quiz.audioOutputUID = outputs.first?.id ?? ""
+  assert(quiz.playback.outputDevice == quiz.background.session.outputDevice)
+  print("PASS: preflight catches bounds/missing media, valid media succeeds, recovery retains local assets and waits paused, sound output routes consistently")
+  let gif = root.appendingPathComponent("animated.gif")
+  let destinationGIF = CGImageDestinationCreateWithURL(gif as CFURL,"com.compuserve.gif" as CFString,2,nil)!
+  CGImageDestinationSetProperties(destinationGIF,[kCGImagePropertyGIFDictionary:[kCGImagePropertyGIFLoopCount:0]] as CFDictionary)
+  for red in [true,false] {
+   let bitmap = CGContext(data:nil,width:32,height:32,bitsPerComponent:8,bytesPerRow:128,space:CGColorSpaceCreateDeviceRGB(),bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue)!
+   bitmap.setFillColor((red ? NSColor.red : NSColor.blue).cgColor); bitmap.fill(CGRect(x:0,y:0,width:32,height:32))
+   CGImageDestinationAddImage(destinationGIF,bitmap.makeImage()!,[kCGImagePropertyGIFDictionary:[kCGImagePropertyGIFDelayTime:0.1]] as CFDictionary)
+  }
+  assert(CGImageDestinationFinalize(destinationGIF))
+  let gifSource = CGImageSourceCreateWithURL(gif as CFURL,nil)!; assert(CGImageSourceGetCount(gifSource)==2)
+  let gifHost = NSHostingView(rootView:AnimatedQuizImage(url:gif)); gifHost.frame=NSRect(x:0,y:0,width:300,height:200); gifHost.layoutSubtreeIfNeeded()
+  func imageViews(_ view: NSView) -> [NSImageView] { (view as? NSImageView).map { [$0] } ?? view.subviews.flatMap(imageViews) }
+  assert(imageViews(gifHost).contains { $0.animates && $0.image != nil })
+  try FileManager.default.copyItem(at:gif,to:media.appendingPathComponent("animated.gif"))
+  quiz.quiz.rounds[0].intro = RoundIntro(text:"Правила",image:"animated.gif")
+  let gifQuiz = root.appendingPathComponent("gif.quiz"); try quiz.write(to:gifQuiz)
+  let gifArchive = try JSONDecoder().decode(QuizFile.self,from:Data(contentsOf:gifQuiz))
+  let gifBytes = try Data(contentsOf:gif); assert(gifArchive.assets["animated.gif"] == gifBytes)
+  print("PASS: two-frame GIF opens in animated native view and transfers unchanged with round description")
   quiz.addRound(); let destination=quiz.quiz.rounds[1].id
   let provider=NSItemProvider(object:question.id.uuidString as NSString)
   assert(quiz.acceptQuestionDrop([provider],toRound:destination))

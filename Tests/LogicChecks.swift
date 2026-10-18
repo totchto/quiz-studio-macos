@@ -1,3 +1,4 @@
+import PDFKit
 struct Stage: View { var studio: Studio; var audience: Bool; var body: some View { EmptyView() } }
 @main struct Checks {
  @MainActor static func tryData(_ url: URL) -> Data { (try? Data(contentsOf: url)) ?? Data() }
@@ -111,7 +112,7 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   let beforeInvalid = imported.quiz; assert(!imported.load(invalid) && imported.quiz == beforeInvalid)
   let editor = NSTextView()
   let field = MockScoreField(editor: editor); field.stringValue = "0"; editor.string = "0"; field.selectZero(); assert(editor.string.isEmpty)
-  var score = 0
+  var score: Double = 0
   let scoreInput = ScoreField(value: Binding(get: { score },set: { score = $0 }))
   let delegate = scoreInput.makeCoordinator(); field.stringValue = "12"
   delegate.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification,object: field)); assert(score == 12)
@@ -258,6 +259,56 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   for _ in 0..<20 { modes.tick() }; assert(modes.index == 0)
   modes.automaticAdvance = true; modes.tick(); assert(modes.index == 1)
   print("PASS: reading gate, space starts timer, automatic/manual advance, pause, next/back, repeat without reading gate")
+
+  let reliable = Studio(draftURL: root.appendingPathComponent("reliable.workspace")); reliable.timer?.invalidate()
+  reliable.quiz.rounds[0].questions = [Question(text: "Сохраняемый вопрос",answer: "Ответ",seconds: 30)]
+  reliable.quiz.teams = [Team(name: "А",scores: ["r": 1.5]),Team(name: "Б",scores: ["r": -0.5])]
+  reliable.start(); reliable.index = 2; reliable.enter(); reliable.remaining = 17
+  reliable.checkpoint(); let expectedStep = reliable.step?.kind
+  let resumed = Studio(draftURL: reliable.draft); resumed.timer?.invalidate(); assert(resumed.recoveryAvailable)
+  resumed.restoreGame(); assert(resumed.playing && resumed.paused && resumed.remaining == 17 && resumed.step?.kind == expectedStep)
+  assert(resumed.quiz.teams[0].total == 1.5 && resumed.quiz.teams[1].total == -0.5)
+  resumed.stop(preserveRecovery: true); assert(resumed.recoveryAvailable)
+  resumed.restoreGame(); resumed.stop(); assert(!resumed.recoveryAvailable)
+  let undo = Studio(draftURL: root.appendingPathComponent("undo.workspace")); undo.timer?.invalidate(); undo.screen = .editor
+  undo.quiz.rounds[0].questions[0].text = "До удаления"; undo.deleteSelectedQuestion(); assert(undo.selectedQuestion == nil)
+  undo.undoEdit(); assert(undo.selectedQuestion?.text == "До удаления")
+  var extra = Round(title: "Тайбрейк",questions: [Question(text: "Решающий",answer: "Да")]); extra.tieBreaker = true
+  undo.quiz.rounds[0].questions[0].answer = "Ответ"
+  undo.quiz.rounds.append(extra); undo.start()
+  let extraIndex = undo.steps.firstIndex { $0.round == 1 && $0.kind == .question }!
+  undo.index = extraIndex-1; undo.next(); assert(undo.step?.kind == .finish)
+  undo.jump(to: extraIndex); assert(undo.paused && undo.currentQuestion?.text == "Решающий")
+  undo.quiz.rounds[1].muteBackground = true; assert(undo.roundMutesBackground)
+  field.stringValue = "-1,25"; delegate.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification,object: field)); assert(score == -1.25)
+  let sheets = root.appendingPathComponent("answers.pdf"); try undo.exportSheets(to: sheets,answers: true)
+  let pdfBytes = try Data(contentsOf: sheets); assert(pdfBytes.starts(with: Data("%PDF".utf8)))
+  let pdf = PDFDocument(url: sheets)!; assert(pdf.pageCount == 2 && (pdf.string ?? "").contains("Решающий"))
+  undo.quiz.rounds[0].questions[0].explanation = String(repeating: "Строка объяснения\n",count: 150) + "КОНЕЦ ОБЪЯСНЕНИЯ"
+  try undo.exportSheets(to: sheets,answers: true)
+  let longPDF = PDFDocument(url: sheets)!; assert(longPDF.pageCount > 2 && (longPDF.string ?? "").contains("КОНЕЦ ОБЪЯСНЕНИЯ"))
+  try undo.exportSheets(to: root.appendingPathComponent("blank.pdf"),answers: false)
+  assert(PDFDocument(url: root.appendingPathComponent("blank.pdf"))!.pageCount == 2)
+  print("PASS: recovery paused with retained timer/scores, explicit recovery exit, undo deletion, optional tie-breaker skip/jump, round music suppression, decimal penalties and printable PDF")
+
+  let librarySource = root.appendingPathComponent("library-source.quiz")
+  undo.quiz.rounds[0].hostNotes = "Заметка о раунде"
+  undo.quiz.rounds[0].questions[0].hostNotes = "Произнести слово правильно"
+  undo.quiz.teams = [Team(name: "Команда",scores: ["r": 2.5])]
+  try undo.write(to: librarySource); let originalBytes = try Data(contentsOf: librarySource)
+  let currentBeforeCopy = undo.quiz
+  let copiedURL = root.appendingPathComponent("library-copy.quiz")
+  try undo.duplicateQuiz(from: librarySource,to: copiedURL)
+  assert(undo.quiz == currentBeforeCopy && (tryData(librarySource)) == originalBytes)
+  let copyArchive = try JSONDecoder().decode(QuizFile.self,from: Data(contentsOf: copiedURL))
+  assert(copyArchive.quiz.title.hasSuffix("— копия") && copyArchive.quiz.teams[0].total == 0)
+  assert(copyArchive.quiz.rounds[0].hostNotes == "Заметка о раунде" && copyArchive.quiz.rounds[0].questions[0].hostNotes == "Произнести слово правильно")
+  undo.jump(to: undo.steps.firstIndex { $0.round == 0 && $0.kind == .question }!)
+  assert(undo.hostNote.contains("Произнести") && undo.hostNote.contains("Заметка"))
+  assert(!undo.publishedScores); undo.publishScores(); assert(undo.publishedScores)
+  undo.jump(to: undo.steps.firstIndex { $0.kind == .standings }!); assert(!undo.publishedScores && !undo.showScoreInputLocally)
+  do { try undo.duplicateQuiz(from: librarySource,to: librarySource); assertionFailure("Must not overwrite source") } catch {}
+  print("PASS: quiz duplication without source/current edits, reset copied scores, portable host notes, standings remain private until publication")
 
   print("PASS: schedule, per-round defaults, pause, automatic transitions, back, untimed question, save/load, portable assets, scores")
  }
