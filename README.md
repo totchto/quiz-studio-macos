@@ -1,8 +1,8 @@
 # Квиз Студия для macOS
 
-Исходники приложения находятся в этом репозитории обычными файлами. Текущая версия — **0.9.1**.
+Исходники приложения находятся в этом репозитории обычными файлами. Текущая версия — **0.9.2**.
 
-[Скачать приложение из Releases](https://github.com/totchto/quiz-studio-macos/releases/tag/v0.9.1) · [Пример квиза](Examples/Demo.quiz)
+[Скачать приложение из Releases](https://github.com/totchto/quiz-studio-macos/releases/tag/v0.9.2) · [Пример квиза](Examples/Demo.quiz)
 
 Откройте `Package.swift` в Xcode или запустите `python3 build.py` на Mac. Проверки: `python3 Tests/run.py`.
 
@@ -133,7 +133,7 @@ GIF можно добавлять как картинку вопроса, объ
 
 ## Файлы репозитория и сборка
 
-- [Releases](https://github.com/totchto/quiz-studio-macos/releases/tag/v0.9.1) — готовое приложение 0.7.0 для Mac с Apple Silicon. Распакуйте и откройте приложение.
+- [Releases](https://github.com/totchto/quiz-studio-macos/releases/tag/v0.9.2) — готовое приложение 0.7.0 для Mac с Apple Silicon. Распакуйте и откройте приложение.
 - Архивы `QuizStudio-0.5.0-macOS-arm64.zip` и `QuizStudio-source-0.5.0.zip` в корне сохранены для совместимости со старыми ссылками; для разработки используйте исходники из репозитория.
 - `Examples/Demo.quiz` — пример игры в формате одного файла.
 - `Sources/QuizStudio/main.swift` — исходники приложения.
