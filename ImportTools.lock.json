@@ -1,0 +1,14 @@
+{
+  "yt-dlp": {
+    "version": "2026.08.19",
+    "source": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos",
+    "download_sha256": "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202",
+    "binary_sha256": "0f192b7ec147ab6288885d6351d9ab67367640029b4377576ef46dd79cf7b202"
+  },
+  "deno": {
+    "version": "v2.9.7",
+    "source": "https://github.com/denoland/deno/releases/download/v2.9.7/deno-aarch64-apple-darwin.zip",
+    "download_sha256": "5cd46d6268f6f78f5d88bdc7159d20bd44cdaa4b3303474839f87ec6fe7ae25c",
+    "binary_sha256": "b73737579d5a84c160e3316487594783fa5c15f4e13252a6a07050b755317f1a"
+  }
+}

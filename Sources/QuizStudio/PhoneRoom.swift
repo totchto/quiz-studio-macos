@@ -202,7 +202,7 @@ struct PhoneRecovery: Codable {
         guard let i = answers.firstIndex(where: { $0.id == id }), [0,1].contains(points) else { return }
         answers[i].points = points; updateScores(); studio?.checkpoint()
     }
-    static func normalize(_ text: String) -> String { text.lowercased().replacingOccurrences(of:"ё",with:"е").split(whereSeparator: { $0.isWhitespace }).joined(separator:" ") }
+    nonisolated static func normalize(_ text: String) -> String { text.lowercased().replacingOccurrences(of:"ё",with:"е").split(whereSeparator: { $0.isWhitespace }).joined(separator:" ") }
     func handle(_ request: LANRequest) -> LANResponse {
         guard running, let studio else { return .json(["error":"Комната закрыта"],status:503) }
         let base = "/" + roomKey

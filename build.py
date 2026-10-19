@@ -21,6 +21,19 @@ if installed_music.exists():
     shutil.rmtree(installed_music)
 if music.exists():
     shutil.copytree(music, app / 'Contents/Resources/BackgroundMusic', dirs_exist_ok=True)
+# Keep helper executables local to the app; no system installation is needed.
+import json, hashlib
+tools = root / 'Resources/ImportTools'
+if tools.exists():
+    versions = json.loads((tools / 'versions.json').read_text())
+    for name in ('yt-dlp', 'deno'):
+        assert hashlib.sha256((tools / name).read_bytes()).hexdigest() == versions[name]['binary_sha256'], f'Unexpected helper contents: {name}'
+    destination = app / 'Contents/Resources/ImportTools'
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(tools, destination)
+    for name in ('yt-dlp', 'deno'):
+        subprocess.run(['codesign', '--force', '--sign', '-', str(destination / name)], check=True)
 # Convert the master PNG into every macOS icon resolution.
 iconset = root / '.build' / 'AppIcon.iconset'
 iconset.mkdir(parents=True, exist_ok=True)

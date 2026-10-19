@@ -1,0 +1,15 @@
+YouTube import components — Quiz Studio 0.16.0
+
+yt-dlp macOS executable: https://github.com/yt-dlp/yt-dlp
+The official PyInstaller macOS executable includes GPLv3+ components.
+Release source: https://github.com/yt-dlp/yt-dlp/tree/2026.08.19
+Source archive: https://github.com/yt-dlp/yt-dlp/archive/refs/tags/2026.08.19.tar.gz
+Binary licensing: https://github.com/yt-dlp/yt-dlp#licensing
+GNU GPL v3: https://www.gnu.org/licenses/gpl-3.0.html
+See yt-dlp-LICENSE.txt and yt-dlp-THIRD-PARTY.txt for upstream notices.
+
+Deno: https://github.com/denoland/deno/tree/v2.9.7
+MIT license; see deno-LICENSE.txt.
+
+Original download hashes and exact versions are recorded in versions.json.
+Executable signatures in the application are replaced with local ad-hoc signatures.
