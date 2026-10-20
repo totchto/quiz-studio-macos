@@ -1,3 +1,0 @@
-a3dc5c63d8fe3ba5d315dbad042b005b481f6ede51bc04ea4db1135ade814f8b  Demo.quiz
-d827b29ceafd563601f3e1d45f79ede703ecbdd4d05fea8e430de3d7b9f33696  QuizStudio-0.5.0-macOS-arm64.zip
-901e802fd691f6804a2ae592724f0ceb813897b60ff6365fc6cfdb1f0e70abcc  QuizStudio-source-0.5.0.zip
