@@ -3,10 +3,10 @@ import CryptoKit
 
 extension Question {
     var bankAssets: [String] {
-        Array(Set([image,media,explanationImage,explanationMedia].compactMap { $0 } + (imageGallery ?? []) + (explanationGallery ?? []) + (siqAttachments ?? []).map(\.name))).sorted()
+        Array(Set([image,media,explanationImage,explanationMedia].compactMap { $0 } + (imageGallery ?? []) + (explanationGallery ?? []) + (siqAttachments ?? []).map(\.name) + (choiceImages ?? []).compactMap { $0 })).sorted()
     }
     var bankCategories: [String] {
-        var result = [kind == "Один из четырёх" ? "4 варианта" : kind == "Сопоставление" ? "Сопоставление" : "Открытые вопросы"]
+        var result = [kind == "Один из четырёх" ? "4 варианта" : ["Сопоставление","Числовой ответ","Порядок событий","Несколько вариантов","Категоризация"].contains(kind) ? kind : "Открытые вопросы"]
         if media != nil || explanationMedia != nil || (siqAttachments ?? []).contains(where: { $0.type == "audio" || $0.type == "video" }) { result.insert("Аудио / видео",at:0) }
         return result
     }
@@ -84,8 +84,7 @@ extension Studio {
         do { let entry = try questionBank.save(q,assets:bankQuestionAssets(q),origin:quiz.title); questionBinding(q.id).wrappedValue.bankEntryID = entry.id; status = "Вопрос сохранён в банк" }
         catch { status = "Ошибка банка: "+error.localizedDescription }
     }
-    func insertBankQuestions(_ entries: [BankEntry]) throws {
-        guard quiz.rounds.indices.contains(roundIndex) else { throw SIQError(message:"Сначала создайте раунд.") }
+    func copyBankQuestions(_ entries: [BankEntry]) throws -> (questions:[Question],folder:URL) {
         // Validate and copy everything before changing the quiz. Each insertion gets independent IDs and media names.
         var questions: [Question] = []
         let workspace = folder ?? FileManager.default.temporaryDirectory.appendingPathComponent("QuizStudio-Bank-"+UUID().uuidString)
@@ -104,12 +103,20 @@ extension Studio {
             q.image = q.image.map { mapping[$0] ?? $0 }; q.media = q.media.map { mapping[$0] ?? $0 }
             q.explanationImage = q.explanationImage.map { mapping[$0] ?? $0 }; q.explanationMedia = q.explanationMedia.map { mapping[$0] ?? $0 }
             q.imageGallery = q.imageGallery?.map { mapping[$0] ?? $0 }; q.explanationGallery = q.explanationGallery?.map { mapping[$0] ?? $0 }
+            q.choiceImages = q.choiceImages?.map { $0.map { mapping[$0] ?? $0 } }
             q.siqAttachments = q.siqAttachments?.map { item in var copy = item; copy.name = mapping[item.name] ?? item.name; return copy }
             q.id = UUID(); q.bankEntryID = entry.id
+            q.sequenceItems = q.sequenceItems?.map { item in var copy = item; copy.id = UUID(); return copy }
             q.matchPairs = q.matchPairs?.map { pair in var copy = pair; copy.id = UUID(); return copy }
             q.siqAttachments = q.siqAttachments?.map { item in var copy = item; copy.id = UUID(); return copy }
             questions.append(q)
         }
+        return (questions,workspace)
+    }
+    func insertBankQuestions(_ entries: [BankEntry]) throws {
+        guard quiz.rounds.indices.contains(roundIndex) else { throw SIQError(message:"Сначала создайте раунд.") }
+        let copied = try copyBankQuestions(entries)
+        let questions = copied.questions; let workspace = copied.folder
         folder = workspace
         let target = min(max(0,questionIndex+1),quiz.rounds[roundIndex].questions.count)
         quiz.rounds[roundIndex].questions.insert(contentsOf:questions,at:target)

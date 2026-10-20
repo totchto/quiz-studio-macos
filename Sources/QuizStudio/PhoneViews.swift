@@ -68,12 +68,13 @@ struct PhoneAnswerReview: View {
     var body: some View {
         VStack(alignment:.leading,spacing:14) {
             HStack { Text("Ответы с телефонов").font(.title.bold()); Spacer(); Button("Готово") { dismiss() } }
-            Text("Варианты и сопоставления проверяются автоматически. Сопоставление: все пары верны — 1 балл, иначе 0. Свободный ответ с иной формулировкой нужно подтвердить. Изменённая оценка сразу пересчитает баллы.").font(.caption).foregroundStyle(.secondary)
+            Text("Формализованные ответы проверяются автоматически по правилам вопроса. Свободный ответ с иной формулировкой нужно подтвердить. Можно засчитать его полностью, частично (если задан частичный балл) или отклонить; сумма пересчитается сразу.").font(.caption).foregroundStyle(.secondary)
             if displayed.isEmpty { Text("Пока нет отправленных ответов") }
             List(displayed) { answer in
                 VStack(alignment:.leading,spacing:8) {
+                    let question=studio.quiz.rounds.flatMap(\.questions).first(where: { $0.id == answer.questionID })
                     Text(studio.quiz.teams.first { $0.id == answer.teamID }?.name ?? "Команда").bold()
-                    if let q = studio.quiz.rounds.flatMap(\.questions).first(where: { $0.id == answer.questionID }) {
+                    if let q = question {
                         Text(q.text).foregroundStyle(.secondary)
                         Text("Правильный ответ: " + q.correctAnswer).font(.caption)
                     }
@@ -81,8 +82,9 @@ struct PhoneAnswerReview: View {
                     HStack {
                         Text(answer.points.map { "\($0) балл" } ?? "Нужна проверка").foregroundStyle(answer.points == nil ? .orange : .secondary)
                         Spacer()
-                        Button("Засчитать · 1") { room.grade(answer.id,points:1) }
-                        Button("Не засчитать · 0") { room.grade(answer.id,points:0) }
+                        Button("Засчитать · \(scoreText(question?.baseCorrectPoints ?? 1))") { room.grade(answer.id,points:1) }
+                        if let partial=question?.partialPoints { Button("Частично · \(scoreText(partial))") { room.grade(answer.id,points:2) } }
+                        Button("Не засчитать · \(scoreText(question?.baseWrongPoints ?? 0))") { room.grade(answer.id,points:0) }
                     }
                 }.padding(.vertical,8)
             }

@@ -109,7 +109,8 @@ struct PhoneAnswer: Codable, Identifiable {
     var roundID: UUID
     var display: String
     var payload: Data
-    var points: Int?
+    var points: Double?
+    var outcome: String? = nil
 }
 struct PhoneRecovery: Codable {
     var roomKey: String
@@ -118,11 +119,13 @@ struct PhoneRecovery: Codable {
     var answers: [PhoneAnswer]
     var baseline: [UUID:[String:Double]]
     var revision: Int
+    var blockResponses: [UUID:[UUID:String]]? = nil
 }
 @MainActor final class PhoneRoom: ObservableObject {
     weak var studio: Studio?
     @Published var running = false
     @Published var starting = false
+    @Published var blockResponses: [UUID:[UUID:String]] = [:]
     @Published var message = ""
     @Published var port: UInt16 = 0
     @Published var hosts: [String] = []
@@ -158,7 +161,7 @@ struct PhoneRecovery: Codable {
     func refreshHosts() { hosts = Self.localHosts(); if !hosts.contains(selectedHost) { selectedHost = hosts.first ?? "" } }
     func start(restoring: PhoneRecovery? = nil) {
         stop(clear: restoring == nil)
-        if let saved = restoring { roomKey = saved.roomKey; port = saved.port; sessions = saved.sessions; answers = saved.answers; baseline = saved.baseline; revision = saved.revision }
+        if let saved = restoring { roomKey = saved.roomKey; port = saved.port; sessions = saved.sessions; answers = saved.answers; baseline = saved.baseline; revision = saved.revision; blockResponses=saved.blockResponses ?? [:] }
         refreshHosts(); starting = true; message = "Запускаем локальную комнату…"
         let server = LANHTTPServer(); self.server = server
         server.handle = { [weak self] request in self?.handle(request) ?? .json(["error":"Комната закрыта"],status:503) }
@@ -172,11 +175,11 @@ struct PhoneRecovery: Codable {
     }
     func stop(clear: Bool = true) {
         server?.stop(); server = nil; running = false; starting = false
-        if clear { sessions = []; answers = []; baseline = [:]; lastSeen = [:]; revision = 0; roomKey = UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased(); port = 0 }
+        if clear { sessions = []; answers = []; blockResponses=[:]; baseline = [:]; lastSeen = [:]; revision = 0; roomKey = UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased(); port = 0 }
     }
-    var recovery: PhoneRecovery? { guard port > 0 else { return nil }; return PhoneRecovery(roomKey:roomKey,port:port,sessions:sessions,answers:answers,baseline:baseline,revision:revision) }
+    var recovery: PhoneRecovery? { guard port > 0 else { return nil }; return PhoneRecovery(roomKey:roomKey,port:port,sessions:sessions,answers:answers,baseline:baseline,revision:revision,blockResponses:blockResponses) }
     func beginGame() {
-        answers = []; baseline = Dictionary(uniqueKeysWithValues:joinedTeams.map { ($0.id,$0.scores) }); revision += 1
+        answers = [];blockResponses=[:]; baseline = Dictionary(uniqueKeysWithValues:joinedTeams.map { ($0.id,$0.scores) }); revision += 1
     }
     func questionChanged() { revision += 1 }
     var canAccept: Bool {
@@ -194,13 +197,18 @@ struct PhoneRecovery: Codable {
             let teamID = studio.quiz.teams[i].id
             guard sessions.contains(where: { $0.teamID == teamID }) else { continue }
             var scores = baseline[teamID] ?? [:]
-            for answer in answers where answer.teamID == teamID { scores[answer.roundID.uuidString,default:0] += Double(answer.points ?? 0) }
+            for answer in answers where answer.teamID == teamID { scores[answer.roundID.uuidString,default:0] += answer.points ?? 0 }
             studio.quiz.teams[i].scores = scores
         }
     }
     func grade(_ id: String,points: Int) {
-        guard let i = answers.firstIndex(where: { $0.id == id }), [0,1].contains(points) else { return }
-        answers[i].points = points; updateScores(); studio?.checkpoint()
+        guard let i = answers.firstIndex(where: { $0.id == id }), [0,1,2].contains(points) else { return }
+        let q=studio?.quiz.rounds.flatMap(\.questions).first { $0.id == answers[i].questionID }
+        guard points != 2 || q?.partialPoints != nil else { return }
+        let payload=(try? JSONSerialization.jsonObject(with:answers[i].payload)) as? [String:Any]
+        answers[i].points = points == 2 ? q?.partialPoints : q?.awardedPoints(correct:points==1,wagered:q?.wagerEnabled == true && payload?["wager"] as? Bool == true) ?? Double(points)
+        answers[i].outcome = points == 1 ? "correct" : points == 2 ? "partial":"wrong"
+        updateScores(); studio?.checkpoint()
     }
     nonisolated static func normalize(_ text: String) -> String { text.lowercased().replacingOccurrences(of:"ё",with:"е").split(whereSeparator: { $0.isWhitespace }).joined(separator:" ") }
     func handle(_ request: LANRequest) -> LANResponse {
@@ -210,6 +218,11 @@ struct PhoneRecovery: Codable {
         if let origin = request.headers["origin"], origin != "http://" + (request.headers["host"] ?? "") { return .json(["error":"Неверный источник запроса"],status:403) }
         if request.method == "GET" && [base,base+"/"].contains(request.path) {
             return LANResponse(type:"text/html; charset=utf-8",data:Data(Self.page.utf8))
+        }
+        if request.method == "GET",request.path.hasPrefix(base+"/asset/") {
+            let name=String(request.path.dropFirst((base+"/asset/").count));let allowed=Set(studio.currentQuestion?.choiceImages?.compactMap{$0} ?? [])
+            guard name == (name as NSString).lastPathComponent,allowed.contains(name),let url=studio.asset(name),let data=try? Data(contentsOf:url),data.count<=12_000_000 else { return .json(["error":"Изображение не найдено"],status:404) }
+            let ext=url.pathExtension.lowercased(),type=ext=="png" ? "image/png" : ext=="webp" ? "image/webp" : "image/jpeg";return LANResponse(type:type,data:data)
         }
         let object = (try? JSONSerialization.jsonObject(with:request.body)) as? [String:Any] ?? [:]
         if request.method == "POST" && request.path == base+"/join" {
@@ -235,6 +248,16 @@ struct PhoneRecovery: Codable {
         guard let session = sessions.first(where: { $0.token == token }), let team = studio.quiz.teams.first(where: { $0.id == session.teamID }) else { return .json(["error":"Подключитесь к комнате заново"],status:401) }
         lastSeen[team.id] = Date()
         if request.method == "GET" && request.path == base+"/state" { return .json(state(for:team)) }
+        if request.method == "POST" && request.path == base+"/block" {
+            guard studio.playing,!studio.paused,let step=studio.step,step.kind == .block,let bi=step.block,(studio.quiz.rounds[step.round].blocks ?? []).indices.contains(bi) else { return .json(["error":"Приём ответов закрыт"],status:409) }
+            let block=studio.quiz.rounds[step.round].blocks![bi]
+            guard object["block"] as? String == block.id.uuidString else { return .json(["error":"Этот блок уже закрыт"],status:409) }
+            let value=(object["value"] as? String ?? "").trimmingCharacters(in:.whitespacesAndNewlines)
+            guard !value.isEmpty,value.count<=200 else { return .json(["error":"Введите ответ"],status:400) }
+            if ["Голосование","Выбор темы"].contains(block.kind),!(block.options ?? []).contains(value) { return .json(["error":"Выберите предложенный вариант"],status:400) }
+            if let old=blockResponses[block.id]?[team.id] { return old==value ? .json(["accepted":true]) : .json(["error":"Ответ уже отправлен"],status:409) }
+            blockResponses[block.id,default:[:]][team.id]=value;studio.objectWillChange.send();studio.checkpoint();return .json(["accepted":true])
+        }
         if request.method == "POST" && request.path == base+"/answer" {
             guard canAccept, let step = studio.step, let q = studio.currentQuestion, object["question"] as? String == questionToken else { return .json(["error":"Приём ответов на этот вопрос закрыт"],status:409) }
             let payload = object["answer"] as? [String:Any] ?? [:]
@@ -242,12 +265,15 @@ struct PhoneRecovery: Codable {
             if let old = answers.first(where: { $0.teamID == team.id && $0.questionID == q.id }) {
                 return old.payload == canonical ? .json(["accepted":true]) : .json(["error":"Ответ уже отправлен и сохранён"],status:409)
             }
-            var points: Int?; var display = ""
-            if q.kind == "Один из четырёх" {
+            var points: Double?; var display = "";var outcome:String?
+            let wagered = q.wagerEnabled == true && (payload["wager"] as? Bool == true)
+            if q.extraIssues != nil {
+                do { guard let result = try q.gradeExtra(payload) else { throw SIQError(message:"Неверный ответ") }; display = result.display; points = q.awardedPoints(grade:result.points,wagered:wagered);outcome=result.points==1 ? "correct" : result.points==2 ? "partial":"wrong" } catch { return .json(["error":error.localizedDescription],status:400) }
+            } else if q.kind == "Один из четырёх" {
                 guard let n = payload["choice"] as? Int, q.choices.indices.contains(n) else { return .json(["error":"Выберите вариант"],status:400) }
                 display = q.choices[n]
                 let correct = q.selectedChoice ?? q.choices.firstIndex(of:q.correctAnswer)
-                points = n == correct ? 1 : 0
+                let right=n == correct;points = q.awardedPoints(correct:right,wagered:wagered);outcome=right ? "correct":"wrong"
             } else if q.kind == "Сопоставление", let pairs = q.matchPairs, let layout = studio.matchLayouts[q.id] {
                 let matches = payload["matches"] as? [String:String] ?? [:]
                 guard matches.count == pairs.count, Set(matches.values).count == pairs.count else { return .json(["error":"Сопоставьте все пары, без повторений"],status:400) }
@@ -256,15 +282,16 @@ struct PhoneRecovery: Codable {
                     guard let raw = matches["l\(i)"], raw.hasPrefix("r"), let j = Int(raw.dropFirst()), layout.right.indices.contains(j), let left = pairs.first(where: { $0.id == leftID }), let right = pairs.first(where: { $0.id == layout.right[j] }) else { return .json(["error":"Неверная пара"],status:400) }
                     allCorrect = allCorrect && leftID == layout.right[j]; lines.append(left.left + " — " + right.right)
                 }
-                display = lines.joined(separator:"\n"); points = allCorrect ? 1 : 0
+                let correctCount=lines.enumerated().filter { layout.left[$0.offset] == layout.right[Int(matches["l\($0.offset)"]!.dropFirst())!] }.count
+                display = lines.joined(separator:"\n"); points = allCorrect ? q.awardedPoints(correct:true,wagered:wagered) : correctCount>0 ? (q.partialPoints ?? q.awardedPoints(correct:false,wagered:wagered)) : q.awardedPoints(correct:false,wagered:wagered);outcome=allCorrect ? "correct" : correctCount>0 && q.partialPoints != nil ? "partial":"wrong"
             } else {
                 let text = (payload["text"] as? String ?? "").trimmingCharacters(in:.whitespacesAndNewlines)
                 guard !text.isEmpty, text.count <= 1000 else { return .json(["error":"Введите ответ, не длиннее 1000 символов"],status:400) }
                 display = text
                 let allowed = [q.correctAnswer] + (q.acceptedAnswers ?? [])
-                points = allowed.contains { Self.normalize($0) == Self.normalize(text) } ? 1 : nil
+                let right=allowed.contains { Self.normalize($0) == Self.normalize(text) };points = right ? q.awardedPoints(correct:true,wagered:wagered) : nil;outcome=right ? "correct":nil
             }
-            answers.append(PhoneAnswer(teamID:team.id,questionID:q.id,roundID:studio.quiz.rounds[step.round].id,display:display,payload:canonical,points:points))
+            answers.append(PhoneAnswer(teamID:team.id,questionID:q.id,roundID:studio.quiz.rounds[step.round].id,display:display,payload:canonical,points:points,outcome:outcome))
             updateScores(); studio.checkpoint()
             return .json(["accepted":true])
         }
@@ -276,12 +303,19 @@ struct PhoneRecovery: Codable {
         guard studio.playing, let step = studio.step else { return state }
         state["phase"] = step.kind.rawValue
         state["message"] = studio.paused ? "Пауза ведущего" : studio.awaitingQuestionStart ? "Ведущий читает вопрос" : "Смотрите на экран"
+        if step.kind == .block,let bi=step.block,(studio.quiz.rounds[step.round].blocks ?? []).indices.contains(bi) {
+            let block=studio.quiz.rounds[step.round].blocks![bi];state["block"]=block.id.uuidString;state["blockKind"]=block.kind;state["text"]=block.title+"\n"+block.text
+            state["blockOptions"]=block.options ?? [];state["open"] = !studio.paused && ["Голосование","Облако слов","Выбор темы"].contains(block.kind);if let sent=blockResponses[block.id]?[team.id] { state["blockSent"]=sent };return state
+        }
         if [.question,.repeated,.answerPrompt,.answer].contains(step.kind), let q = studio.currentQuestion {
             state["question"] = questionToken; state["text"] = q.text; state["kind"] = q.kind
             state["round"] = studio.quiz.rounds[step.round].title
             state["open"] = canAccept
             if step.kind == .question && !studio.awaitingQuestionStart && !studio.waitingForMedia && step.duration > 0 { state["seconds"] = studio.remaining }
-            if q.kind == "Один из четырёх" { state["choices"] = q.choices }
+            if q.isChoiceQuestion { state["choices"] = q.choices;state["choiceImages"]=(q.choiceImages ?? []).map{$0.map{"/"+roomKey+"/asset/"+$0} ?? ""} }
+            if q.kind == "Порядок событий" { state["sequence"] = q.displayedSequence.map(\.text) }
+            if q.kind == "Категоризация" { state["categoryGroups"] = q.categoryGroups ?? []; state["categoryItems"] = q.displayedCategoryItems.map(\.text) }
+            state["scoring"] = q.scoringSummary;if q.wagerEnabled == true { state["wager"] = true }
             if q.kind == "Сопоставление", let pairs = q.matchPairs, let layout = studio.matchLayouts[q.id] {
                 state["left"] = layout.left.enumerated().map { i,id in ["key":"l\(i)","text":pairs.first { $0.id == id }?.left ?? ""] }
                 state["right"] = layout.right.enumerated().map { i,id in ["key":"r\(i)","text":pairs.first { $0.id == id }?.right ?? ""] }
@@ -289,6 +323,7 @@ struct PhoneRecovery: Codable {
             if let sent = answers.first(where: { $0.teamID == team.id && $0.questionID == q.id }) { state["sent"] = sent.display }
             if step.kind == .answer {
                 state["correct"] = q.kind == "Сопоставление" ? (q.matchPairs ?? []).map { $0.left + " — " + $0.right }.joined(separator:"\n") : q.correctAnswer
+                if q.kind == "Один из четырёх",let choice=q.selectedChoice,let images=q.choiceImages,images.indices.contains(choice),let name=images[choice] { state["correctImage"]="/"+roomKey+"/asset/"+name }
                 state["explanation"] = q.explanation ?? ""
             }
         }

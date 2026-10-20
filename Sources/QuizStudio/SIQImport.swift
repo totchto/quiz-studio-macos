@@ -25,9 +25,9 @@ final class SIQArchive {
         guard !decoded.isEmpty, !decoded.hasPrefix("/"), !decoded.contains("\\"), !decoded.contains("\0"), !decoded.contains(":"), !decoded.split(separator:"/",omittingEmptySubsequences:false).contains(where: { $0 == ".." || $0 == "." || $0.isEmpty }) else { throw SIQError(message:"В архиве обнаружен недопустимый путь.") }
         return decoded.precomposedStringWithCanonicalMapping
     }
-    func read(_ url: URL) throws -> [String: Data] {
+    func read(_ url: URL,maxBytes: Int = 512*1024*1024) throws -> [String: Data] {
         let size = try url.resourceValues(forKeys:[.fileSizeKey]).fileSize ?? 0
-        guard size > 0 && size <= 512*1024*1024 else { throw SIQError(message:"Пак пуст или больше 512 МБ.") }
+        guard size > 0 && size <= maxBytes else { throw SIQError(message:"Пак пуст или больше 512 МБ.") }
         typealias New = @convention(c) () -> OpaquePointer?
         typealias Unary = @convention(c) (OpaquePointer?) -> Int32
         typealias Open = @convention(c) (OpaquePointer?,UnsafePointer<CChar>?,Int) -> Int32
@@ -69,7 +69,7 @@ final class SIQArchive {
             let key = try Self.key(name)
             guard result[key] == nil else { throw SIQError(message:"Неоднозначные имена вложений: "+key) }
             let expected = entrySize(entry)
-            guard expected >= 0 && expected <= 128*1024*1024 else { throw SIQError(message:"Одно из вложений больше 128 МБ.") }
+            guard expected >= 0 && expected <= min(128*1024*1024,maxBytes) else { throw SIQError(message:"Одно из вложений больше 128 МБ.") }
             var data = Data()
             while true {
                 try Task.checkCancellation()
@@ -77,7 +77,7 @@ final class SIQArchive {
                 if n == 0 { break }
                 guard n > 0 else { throw SIQError(message:"Не удалось распаковать вложение: "+key) }
                 total += n
-                guard total <= 512*1024*1024 && data.count+n <= 128*1024*1024 else { throw SIQError(message:"Распакованный пак слишком большой.") }
+                guard total <= maxBytes && data.count+n <= 128*1024*1024 else { throw SIQError(message:"Распакованный пак слишком большой.") }
                 data.append(contentsOf:buffer.prefix(n))
             }
             guard data.count == expected else { throw SIQError(message:"Неполное вложение: "+key) }
@@ -102,12 +102,12 @@ final class SIQXML: NSObject, XMLParserDelegate {
     private var stack: [SIQNode] = []
     private var nodes = 0
     private var invalid = false
-    func parse(_ data: Data) throws -> SIQNode {
+    func parse(_ data: Data,expectedRoot: String = "package") throws -> SIQNode {
         guard data.count <= 16*1024*1024 else { throw SIQError(message:"Описание пака слишком большое.") }
         let screen = String(decoding:data.filter { $0 != 0 },as:UTF8.self).uppercased()
         guard !screen.contains("<!DOCTYPE"), !screen.contains("<!ENTITY") else { throw SIQError(message:"XML с DTD и внешними сущностями не поддерживается.") }
         let parser = XMLParser(data:data); parser.shouldProcessNamespaces = true; parser.shouldResolveExternalEntities = false; parser.delegate = self
-        guard parser.parse(), !invalid, let root, root.name == "package" else { throw SIQError(message:"Не удалось прочитать content.xml: "+(parser.parserError?.localizedDescription ?? "нет описания пака")) }
+        guard parser.parse(), !invalid, let root, root.name == expectedRoot else { throw SIQError(message:"Не удалось прочитать content.xml: "+(parser.parserError?.localizedDescription ?? "нет описания пака")) }
         return root
     }
     func parser(_ parser: XMLParser,didStartElement elementName: String,namespaceURI: String?,qualifiedName qName: String?,attributes attributeDict: [String:String]) {
@@ -262,13 +262,14 @@ enum SIQImporter {
 struct SIQImageGallery: View {
     let names: [String]
     let studio: Studio
+    var masks: [ImageMask] = []
     var body: some View {
         GeometryReader { geometry in
             let columns = min(3,max(1,names.count == 2 ? 2 : Int(ceil(sqrt(Double(names.count))))))
             let rows = max(1,Int(ceil(Double(names.count)/Double(columns))))
             LazyVGrid(columns:Array(repeating:GridItem(.flexible()),count:columns),spacing:8) {
-                ForEach(Array(names.enumerated()),id:\.offset) { _,name in
-                    if let url = studio.asset(name) { AnimatedQuizImage(url:url).frame(height:max(40,(geometry.size.height-Double(rows-1)*8)/Double(rows))) }
+                ForEach(Array(names.enumerated()),id:\.offset) { index,name in
+                    if let url = studio.asset(name) { QuizImage(url:url,masks:index == 0 ? masks : []).frame(height:max(40,(geometry.size.height-Double(rows-1)*8)/Double(rows))) }
                 }
             }
         }

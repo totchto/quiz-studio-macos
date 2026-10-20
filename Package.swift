@@ -1,3 +1,3 @@
 // swift-tools-version: 6.0
 import PackageDescription
-let package = Package(name: "QuizStudio", platforms: [.macOS(.v14)], products: [.executable(name: "QuizStudio", targets: ["QuizStudio"])], targets: [.executableTarget(name: "QuizStudio")], swiftLanguageModes: [.v5])
+let package = Package(name: "QuizStudio", platforms: [.macOS(.v14)], products: [.executable(name: "QuizStudio", targets: ["QuizStudio"])], targets: [.executableTarget(name: "QuizStudio"), .testTarget(name: "QuizStudioTests", dependencies: ["QuizStudio"], exclude: ["ArchiveChecks.swift","BankChecks.swift","EditorChecks.swift","LogicChecks.swift","MediaChecks.swift","NewFeaturesChecks.swift","PhoneChecks.swift","SIQChecks.swift","YouTubeChecks.swift","check_archive.py","check_bank.py","check_editor.py","check_media.py","check_new_features.py","check_phone_forms.js","check_phones.py","check_siq.py","check_youtube.py","legacy-quiz.json","run.py"])], swiftLanguageModes: [.v5])
