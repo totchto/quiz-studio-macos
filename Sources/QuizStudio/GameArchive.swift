@@ -216,7 +216,7 @@ struct GameArchiveView: View {
     var visible: [ArchivedGame] { archive.games.filter { (!onlyCompleted || $0.status == "completed") && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search) || $0.teams.contains { $0.name.localizedCaseInsensitiveContains(search) }) } }
     var body: some View {
         VStack(alignment:.leading,spacing:12) {
-            HStack { Text("Архив игр и статистика").font(.title.bold()); Spacer(); Button("Закрыть") { dismiss() } }
+            HStack { Text("Архив игр и статистика").font(.title.bold()); Spacer(); Button("Назад") { studio.showGameArchive=false } }
             Text("Каждый запуск сохраняется отдельно на этом Mac. Файл квиза можно менять — результаты прошлых игр сохранятся.").font(.caption).foregroundStyle(.secondary)
             HStack { TextField("Квиз или команда",text:$search); Toggle("Только завершённые",isOn:$onlyCompleted) }
             Picker("Раздел",selection:$tab) { Text("Проведённые игры").tag(0); Text("Статистика вопросов").tag(1) }.pickerStyle(.segmented)

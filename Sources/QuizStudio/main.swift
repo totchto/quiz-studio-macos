@@ -465,15 +465,21 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
     @Published var readBeforeTimer = false
     @Published var awaitingQuestionStart = false
     @Published var recentQuizzes: [URL] = []
+    @Published var libraryFolders: [String: String] = [:]
+    @Published var libraryTags: [String: [String]] = [:]
     var rememberRecent = true
     var hiddenQuizzes: Set<String> = []
     let libraryDefaults: UserDefaults
     @Published var quiz = Quiz() {
         didSet {
-            if screen == .editor && !suppressUndo && oldValue != quiz { undoHistory.append(oldValue); if undoHistory.count > 100 { undoHistory.removeFirst() } }
+            if screen == .editor && !suppressUndo && oldValue != quiz {
+                undoHistory.append(oldValue); if undoHistory.count > 100 { undoHistory.removeFirst() }
+                redoHistory = []
+            }
         }
     }
     @Published var undoHistory: [Quiz] = []
+    @Published var redoHistory: [Quiz] = []
     var suppressUndo = false
     @Published var recoveryAvailable = false
     var checkpointTicks = 0
@@ -496,6 +502,9 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
     @Published var remaining = 0
     @Published var index = 0
     @Published var status = ""
+    @Published var lastAutosave: Date?
+    @Published var focusEditorSearch = false
+    @Published var focusLibrarySearch = false
     @Published var publishedScores = false
     @Published var scoreSnapshot: [Team] = []
     @Published var scoreRevealedIDs: Set<UUID> = []
@@ -538,6 +547,8 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
         }
         if rememberRecent {
             hiddenQuizzes = Set(self.libraryDefaults.stringArray(forKey: "HiddenQuizzes") ?? [])
+            libraryFolders = self.libraryDefaults.dictionary(forKey: "QuizFolders") as? [String: String] ?? [:]
+            libraryTags = self.libraryDefaults.dictionary(forKey: "QuizTags") as? [String: [String]] ?? [:]
             let saved = (self.libraryDefaults.stringArray(forKey: "RecentQuizzes") ?? []).map { URL(fileURLWithPath: $0).standardizedFileURL }
             let nearby = nearbyFolder ?? Bundle.main.bundleURL.deletingLastPathComponent()
             let discovered = ((try? FileManager.default.contentsOfDirectory(at: nearby,includingPropertiesForKeys: nil)) ?? []).filter { $0.pathExtension == "quiz" }.map(\.standardizedFileURL)
@@ -553,7 +564,8 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
             guard let self, self.playing, event.modifierFlags.intersection([.command,.control,.option]).isEmpty else { return event }
             // Do not steal navigation or spaces from the score table's field editor.
             if event.window is NSPanel || NSApp.keyWindow?.firstResponder is NSTextView { return event }
-            if event.isARepeat { return [49,123,124].contains(event.keyCode) ? nil : event }
+            // Presentation remotes commonly send arrows, Page Up/Down, Enter or media keys.
+            if event.isARepeat { return [49,36,123,124,116,121, Self.playPauseKeyCode].contains(event.keyCode) ? nil : event }
             return self.handleKey(event.keyCode) ? nil : event
         }
         selectedScreen = NSScreen.screens.count > 1 ? 1 : 0
@@ -561,7 +573,7 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
         timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
     }
     func autosave() { do { try writeDirectory(to: draft)
-        if (playing || screen == .teams) && !phoneMode { try persistResults() }; if playing { checkpoint() }
+        if (playing || screen == .teams) && !phoneMode { try persistResults() }; if playing { checkpoint() }; lastAutosave = Date()
     } catch { status = "Ошибка автосохранения: \(error.localizedDescription)" } }
     func persistResults() throws {
         guard let documentURL else { return }
@@ -572,13 +584,29 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
     }
     @discardableResult func handleKey(_ key: UInt16) -> Bool {
         guard playing else { return false }
-        switch key { case 49: togglePause(); case 123: back(); case 124: next(); default: return false }
+        switch key {
+        case 49, 36, Self.playPauseKeyCode: togglePause() // Space, Return, Play/Pause
+        case 123, 116: back() // Left, Page Up
+        case 124, 121: next() // Right, Page Down
+        default: return false
+        }
         return true
     }
+    private static let playPauseKeyCode: UInt16 = 16 // NSEvent key code for Play/Pause on common remotes
     func persistLibrary() {
         guard rememberRecent else { return }
         libraryDefaults.set(recentQuizzes.map(\.path),forKey: "RecentQuizzes")
         libraryDefaults.set(hiddenQuizzes.sorted(),forKey: "HiddenQuizzes")
+        libraryDefaults.set(libraryFolders,forKey: "QuizFolders")
+        libraryDefaults.set(libraryTags,forKey: "QuizTags")
+    }
+    func setLibraryMetadata(for url: URL, folder: String, tags: String) {
+        let key = url.standardizedFileURL.path
+        let cleanFolder = folder.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanTags = Array(Set(tags.split(whereSeparator: { $0 == "," || $0 == ";" }).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
+        libraryFolders[key] = cleanFolder.isEmpty ? nil : cleanFolder
+        libraryTags[key] = cleanTags.isEmpty ? nil : cleanTags
+        persistLibrary()
     }
     func remember(_ url: URL) {
         guard rememberRecent, url.standardizedFileURL != draft.standardizedFileURL else { return }
@@ -594,6 +622,19 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
         hiddenQuizzes.insert(canonical.path)
         persistLibrary()
         status = "Квиз убран из списка. Файл остался на Mac; его можно снова добавить через «Открыть квиз на Mac…»."
+    }
+    func deleteQuizFile(_ url: URL) {
+        let alert = NSAlert(); alert.messageText = "Удалить квиз с Mac?"
+        alert.informativeText = "«\(url.deletingPathExtension().lastPathComponent)» будет удалён с диска, а не только из библиотеки."
+        alert.alertStyle = .warning; alert.addButton(withTitle:"Удалить файл"); alert.addButton(withTitle:"Отмена")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            try FileManager.default.removeItem(at:url)
+            let key = url.standardizedFileURL.path
+            recentQuizzes.removeAll { $0.standardizedFileURL.path == key }
+            hiddenQuizzes.remove(key); libraryFolders.removeValue(forKey:key); libraryTags.removeValue(forKey:key)
+            persistLibrary(); status = "Квиз удалён с Mac: " + url.lastPathComponent
+        } catch { status = "Не удалось удалить квиз: " + error.localizedDescription }
     }
     func showLibrary(editing: Bool) { status = ""; screen = editing ? .createLibrary : .library }
     func editQuiz(_ url: URL) {
@@ -663,13 +704,13 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
         var createdDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path,isDirectory: &createdDirectory), !createdDirectory.boolValue else { throw CocoaError(.fileWriteUnknown) }
     }
-    func leaveEditor() {
+    func leaveEditor(destination: Screen = .home) {
         let alert = NSAlert(); alert.messageText = "Сохранить квиз перед выходом в меню?"
         alert.informativeText = "Сохраните отдельный файл .quiz, чтобы продолжить работу позже или перенести игру. Черновик также сохраняется автоматически."
         alert.addButton(withTitle: "Сохранить"); alert.addButton(withTitle: "Отмена"); alert.addButton(withTitle: "Выйти с черновиком")
         switch alert.runModal() {
-        case .alertFirstButtonReturn: if save() { screen = .home }
-        case .alertThirdButtonReturn: autosave(); screen = .home
+        case .alertFirstButtonReturn: if save() { screen = destination }
+        case .alertThirdButtonReturn: autosave(); screen = destination
         default: break
         }
     }
@@ -723,11 +764,18 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
             roundIndex = 0; questionIndex = 0; remember(url); status = ""
             registeredFontName = asset(quiz.appearance?.fontFile).flatMap { registerFont($0) }
             if quiz.appearance?.fontFile != nil && registeredFontName == nil { status = "Шрифт не удалось открыть — используется системный" }
-            undoHistory = []
+            undoHistory = []; redoHistory = []
             return true
         } catch { status = "Не удалось открыть квиз: \(error.localizedDescription)"; return false }
     }
-    func newQuiz() { autosave(); screen = .editor; quiz = Quiz(); registeredFontName = nil; folder = nil; documentURL = nil; roundIndex = 0; questionIndex = 0; status = "Создан новый квиз"; undoHistory = [] }
+    func newQuiz() { autosave(); screen = .editor; quiz = Quiz(); registeredFontName = nil; folder = nil; documentURL = nil; roundIndex = 0; questionIndex = 0; status = "Создан новый квиз"; undoHistory = []; redoHistory = [] }
+    func duplicateSelectedQuestion() {
+        guard quiz.rounds.indices.contains(roundIndex), quiz.rounds[roundIndex].questions.indices.contains(questionIndex) else { return }
+        var copy = quiz.rounds[roundIndex].questions[questionIndex]
+        copy.id = UUID()
+        quiz.rounds[roundIndex].questions.insert(copy, at: questionIndex + 1)
+        questionIndex += 1
+    }
     func attach(image: Bool, explanation: Bool = false, roundIntro: Bool = false) {
         let panel = NSOpenPanel(); panel.allowedContentTypes = image ? [.image] : [.audio,.movie]
         if panel.runModal() == .OK, let url = panel.url {
@@ -899,6 +947,31 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
         questionIndex = min(questionIndex,max(0,quiz.rounds[roundIndex].questions.count-1))
     }
     func addRound() { quiz.rounds.append(Round(title: "Раунд \(quiz.rounds.count + 1)")); roundIndex = quiz.rounds.count-1; questionIndex = 0 }
+    func duplicateRound(_ id: UUID) {
+        guard let index = quiz.rounds.firstIndex(where: { $0.id == id }) else { return }
+        var copy = quiz.rounds[index]; copy.id = UUID(); copy.title += " — копия"
+        for questionIndex in copy.questions.indices { copy.questions[questionIndex].id = UUID() }
+        quiz.rounds.insert(copy,at:index+1); roundIndex = index+1; questionIndex = 0
+    }
+    @discardableResult func moveRound(_ id: UUID,before anchor: UUID?) -> Bool {
+        guard let source = quiz.rounds.firstIndex(where: { $0.id == id }), id != anchor,
+              anchor == nil || quiz.rounds.contains(where: { $0.id == anchor }) else { return false }
+        let activeID = quiz.rounds.indices.contains(roundIndex) ? quiz.rounds[roundIndex].id : id
+        var updated = quiz
+        let moving = updated.rounds.remove(at:source)
+        let destination = anchor.flatMap { wanted in updated.rounds.firstIndex(where: { $0.id == wanted }) } ?? updated.rounds.count
+        updated.rounds.insert(moving,at:destination)
+        quiz = updated; roundIndex = updated.rounds.firstIndex(where: { $0.id == activeID }) ?? destination
+        return true
+    }
+    func acceptRoundDrop(_ providers:[NSItemProvider],before anchor:UUID) -> Bool {
+        guard let provider = providers.first(where:{ $0.hasItemConformingToTypeIdentifier(UTType.text.identifier) }) else { return false }
+        provider.loadObject(ofClass:NSString.self) { [weak self] item,_ in
+            guard let text = item as? String,let id = UUID(uuidString:text) else { return }
+            Task { @MainActor in _ = self?.moveRound(id,before:anchor) }
+        }
+        return true
+    }
     func applyTime() {
         let q = quiz.rounds[roundIndex].questions[questionIndex]
         quiz.rounds[roundIndex].defaultSeconds = q.seconds
@@ -1142,7 +1215,15 @@ extension Studio {
     }
     func undoEdit() {
         guard let previous = undoHistory.popLast() else { return }
+        redoHistory.append(quiz)
         suppressUndo = true; quiz = previous; suppressUndo = false
+        roundIndex = min(roundIndex,max(0,quiz.rounds.count-1)); questionIndex = min(questionIndex,max(0,quiz.rounds[roundIndex].questions.count-1))
+        autosave()
+    }
+    func redoEdit() {
+        guard let next = redoHistory.popLast() else { return }
+        undoHistory.append(quiz)
+        suppressUndo = true; quiz = next; suppressUndo = false
         roundIndex = min(roundIndex,max(0,quiz.rounds.count-1)); questionIndex = min(questionIndex,max(0,quiz.rounds[roundIndex].questions.count-1))
         autosave()
     }
@@ -1266,6 +1347,25 @@ extension Studio {
         let panel = NSSavePanel(); panel.allowedContentTypes = [UTType(exportedAs: "local.quizstudio.quiz",conformingTo: .data)]; panel.nameFieldStringValue = source.deletingPathExtension().lastPathComponent + " — копия.quiz"
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         do { try duplicateQuiz(from: source,to: destination) } catch { status = "Не удалось создать копию: " + error.localizedDescription }
+    }
+    func exportQuiz(_ source: URL) {
+        let panel = NSSavePanel(); panel.allowedContentTypes = [UTType(exportedAs:"local.quizstudio.quiz",conformingTo:.data)]
+        panel.nameFieldStringValue = source.deletingPathExtension().lastPathComponent + " — экспорт.quiz"
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        do {
+            guard source.standardizedFileURL != destination.standardizedFileURL else { throw CocoaError(.fileWriteFileExists) }
+            let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("QuizExport-" + UUID().uuidString)
+            let copy = Studio(draftURL:scratch.appendingPathComponent("Draft.workspace")); copy.timer?.invalidate()
+            defer { if (try? source.resourceValues(forKeys:[.isDirectoryKey]).isDirectory) != true, let folder = copy.folder { try? FileManager.default.removeItem(at:folder) } }
+            guard copy.load(source) else { throw NSError(domain:"QuizExport",code:1,userInfo:[NSLocalizedDescriptionKey:copy.status]) }
+            var assets: [String:Data] = [:]
+            for name in copy.referencedAssets {
+                guard let asset = copy.asset(name) else { throw CocoaError(.fileNoSuchFile) }
+                assets[name] = try Data(contentsOf:asset)
+            }
+            try JSONEncoder().encode(QuizFile(quiz:copy.quiz,assets:assets)).write(to:destination,options:.atomic)
+            remember(destination); status = "Экспортирован переносимый квиз: " + destination.lastPathComponent
+        } catch { status = "Не удалось экспортировать квиз: " + error.localizedDescription }
     }
     func saveCopy() {
         let panel = NSSavePanel(); panel.allowedContentTypes = [UTType(exportedAs: "local.quizstudio.quiz",conformingTo: .data)]; panel.nameFieldStringValue = quiz.title + " — копия.quiz"
@@ -1401,6 +1501,12 @@ struct DraggableQuestionRow: View {
         .contentShape(Rectangle())
         .animation(.easeInOut(duration: 0.18),value: targeted)
         .help(question.issues.isEmpty ? "Перетащите для изменения порядка или переноса в другой раунд" : question.issues.joined(separator: "\n"))
+        .contextMenu {
+            Button("Дублировать вопрос", systemImage: "plus.square.on.square") { select(); studio.duplicateSelectedQuestion() }
+            Button("Сохранить в банк вопросов", systemImage: "tray.and.arrow.down") { select(); studio.saveSelectedToBank() }
+            Divider()
+            Button("Удалить вопрос", systemImage: "trash", role: .destructive) { select(); studio.deleteSelectedQuestion() }
+        }
         .onDrop(of: [UTType.text],isTargeted: $targeted) { providers in
             targeted = false
             return studio.acceptQuestionDrop(providers,toRound: roundID,before: question.id)
@@ -1429,9 +1535,40 @@ struct RoundDropTarget: View {
 @main struct QuizStudioApp: App {
     @NSApplicationDelegateAdaptor(GameAppDelegate.self) var appDelegate
     @StateObject var studio = Studio()
+    @AppStorage("appearanceMode") private var appearanceMode = "system"
+    var appearance: ColorScheme? {
+        switch appearanceMode {
+        case "light": return .light
+        case "dark": return .dark
+        default: return nil
+        }
+    }
     var body: some Scene {
-        WindowGroup("Квиз Студия · 0.18.0 — тестовая сборка") { Content(studio: studio).onAppear { appDelegate.install(studio) }.frame(minWidth: 1050,minHeight: 720).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if url.pathExtension.lowercased() == "siq" { studio.chooseSIQ(url) } else if !studio.playing && studio.load(url) { studio.prepareGame() } } }
-        .commands { CommandGroup(replacing: .newItem) { Button("Создать квиз") { studio.newQuiz() }.keyboardShortcut("n").disabled(studio.playing); Button("Открыть квиз…") { studio.open() }.keyboardShortcut("o").disabled(studio.playing); Button("Сохранить квиз…") { studio.save() }.keyboardShortcut("s") } }
+        WindowGroup("Квиз Студия · 0.18.0 — тестовая сборка") { Content(studio: studio).onAppear { appDelegate.install(studio) }.frame(minWidth: 1050,minHeight: 720).preferredColorScheme(appearance).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if url.pathExtension.lowercased() == "siq" { studio.chooseSIQ(url) } else if !studio.playing && studio.load(url) { studio.prepareGame() } } }
+        .commands {
+            CommandGroup(replacing: .newItem) { Button("Создать квиз") { studio.newQuiz() }.keyboardShortcut("n").disabled(studio.playing); Button("Открыть квиз…") { studio.open() }.keyboardShortcut("o").disabled(studio.playing); Button("Сохранить квиз…") { studio.save() }.keyboardShortcut("s") }
+            CommandGroup(after:.textEditing) {
+                Button("Найти") {
+                    if studio.screen == .editor { studio.focusEditorSearch = true }
+                    else if studio.screen == .library || studio.screen == .createLibrary { studio.focusLibrarySearch = true }
+                }.keyboardShortcut("f")
+            }
+        }
+        Settings { AppearanceSettings() }
+    }
+}
+struct AppearanceSettings: View {
+    @AppStorage("appearanceMode") private var appearanceMode = "system"
+    var body: some View {
+        Form {
+            Picker("Оформление",selection:$appearanceMode) {
+                Text("Как в системе").tag("system")
+                Text("Светлое").tag("light")
+                Text("Тёмное").tag("dark")
+            }
+            Text("Выбор влияет на окна редактора и библиотеки. Экран участников сохраняет оформление квиза.").font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(24).frame(width:420)
     }
 }
 struct QuestionBankView: View {
@@ -1456,14 +1593,18 @@ struct QuestionBankView: View {
     }
     var body: some View {
         VStack(alignment:.leading,spacing:14) {
-            HStack { Text("Банк вопросов").font(.largeTitle.bold()); Spacer(); Menu("Импорт…",systemImage:"square.and.arrow.down") { Button("Вопросы из таблицы или текста…") { bulkImport = true }; Button("Пак «Своя игра» (.siq)…") { studio.chooseSIQ() } }; Button("Собрать квиз") { assembly = true }; Button("Новая идея",systemImage:"plus") { creating = true }.buttonStyle(.borderedProminent); Button("Закрыть") { dismiss() } }
-            Text("Вопрос может входить в несколько категорий. Открытый вопрос — игроки вводят ответ сами. Незавершённые идеи сохраняются как черновики.").font(.callout).foregroundStyle(.secondary)
+            HStack { Text("Банк вопросов").font(.largeTitle.bold()); Spacer(); Menu("Импорт…",systemImage:"square.and.arrow.down") { Button("Вопросы из таблицы или текста…") { bulkImport = true }; Button("Пак «Своя игра» (.siq)…") { studio.chooseSIQ() } }; Button("Собрать квиз") { assembly = true }; Button("Новая идея",systemImage:"plus") { creating = true }.buttonStyle(.borderedProminent) }
+            DisclosureGroup("О банке вопросов") {
+                Text("Вопрос может входить в несколько категорий. Открытый вопрос — игроки вводят ответ сами. Незавершённые идеи сохраняются как черновики.").font(.caption).foregroundStyle(.secondary).padding(.top,4)
+            }
             HStack { TextField("Поиск по вопросу, ответу или источнику",text:$search); Toggle("Архив",isOn:$showArchived).toggleStyle(.switch) }
-            Picker("Категория",selection:$category) { ForEach(["Все","Аудио / видео","4 варианта","Открытые вопросы","Сопоставление","Числовой ответ","Порядок событий","Несколько вариантов","Категоризация"],id:\.self) { Text($0) } }
-            HStack {
-                Picker("Тема",selection:$tag) { Text("Все темы").tag("Все темы"); ForEach(Array(Set(bank.entries.flatMap { $0.question.tags ?? [] })).sorted(),id:\.self) { Text($0).tag($0) } }
-                Picker("Сложность",selection:$difficulty) { ForEach(["Любая сложность","Не указана","Лёгкий","Средний","Сложный"],id:\.self) { Text($0) } }
-                Toggle("Ещё не использовались",isOn:$unusedOnly)
+            DisclosureGroup("Фильтры · \(category) · \(tag) · \(difficulty)") {
+                VStack(alignment:.leading,spacing:8) {
+                    Picker("Категория",selection:$category) { ForEach(["Все","Аудио / видео","4 варианта","Открытые вопросы","Сопоставление","Числовой ответ","Порядок событий","Несколько вариантов","Категоризация"],id:\.self) { Text($0) } }
+                    Picker("Тема",selection:$tag) { Text("Все темы").tag("Все темы"); ForEach(Array(Set(bank.entries.flatMap { $0.question.tags ?? [] })).sorted(),id:\.self) { Text($0).tag($0) } }
+                    Picker("Сложность",selection:$difficulty) { ForEach(["Любая сложность","Не указана","Лёгкий","Средний","Сложный"],id:\.self) { Text($0) } }
+                    Toggle("Ещё не использовались",isOn:$unusedOnly)
+                }.padding(.top,6)
             }
             Text("Найдено: \(visible.count) · Всего в банке: \(bank.entries.filter { !$0.archived }.count)").font(.caption)
             List(visible) { entry in
@@ -1492,10 +1633,10 @@ struct QuestionBankView: View {
             Text(bank.message).font(.caption).foregroundStyle(.secondary)
             if studio.screen == .editor {
                 HStack { Text("Добавление в текущий раунд после выбранного вопроса").font(.caption); Spacer(); Button("Добавить выбранные (\(selection.count))") {
-                    do { try studio.insertBankQuestions(bank.entries.filter { selection.contains($0.id) && !$0.archived }); dismiss() } catch { self.error = error.localizedDescription }
+                    do { try studio.insertBankQuestions(bank.entries.filter { selection.contains($0.id) && !$0.archived }); studio.showQuestionBank=false; dismiss() } catch { self.error = error.localizedDescription }
                 }.buttonStyle(.borderedProminent).disabled(selection.isEmpty) }
             }
-        }.padding(22).frame(minWidth:850,minHeight:620)
+        }.padding(16).frame(minWidth:850,minHeight:620)
         .sheet(isPresented:$bulkImport) { BulkQuestionImportView(studio:studio) }
         .sheet(isPresented:$assembly) { QuizAssemblyView(studio:studio) }
         .sheet(isPresented:$creating) { BankQuestionEditor(bank:bank,entry:nil) }
@@ -1635,30 +1776,70 @@ struct EditorPreview: View {
 struct Content: View {
     @ObservedObject var studio: Studio
     var body: some View {
-        Group {
-            if studio.playing { PlayerView(studio: studio) }
-            else { switch studio.screen {
+        VStack(spacing:0) {
+            if !studio.playing { AppSectionBar(studio:studio) }
+            Group {
+                if studio.showQuestionBank { QuestionBankView(studio:studio) }
+                else if studio.showGameArchive { GameArchiveView(studio:studio) }
+                else if studio.playing { PlayerView(studio: studio) }
+                else { switch studio.screen {
                 case .home: Welcome(studio: studio)
                 case .library: QuizLibrary(studio: studio)
                 case .createLibrary: QuizLibrary(studio: studio,editing: true)
                 case .teams: TeamSetup(studio: studio)
                 case .editor: Editor(studio: studio)
-            } }
+                } }
+            }
         }
         .tint(.indigo)
         .sheet(item:$studio.editorPreview) { mode in EditorPreview(studio:studio,mode:mode) }
         .sheet(isPresented:$studio.showBulkEdit) { BulkQuestionSettings(studio:studio) }
         .sheet(isPresented:$studio.showBulkImport) { BulkQuestionImportView(studio:studio) }
         .sheet(isPresented:$studio.showQuizAssembly) { QuizAssemblyView(studio:studio) }
-        .sheet(isPresented:$studio.showGameArchive) { GameArchiveView(studio:studio) }
-        .sheet(isPresented:$studio.showQuestionBank) { QuestionBankView(studio:studio) }
         .sheet(isPresented:$studio.showSIQImport) { if let url = studio.siqSource { SIQImportView(studio:studio,source:url) } }
+    }
+}
+struct AppSectionBar: View {
+    @ObservedObject var studio: Studio
+    var body: some View {
+        HStack(spacing:6) {
+            section("Главная","house",selected:studio.screen == .home && !studio.showQuestionBank && !studio.showGameArchive) {
+                studio.showQuestionBank=false; studio.showGameArchive=false
+                if studio.screen == .editor { studio.leaveEditor(destination:.home) } else { studio.screen = .home }
+            }
+            section("Мои квизы","rectangle.stack",selected:(studio.screen == .library || studio.screen == .createLibrary) && !studio.showQuestionBank && !studio.showGameArchive) {
+                studio.showQuestionBank=false; studio.showGameArchive=false
+                if studio.screen == .editor { studio.leaveEditor(destination:.createLibrary) } else { studio.screen = .createLibrary }
+            }
+            section("Банк вопросов","tray.full",selected:studio.showQuestionBank) {
+                studio.showGameArchive=false; studio.showQuestionBank=true
+            }
+            section("Архив игр","chart.bar.doc.horizontal",selected:studio.showGameArchive) {
+                studio.showQuestionBank=false; studio.persistArchive(); studio.showGameArchive=true
+            }
+            Spacer(minLength:0)
+        }.buttonStyle(.plain).padding(.horizontal,12).padding(.vertical,7)
+            .background(.bar)
+            .overlay(alignment:.bottom) { Divider() }
+    }
+    private func section(_ title:String,_ icon:String,selected:Bool,action:@escaping ()->Void) -> some View {
+        Button(action:action) {
+            Label(title,systemImage:icon).font(.callout.weight(selected ? .semibold : .regular))
+                .padding(.horizontal,10).padding(.vertical,6)
+                .background(selected ? Color.accentColor.opacity(0.12) : .clear,in:Capsule())
+                .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+        }.help(title)
     }
 }
 struct Editor: View {
     @ObservedObject var studio: Studio
     @State private var editorSection = "Вопрос"
     @State private var showQuizTemplateSave = false
+    @State private var showInspector = true
+    @State private var tableMode = false
+    @State private var questionSearch = ""
+    @State private var showEditorIssues = false
+    @FocusState private var questionSearchFocused: Bool
     var body: some View {
         NavigationSplitView {
             VStack(alignment: .leading,spacing: 16) {
@@ -1666,100 +1847,256 @@ struct Editor: View {
                     Text("СОДЕРЖАНИЕ КВИЗА").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     Text(studio.quiz.title.isEmpty ? "Без названия" : studio.quiz.title).font(.headline).lineLimit(1)
                 }.padding(.horizontal, 12).padding(.top, 8)
+                TextField("Найти вопрос…", text: $questionSearch).textFieldStyle(.roundedBorder).padding(.horizontal, 10).focused($questionSearchFocused)
                 ScrollView {
                     LazyVStack(alignment: .leading,spacing: 8,pinnedViews: [.sectionHeaders]) {
                     ForEach(Array(studio.quiz.rounds.enumerated()),id: \.element.id) { ri,r in
                         Section {
-                            ForEach(Array(r.questions.enumerated()),id: \.element.id) { qi,q in
+                            ForEach(Array(r.questions.enumerated()).filter { questionSearch.isEmpty || $0.element.text.localizedCaseInsensitiveContains(questionSearch) || $0.element.correctAnswer.localizedCaseInsensitiveContains(questionSearch) },id: \.element.id) { qi,q in
                                 HStack(spacing:5) {
                                 Toggle("Выбрать вопрос \(qi+1)",isOn:Binding(get:{ studio.editorSelection.contains(q.id) },set:{ if $0 { studio.editorSelection.insert(q.id) } else { studio.editorSelection.remove(q.id) } })).labelsHidden().help("Выбрать для массового изменения")
                                 DraggableQuestionRow(studio: studio,roundID: r.id,question: q,number: qi+1,selected: studio.selectedQuestion?.id == q.id) {
                                     studio.roundIndex = ri; studio.questionIndex = qi; editorSection = "Вопрос"
+                                }
+                                if q.correctAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange).help("Не указан правильный ответ")
                                 }
                                 }
                             }
                             RoundDropTarget(studio: studio,roundID: r.id)
                         } header: {
                             HStack {
+                                Image(systemName:"line.3.horizontal").font(.caption).foregroundStyle(.tertiary)
+                                    .onDrag { NSItemProvider(object:r.id.uuidString as NSString) }
+                                    .help("Перетащите, чтобы изменить порядок раундов")
                                 Button { studio.selectRound(r.id); editorSection = "Раунд" } label: {
                                     HStack { Text(r.title).font(.subheadline.weight(.semibold)); Spacer(); Text("\(r.questions.count)").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }.padding(.vertical, 3)
                                 }.buttonStyle(.plain).help("Открыть настройки раунда")
-                                Menu { Button("Настроить раунд") { studio.selectRound(r.id); editorSection = "Раунд" }; if r.questions.isEmpty && studio.quiz.rounds.count > 1 { Button("Удалить пустой раунд", role: .destructive) { studio.deleteEmptyRound(r.id) } } } label: { Image(systemName: "ellipsis").foregroundStyle(.secondary) }.menuStyle(.borderlessButton)
-                            }
+                                Menu {
+                                    Button("Настроить раунд") { studio.selectRound(r.id); editorSection = "Раунд" }
+                                    Button("Дублировать раунд",systemImage:"plus.square.on.square") { studio.duplicateRound(r.id) }
+                                    if ri > 0 { Button("Переместить выше",systemImage:"arrow.up") { _ = studio.moveRound(r.id,before:studio.quiz.rounds[ri-1].id) } }
+                                    if ri+1 < studio.quiz.rounds.count { Button("Переместить ниже",systemImage:"arrow.down") { _ = studio.moveRound(r.id,before:ri+2 < studio.quiz.rounds.count ? studio.quiz.rounds[ri+2].id : nil) } }
+                                    if r.questions.isEmpty && studio.quiz.rounds.count > 1 { Divider(); Button("Удалить пустой раунд",role:.destructive) { studio.deleteEmptyRound(r.id) } }
+                                } label: { Image(systemName: "ellipsis").foregroundStyle(.secondary) }.menuStyle(.borderlessButton)
+                            }.onDrop(of:[UTType.text],isTargeted:nil) { providers in studio.acceptRoundDrop(providers,before:r.id) }
                         }
                     }
                     }.padding(.horizontal,8)
                 }
                 Button("Следующий раунд",systemImage: "plus.rectangle.on.rectangle") { studio.addRound() }.padding()
             }.padding(.top)
-            .navigationSplitViewColumnWidth(min: 220,ideal: 260)
+            .navigationSplitViewColumnWidth(min: 190,ideal: 240,max:300)
         } detail: {
             VStack(spacing: 0) {
-                HStack(spacing: 14) {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("Редактирование квиза").font(.caption).foregroundStyle(.secondary)
-                        TextField("Название квиза",text: $studio.quiz.title).font(.title2.bold()).textFieldStyle(.plain)
-                    }
-                    Spacer()
-                    Menu("Инструменты", systemImage: "ellipsis.circle") {
-                        Button("Отменить изменение", systemImage: "arrow.uturn.backward") { studio.undoEdit() }.disabled(studio.undoHistory.isEmpty)
+                HStack(spacing: 8) {
+                Button { studio.leaveEditor() } label: { Image(systemName:"house") }
+                        .help("В главное меню")
+                    TextField("Название квиза",text: $studio.quiz.title).font(.title2.bold()).textFieldStyle(.plain).lineLimit(1).frame(minWidth:70,idealWidth:220,maxWidth:300)
+                    Button { showInspector.toggle() } label: { Image(systemName: "sidebar.right") }
+                        .help(showInspector ? "Скрыть параметры" : "Показать параметры")
+                    Button { tableMode.toggle() } label: {
+                        Image(systemName: tableMode ? "tablecells" : "rectangle.and.pencil.and.ellipsis")
+                    }.help(tableMode ? "Табличный вид" : "Вид редактора")
+                    Menu {
+                        Button("Отменить изменение", systemImage: "arrow.uturn.backward") { studio.undoEdit() }.keyboardShortcut("z").disabled(studio.undoHistory.isEmpty)
+                        Button("Повторить изменение", systemImage: "arrow.uturn.forward") { studio.redoEdit() }.keyboardShortcut("z", modifiers: [.command, .shift]).disabled(studio.redoHistory.isEmpty)
+                        Button("Дублировать вопрос", systemImage: "plus.square.on.square") { studio.duplicateSelectedQuestion() }.keyboardShortcut("d").disabled(studio.selectedQuestion == nil)
                         Divider()
                         Button("Импортировать вопросы…", systemImage: "tablecells") { studio.showBulkImport = true }
                         Button("Собрать квиз из банка…", systemImage: "sparkles") { studio.showQuizAssembly = true }
                         Button("Открыть банк вопросов…", systemImage: "tray.full") { studio.showQuestionBank = true }
                         Button("Сохранить как шаблон квиза…",systemImage:"square.grid.3x3") { showQuizTemplateSave = true }
+                        if !studio.editorSelection.isEmpty {
+                            Divider()
+                            Button("Выбрать все вопросы раунда") { studio.editorSelection = Set(studio.quiz.rounds[studio.roundIndex].questions.map(\.id)) }
+                            Button("Снять выделение") { studio.editorSelection = [] }
+                            Button("Массовые настройки…") { studio.showBulkEdit = true }
+                                .disabled(studio.editorSelection.intersection(Set(studio.quiz.rounds.flatMap(\.questions).map(\.id))).isEmpty)
+                        }
                         Divider()
                         Button("Печатные бланки…", systemImage: "doc.text") { studio.printSheets() }
                         Button("Сохранить копию…", systemImage: "doc.on.doc") { studio.saveCopy() }
-                    }
-                    Button("На главную",systemImage:"house") { studio.leaveEditor() }
+                    } label: { Label("Инструменты",systemImage:"ellipsis.circle") }.labelStyle(.iconOnly).help("Инструменты")
+                    Menu {
+                        Button("Мои квизы",systemImage:"rectangle.stack") { studio.leaveEditor(destination:.createLibrary) }
+                        Button("Сохранить копию…", systemImage: "doc.on.doc") { studio.saveCopy() }
+                        Button("Печатные бланки…", systemImage: "doc.text") { studio.printSheets() }
+                    } label: { Image(systemName:"ellipsis") }.help("Дополнительные действия")
                     Button("Сохранить") { studio.save() }
                     Button("Начать игру",systemImage: "play.fill") { studio.prepareGame() }.buttonStyle(.borderedProminent)
-                }.padding(22)
-                HStack(spacing: 10) {
-                    Text("Раунд \(studio.roundIndex + 1) · выбрано \(studio.editorSelection.count)").font(.subheadline).foregroundStyle(.secondary)
-                    Spacer()
-                    if !studio.editorSelection.isEmpty {
-                        Button("Выбрать раунд") { studio.editorSelection = Set(studio.quiz.rounds[studio.roundIndex].questions.map(\.id)) }
-                        Button("Снять выбор") { studio.editorSelection = [] }
-                        Button("Массовые настройки…") { studio.showBulkEdit = true }.disabled(studio.editorSelection.intersection(Set(studio.quiz.rounds.flatMap(\.questions).map(\.id))).isEmpty)
-                    }
-                }.padding(.horizontal,22).padding(.bottom,10)
+                }.padding(.horizontal,10).padding(.vertical,7).frame(maxWidth:.infinity,alignment:.leading)
                 Divider()
-                VStack(spacing: 0) {
-                    HStack {
-                        Picker("Раздел редактора", selection: $editorSection) {
-                            Text("Вопрос").tag("Вопрос")
-                            Text("Раунд").tag("Раунд")
-                            Text("Оформление").tag("Оформление")
-                        }.pickerStyle(.segmented).frame(maxWidth: 420)
-                        Spacer()
-                    }.padding(.horizontal, 22).padding(.vertical, 12)
-                    Divider()
-                    ScrollView { VStack(alignment: .leading,spacing: 24) {
-                    if editorSection == "Оформление" {
-                        AppearanceEditor(studio: studio, expanded: true)
-                    } else if editorSection == "Раунд" {
-                        RoundSettings(studio: studio, round: studio.roundBinding(studio.quiz.rounds[studio.roundIndex].id))
-                    } else if let selected = studio.selectedQuestion {
-                        QuestionEditor(studio: studio,question: studio.questionBinding(selected.id)).id(selected.id)
-                    } else {
-                        ContentUnavailableView("В этом раунде пока нет вопросов",systemImage: "text.badge.plus",description: Text("Добавьте вопрос или возьмите его из банка.")).frame(maxWidth: .infinity, minHeight: 220)
+                HSplitView {
+                    VStack(spacing: 0) {
+                        HStack {
+                            Picker("Раздел редактора", selection: $editorSection) {
+                                Text("Вопрос").tag("Вопрос")
+                                Text("Раунд").tag("Раунд")
+                                Text("Оформление").tag("Оформление")
+                            }.pickerStyle(.segmented).frame(maxWidth: 420)
+                            Spacer()
+                        }.padding(.horizontal, 22).padding(.vertical, 12)
+                        Divider()
+                        ScrollView { VStack(alignment: .leading,spacing: 24) {
+                            if editorSection == "Оформление" {
+                                AppearanceEditor(studio: studio, expanded: true)
+                            } else if editorSection == "Раунд" {
+                                RoundSettings(studio: studio, round: studio.roundBinding(studio.quiz.rounds[studio.roundIndex].id))
+                            } else if tableMode {
+                                QuizQuestionTable(studio: studio,filter:questionSearch)
+                            } else if let selected = studio.selectedQuestion {
+                                QuestionEditor(studio: studio,question: studio.questionBinding(selected.id)).id(selected.id)
+                            } else {
+                                ContentUnavailableView("В этом раунде пока нет вопросов",systemImage: "text.badge.plus",description: Text("Добавьте вопрос или возьмите его из банка.")).frame(maxWidth: .infinity, minHeight: 220)
+                            }
+                            HStack {
+                                Button("Добавить из банка…",systemImage:"tray.full") { studio.showQuestionBank = true }
+                                Button("Добавить вопрос",systemImage: "plus") { studio.addQuestion() }.buttonStyle(.borderedProminent)
+                                Spacer()
+                                Menu {
+                                    Button("Сохранить вопрос в банк") { studio.saveSelectedToBank() }.disabled(studio.selectedQuestion == nil)
+                                    Button("Удалить вопрос",role: .destructive) { studio.deleteSelectedQuestion() }.disabled(studio.selectedQuestion == nil)
+                                } label: { Label("Ещё",systemImage:"ellipsis") }.contentShape(Rectangle()).help("Дополнительные действия")
+                            }
+                        }.padding(16) }
                     }
-                    HStack {
-                        Button("Добавить из банка…",systemImage:"tray.full") { studio.showQuestionBank = true }
-                        Button("Добавить вопрос",systemImage: "plus") { studio.addQuestion() }.buttonStyle(.borderedProminent)
-                        Spacer()
-                        Menu {
-                            Button("Сохранить вопрос в банк") { studio.saveSelectedToBank() }.disabled(studio.selectedQuestion == nil)
-                            Button("Удалить вопрос",role: .destructive) { studio.deleteSelectedQuestion() }.disabled(studio.selectedQuestion == nil)
-                        } label: { Label("Ещё",systemImage:"ellipsis") }.contentShape(Rectangle()).help("Дополнительные действия")
+                    if showInspector && !tableMode && editorSection == "Вопрос", let selected = studio.selectedQuestion {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 16) {
+                                Label("Параметры вопроса", systemImage: "slider.horizontal.3").font(.headline)
+                                Picker("Тип вопроса", selection: studio.questionBinding(selected.id).kind) {
+                                    ForEach(Question.kinds, id: \.self) { Text($0) }
+                                }
+                                VStack(alignment:.leading,spacing:8) {
+                                    Text("Темы").font(.caption).foregroundStyle(.secondary)
+                                    TextField("Кино, музыка…",text:Binding(get:{ (selected.tags ?? []).joined(separator:", ") },set:{ studio.questionBinding(selected.id).wrappedValue.tags = Question.cleanTags($0) }))
+                                    Text("Сложность").font(.caption).foregroundStyle(.secondary)
+                                    Picker("Сложность",selection:Binding(get:{ selected.difficulty ?? "Не указана" },set:{ studio.questionBinding(selected.id).wrappedValue.difficulty = $0 == "Не указана" ? nil : $0 })) {
+                                        ForEach(["Не указана","Лёгкий","Средний","Сложный"],id:\.self) { Text($0) }
+                                    }
+                                }
+                                Stepper("Время: \(selected.seconds == 0 ? "без таймера" : "\(selected.seconds) сек")", value: studio.questionBinding(selected.id).seconds, in: 0...600, step: 5)
+                                ScoringRulesEditor(question: studio.questionBinding(selected.id))
+                            }.padding(16)
+                        }.frame(minWidth: 190, idealWidth: 280, maxWidth: 320)
                     }
-                    }.padding(24) }
                 }
-                Text(studio.status).font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity,alignment: .leading).padding(10)
+                HStack(spacing:12) {
+                    let issueCount = studio.preflightIssues.isEmpty ? studio.incompleteQuestions.count : studio.preflightIssues.count
+                    Label(studio.lastAutosave.map { "Сохранено \($0.formatted(date:.omitted,time:.shortened))" } ?? "Черновик сохраняется автоматически",systemImage:"checkmark.circle.fill")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer(minLength:4)
+                    Text("\(studio.quiz.rounds.reduce(0) { $0 + $1.questions.count }) вопросов · \(studio.quiz.rounds.count) раундов").font(.caption).foregroundStyle(.secondary)
+                    Button {
+                        Task { await studio.validateQuiz(); showEditorIssues = true }
+                    } label: {
+                        Label(issueCount == 0 ? "Проверить" : "Проблемы: \(issueCount)",systemImage:issueCount == 0 ? "checkmark.circle" : "exclamationmark.triangle")
+                    }.font(.caption).foregroundStyle(issueCount == 0 ? Color.secondary : Color.orange).disabled(studio.checkingQuiz)
+                }.padding(.horizontal,12).padding(.vertical,9)
             }
         }.sheet(isPresented:$showQuizTemplateSave) { QuizTemplateSaveView(store:studio.quizTemplates,quiz:studio.quiz,introductionSeconds:studio.introductionSeconds,phoneMode:studio.phoneMode,readBeforeTimer:studio.readBeforeTimer,automaticAdvance:studio.automaticAdvance,signalsEnabled:studio.signalsEnabled) }
+        .sheet(isPresented:$showEditorIssues) { PreflightReport(studio:studio) }
+        .onChange(of: studio.focusEditorSearch) { _, requested in
+            if requested { questionSearchFocused = true; studio.focusEditorSearch = false }
+        }
+    }
+}
+struct QuizQuestionTable: View {
+    @ObservedObject var studio: Studio
+    var filter = ""
+    @State private var selectedIDs: Set<UUID> = []
+    @State private var batchSeconds = 30
+    @State private var batchDifficulty = "Средний"
+    @State private var showQuestionDetail = false
+    @State private var showOnlyIssues = false
+    struct Row: Identifiable { let id: UUID; let roundTitle: String; let question: Question }
+    var rows: [Row] { studio.quiz.rounds.flatMap { round in round.questions.map { Row(id: $0.id, roundTitle: round.title, question: $0) } }.filter { (filter.isEmpty || $0.question.text.localizedCaseInsensitiveContains(filter) || $0.question.correctAnswer.localizedCaseInsensitiveContains(filter)) && (!showOnlyIssues || !$0.question.issues.isEmpty) } }
+    private func updateSelectedQuestions(_ update: (inout Question) -> Void) {
+        var quiz = studio.quiz
+        for roundIndex in quiz.rounds.indices {
+            for questionIndex in quiz.rounds[roundIndex].questions.indices where selectedIDs.contains(quiz.rounds[roundIndex].questions[questionIndex].id) {
+                update(&quiz.rounds[roundIndex].questions[questionIndex])
+            }
+        }
+        studio.quiz = quiz
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Вопросы квиза").font(.title2.bold()); Spacer()
+                Toggle("Только с проблемами",isOn:$showOnlyIssues).toggleStyle(.checkbox)
+                if selectedIDs.count == 1 {
+                    Button("Редактировать всё…") { showQuestionDetail = true }
+                    Button { moveSelected(by:-1) } label: { Image(systemName:"arrow.up") }.help("Переместить выше")
+                    Button { moveSelected(by:1) } label: { Image(systemName:"arrow.down") }.help("Переместить ниже")
+                }
+                Text("\(rows.count) вопросов").foregroundStyle(.secondary)
+            }
+            if !selectedIDs.isEmpty {
+                HStack(spacing:12) {
+                    Text("Выбрано: \(selectedIDs.count)").font(.caption).foregroundStyle(.secondary)
+                    Stepper("Время: \(batchSeconds) сек",value:$batchSeconds,in:0...600,step:5)
+                    Button("Применить время") { updateSelectedQuestions { $0.seconds = batchSeconds } }
+                    Picker("Сложность",selection:$batchDifficulty) { ForEach(["Не указана","Лёгкий","Средний","Сложный"],id:\.self) { Text($0) } }.frame(width:130)
+                    Button("Применить сложность") {
+                        updateSelectedQuestions { $0.difficulty = batchDifficulty == "Не указана" ? nil : batchDifficulty }
+                    }
+                    Button("Снять выбор") { selectedIDs.removeAll() }.buttonStyle(.plain)
+                }.buttonStyle(.bordered).padding(.vertical,4)
+            }
+            Table(rows, selection: Binding<Set<UUID>>(get: { selectedIDs }, set: { ids in
+                selectedIDs = ids
+                guard let id = ids.first, let r = studio.quiz.rounds.firstIndex(where: { $0.questions.contains(where: { $0.id == id }) }), let q = studio.quiz.rounds[r].questions.firstIndex(where: { $0.id == id }) else { return }
+                studio.roundIndex = r; studio.questionIndex = q
+            })) {
+                TableColumn("Раунд", value: \.roundTitle).width(min: 100, ideal: 130)
+                TableColumn("Вопрос") { row in TextField("Текст вопроса", text: studio.questionBinding(row.id).text).textFieldStyle(.plain).lineLimit(1) }.width(min: 220, ideal: 360)
+                TableColumn("Проверка") { row in
+                    Image(systemName:row.question.issues.isEmpty ? "checkmark.circle" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(row.question.issues.isEmpty ? Color.secondary : Color.orange)
+                        .help(row.question.issues.isEmpty ? "Ошибок в вопросе не найдено" : row.question.issues.joined(separator:"\n"))
+                }.width(min:70,ideal:85)
+                TableColumn("Тип") { row in
+                    Picker("Тип",selection:studio.questionBinding(row.id).kind) { ForEach(Question.kinds,id:\.self) { Text($0) } }.labelsHidden()
+                }.width(min: 130, ideal: 170)
+                TableColumn("Правильный ответ") { row in
+                    if row.question.kind == "Сопоставление" || row.question.extraIssues != nil {
+                        Text(row.question.correctAnswer).lineLimit(1)
+                    } else {
+                        TextField("Ответ",text:Binding(get:{ studio.questionBinding(row.id).wrappedValue.correctAnswer },set:{ value in
+                            var question = studio.questionBinding(row.id).wrappedValue
+                            question.answer = value
+                            if question.kind == "Один из четырёх" { question.selectedChoice = question.choices.firstIndex(of:value) }
+                            studio.questionBinding(row.id).wrappedValue = question
+                        })).textFieldStyle(.plain).lineLimit(1)
+                    }
+                }.width(min: 160, ideal: 220)
+                TableColumn("Сложность") { row in
+                    Picker("Сложность",selection:Binding(get:{ studio.questionBinding(row.id).wrappedValue.difficulty ?? "Не указана" },set:{ studio.questionBinding(row.id).wrappedValue.difficulty = $0 == "Не указана" ? nil : $0 })) {
+                        ForEach(["Не указана","Лёгкий","Средний","Сложный"],id:\.self) { Text($0) }
+                    }.labelsHidden()
+                }.width(min: 100, ideal: 130)
+                TableColumn("Время") { row in Text(row.question.seconds == 0 ? "—" : "\(row.question.seconds) с") }.width(min: 60, ideal: 75)
+            }
+        }
+        .sheet(isPresented:$showQuestionDetail) {
+            if let question = studio.selectedQuestion {
+                ScrollView { QuestionEditor(studio:studio,question:studio.questionBinding(question.id)).padding() }
+                    .frame(minWidth:850,minHeight:650)
+            }
+        }
+    }
+    private func moveSelected(by offset: Int) {
+        guard let id = selectedIDs.first,
+              let roundIndex = studio.quiz.rounds.firstIndex(where: { $0.questions.contains(where: { $0.id == id }) }),
+              let questionIndex = studio.quiz.rounds[roundIndex].questions.firstIndex(where: { $0.id == id }) else { return }
+        let destination = questionIndex + offset
+        guard studio.quiz.rounds[roundIndex].questions.indices.contains(destination) else { return }
+        var quiz = studio.quiz
+        quiz.rounds[roundIndex].questions.swapAt(questionIndex,destination)
+        studio.quiz = quiz
+        studio.roundIndex = roundIndex; studio.questionIndex = destination
     }
 }
 struct RoundSettings: View {
@@ -1825,8 +2162,7 @@ struct QuestionEditor: View {
             if let notes = studio.quiz.importNotes {
                 DisclosureGroup("Отчёт импорта .siq") { ScrollView { Text(notes).font(.caption).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading) }.frame(height:180) }
             }
-            HStack { VStack(alignment: .leading, spacing: 3) { Text("Вопрос \(studio.questionIndex+1)").font(.title.bold()); Text("Раунд \(studio.roundIndex+1) · \(studio.quiz.rounds[studio.roundIndex].title)").font(.caption).foregroundStyle(.secondary) }; Spacer(); Picker("Тип ответа",selection: $question.kind) { ForEach(Question.kinds,id: \.self) { Text($0) } }.frame(width: 260) }
-            QuestionMetadataEditor(question:$question)
+            HStack { VStack(alignment: .leading, spacing: 3) { Text("Вопрос \(studio.questionIndex+1)").font(.title.bold()); Text("Раунд \(studio.roundIndex+1) · \(studio.quiz.rounds[studio.roundIndex].title)").font(.caption).foregroundStyle(.secondary) }; Spacer() }
             HStack { Button("Посмотреть вопрос",systemImage:"play.rectangle") { preview.stop(); explanationPreview.stop(); studio.editorPreview = .question }; Button("Посмотреть ответ") { preview.stop(); explanationPreview.stop(); studio.editorPreview = .answer } }
             TextEditor(text: $question.text).font(.title3).frame(height: 100).padding(8).background(.background,in: RoundedRectangle(cornerRadius: 10)).overlay(RoundedRectangle(cornerRadius: 10).stroke(.quaternary))
             DisclosureGroup("Заметки ведущего к вопросу") { TextEditor(text: Binding(get: { question.hostNotes ?? "" },set: { question.hostNotes = $0 })).frame(height: 90); Text("Произношение, допустимые ответы и подсказки. Видны ведущему при отдельном экране участников.").font(.caption).foregroundStyle(.secondary) }
@@ -1847,13 +2183,18 @@ struct QuestionEditor: View {
             } else if question.kind == "Сопоставление" {
                 MatchingEditor(question: $question)
             } else {
-                TextField("Правильный ответ",text: $question.answer)
-                TextField("Допустимые ответы с телефона — через ;",text: Binding(get: { (question.acceptedAnswers ?? []).joined(separator: "; ") },set: { question.acceptedAnswers = $0.components(separatedBy: ";").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty } }))
+                VStack(alignment:.leading,spacing:5) {
+                    Text("Правильный ответ").font(.caption).foregroundStyle(.secondary)
+                    TextField("Введите правильный ответ",text: $question.answer)
+                    Text("Допустимые варианты").font(.caption).foregroundStyle(.secondary).padding(.top,3)
+                    TextField("Несколько вариантов разделите точкой с запятой",text: Binding(get: { (question.acceptedAnswers ?? []).joined(separator: "; ") },set: { question.acceptedAnswers = $0.components(separatedBy: ";").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty } }))
+                }
             }
-            HStack { Stepper("Время: \(question.seconds == 0 ? "без таймера" : "\(question.seconds) сек")",value: $question.seconds,in: 0...600,step: 5); Button("Применить время и запуск таймера ко всему раунду") { studio.applyTime() } }
-            ScoringRulesEditor(question:$question)
-            HStack { Button("Добавить картинку",systemImage: "photo") { studio.attach(image: true) }; Button("Добавить аудио / видео",systemImage: "film") { let old = question.media; studio.attach(image:false); if question.media != old { editorStartsAnswer = false; showClipEditor = true } } }
-            Button("Добавить с YouTube",systemImage:"link") { preview.stop(); explanationPreview.stop(); youtubeForAnswer = false; showYouTubeImport = true }
+            Menu("Добавить медиа",systemImage:"paperclip") {
+                Button("Картинку",systemImage:"photo") { studio.attach(image:true) }
+                Button("Аудио / видео",systemImage:"film") { let old=question.media; studio.attach(image:false); if question.media != old { editorStartsAnswer=false; showClipEditor=true } }
+                Button("С YouTube",systemImage:"link") { preview.stop(); explanationPreview.stop(); youtubeForAnswer=false; showYouTubeImport=true }
+            }
             if !question.images(answer:false).isEmpty {
                 SIQImageGallery(names:question.images(answer:false),studio:studio,masks:question.questionImageMasks ?? []).frame(height:240)
                 if let name = question.image, name.lowercased().hasSuffix(".gif") == false {
@@ -1897,9 +2238,11 @@ struct QuestionEditor: View {
                 VStack(alignment: .leading,spacing: 12) {
                     TextEditor(text: Binding(get: { question.explanation ?? "" },set: { question.explanation = $0 })).frame(height: 80)
                     HStack {
-                        Button("Добавить картинку") { studio.attach(image: true,explanation: true) }
-                        Button("YouTube") { preview.stop(); explanationPreview.stop(); youtubeForAnswer = true; showYouTubeImport = true }
-                        Button("Добавить аудио / видео") { let old = question.explanationMedia; studio.attach(image:false,explanation:true); if old != question.explanationMedia { editorStartsAnswer = true; showClipEditor = true } }
+                        Menu("Добавить медиа",systemImage:"paperclip") {
+                            Button("Картинку",systemImage:"photo") { studio.attach(image:true,explanation:true) }
+                            Button("С YouTube",systemImage:"link") { preview.stop(); explanationPreview.stop(); youtubeForAnswer=true; showYouTubeImport=true }
+                            Button("Аудио / видео",systemImage:"film") { let old=question.explanationMedia; studio.attach(image:false,explanation:true); if old != question.explanationMedia { editorStartsAnswer=true; showClipEditor=true } }
+                        }
                     }
                     if question.explanationImage != nil || !(question.explanationGallery ?? []).isEmpty {
                         SIQImageGallery(names:[question.explanationImage].compactMap{$0}+(question.explanationGallery ?? []),studio:studio,masks:question.answerImageMasks ?? []).frame(height:200)
@@ -1954,12 +2297,43 @@ struct PlayerView: View {
     @ObservedObject var studio: Studio
     @State var controls = true
     @State var hideTask: Task<Void,Never>?
+    var hostQuestion: Question? {
+        guard studio.step?.kind == .question || studio.step?.kind == .repeated,
+              studio.quiz.rounds.indices.contains(studio.roundIndex),
+              studio.quiz.rounds[studio.roundIndex].questions.indices.contains(studio.questionIndex) else { return nil }
+        return studio.quiz.rounds[studio.roundIndex].questions[studio.questionIndex]
+    }
+    var nextHostQuestion: Question? {
+        guard let current = studio.steps.indices.first(where: { $0 > studio.index && studio.steps[$0].kind == .question }),
+              studio.steps[current].round < studio.quiz.rounds.count,
+              studio.steps[current].question < studio.quiz.rounds[studio.steps[current].round].questions.count else { return nil }
+        return studio.quiz.rounds[studio.steps[current].round].questions[studio.steps[current].question]
+    }
     var body: some View {
         VStack(spacing: 0) {
             if studio.step?.kind == .standings && !studio.publishedScores {
                 if studio.audienceScreenReady || studio.showScoreInputLocally { ScoreEditor(studio: studio) } else { StandingsBreakHost(studio: studio) }
             } else { Stage(studio: studio,audience: false) }
             if studio.audienceScreenReady { HostNotes(studio: studio) }
+            if hostQuestion != nil {
+                HStack(alignment: .top, spacing: 20) {
+                    VStack(alignment: .leading,spacing:6) {
+                        let total = studio.quiz.rounds.reduce(0) { $0 + $1.questions.count }
+                        let number = studio.quiz.rounds.prefix(studio.roundIndex).reduce(0) { $0 + $1.questions.count } + studio.questionIndex + 1
+                        Label("Вопрос \(number) / \(total)",systemImage:"number").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        if studio.phoneMode { Label("\(studio.phoneRoom.joinedTeams.count) подключено",systemImage:"iphone").font(.caption).foregroundStyle(.secondary) }
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("ПРАВИЛЬНЫЙ ОТВЕТ").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                        Text(hostQuestion?.correctAnswer.isEmpty == false ? hostQuestion!.correctAnswer : "Не указан").font(.headline)
+                    }
+                    if let notes = hostQuestion?.hostNotes, !notes.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) { Text("ЗАМЕТКИ ВЕДУЩЕГО").font(.caption2.weight(.bold)).foregroundStyle(.secondary); Text(notes).font(.callout).lineLimit(3) }
+                    }
+                    Spacer(minLength: 8)
+                    if let nextHostQuestion { VStack(alignment: .leading, spacing: 4) { Text("ДАЛЬШЕ").font(.caption2.weight(.bold)).foregroundStyle(.secondary); Text(nextHostQuestion.text).font(.callout).lineLimit(2).frame(maxWidth: 220, alignment: .leading) } }
+                }.padding(.horizontal, 24).padding(.vertical, 12).frame(maxWidth: .infinity, alignment: .leading).background(.bar)
+            }
         }
         .overlay(alignment: .top) {
             if let step = studio.step, step.kind != .finish {
@@ -1996,11 +2370,16 @@ struct PlayerView: View {
                 HStack(spacing: 10) {
                     Button("Назад") { studio.back() }
                     Button(studio.awaitingQuestionStart ? "Запустить таймер" : (studio.paused ? "Продолжить" : "Пауза")) { studio.togglePause() }.buttonStyle(.borderedProminent)
-                    Button("Вперёд") { studio.next() }.buttonStyle(.borderedProminent)
+                    Button(studio.step?.kind == .question || studio.step?.kind == .repeated ? "Ответ" : "Далее") { studio.next() }.buttonStyle(.borderedProminent)
                     if studio.phoneMode { Button("Ответы \(studio.phoneRoom.pending(through: studio.roundIndex).count)") { studio.showPhoneReview = true }.disabled(!studio.audienceScreenReady && !studio.showScoreInputLocally) }
                     BackgroundMusicControls(music: studio.background)
                     Button("Завершить квиз…",role:.destructive) { studio.confirmExit() }
                     Menu {
+                        Section("Пульт презентаций") {
+                            Label("Вопрос вперёд: → или Page Down", systemImage: "arrow.right")
+                            Label("Пауза: пробел, Enter или Play/Pause", systemImage: "pause")
+                            Label("Назад: ← или Page Up", systemImage: "arrow.left")
+                        }
                         Button("Перейти к этапу…") { studio.showJump = true }
                         Button("Заново начать этап") { studio.enter() }
                         Button("Экран ТВ") { studio.showTV() }
@@ -2169,28 +2548,94 @@ struct Scores: View {
 
 struct Welcome: View {
     @ObservedObject var studio: Studio
+    @State private var showQuickCreate = false
     var body: some View {
-        VStack(spacing: 28) {
-            Image(systemName: "sparkles.tv").font(.system(size: 72)).foregroundStyle(.indigo)
-            Text("Квиз Студия").font(.system(size: 46,weight: .bold))
-            Text("Создайте игру или проведите готовый квиз").font(.title3).foregroundStyle(.secondary)
-            LazyVGrid(columns: [GridItem(.flexible(),spacing: 20),GridItem(.flexible(),spacing: 20)],spacing: 20) {
-                Button { studio.newQuiz() } label: { entry("Создать квиз","Соберите игру и настройте вопросы","square.and.pencil") }
+        GeometryReader { geometry in
+        let compact = geometry.size.height < 650
+        ScrollView(.vertical) {
+        VStack(spacing: compact ? 12 : 18) {
+            HStack(alignment:.center,spacing:12) {
+                VStack(alignment:.leading,spacing:4) {
+                    Text("Квиз Студия").font(.system(size: compact ? 28 : 34,weight:.bold))
+                    Text("Создайте игру или проведите готовый квиз").font(compact ? .callout : .title3).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Архив",systemImage:"chart.bar.doc.horizontal") { studio.showGameArchive = true }.buttonStyle(.bordered)
+            }
+            if studio.recoveryAvailable { Button("Восстановить незавершённую игру") { studio.restoreGame() }.buttonStyle(.borderedProminent) }
+            Button("Продолжить черновик",systemImage:"pencil") { studio.screen = .editor }.buttonStyle(.link).frame(maxWidth:.infinity,alignment:.leading)
+            LazyVGrid(columns: [GridItem(.flexible(),spacing: 12),GridItem(.flexible(),spacing: 12)],spacing: 12) {
+                Button { showQuickCreate = true } label: { entry("Создать квиз","Начните с первого вопроса, затем настройте игру","square.and.pencil") }
+                Button { studio.showLibrary(editing:true) } label: { entry("Мои квизы","Открывайте, сортируйте и редактируйте проекты","rectangle.stack") }
                 Button { studio.showLibrary(editing: false) } label: { entry("Провести игру","Выберите квиз и подготовьте команды","play.rectangle") }
                 Button { studio.showQuestionBank = true } label: { entry("Банк вопросов","Ищите, импортируйте и собирайте вопросы","tray.full") }
-                Button { studio.showGameArchive = true } label: { entry("Архив игр","Результаты и статистика проведённых игр","chart.bar.doc.horizontal") }
             }.buttonStyle(.plain).frame(maxWidth: 740)
-            if studio.recoveryAvailable { Button("Восстановить незавершённую игру") { studio.restoreGame() }.buttonStyle(.borderedProminent) }
-            Button("Продолжить редактирование черновика",systemImage:"pencil") { studio.screen = .editor }.buttonStyle(.link)
-            Text(studio.status).foregroundStyle(.secondary)
-        }.padding(40).frame(maxWidth: .infinity,maxHeight: .infinity).background(Color.indigo.opacity(0.04))
+            if !studio.status.isEmpty { Text(studio.status).foregroundStyle(.secondary).font(.caption).lineLimit(2) }
+        }.padding(.horizontal,compact ? 22 : 40).padding(.vertical,compact ? 14 : 26).frame(maxWidth: .infinity).frame(minHeight: geometry.size.height,alignment:.center)
+        }
+        }.background(Color.indigo.opacity(0.04))
+            .sheet(isPresented:$showQuickCreate) { QuickQuizStartView(studio:studio) }
     }
     func entry(_ title: String,_ subtitle: String,_ icon: String) -> some View {
-        VStack(alignment: .leading,spacing: 14) {
-            Image(systemName: icon).font(.largeTitle).foregroundStyle(.indigo)
-            Text(title).font(.title2.bold()); Text(subtitle).foregroundStyle(.secondary).font(.callout)
-        }.padding(26).frame(maxWidth: .infinity,minHeight: 150,alignment: .leading).background(.background,in: RoundedRectangle(cornerRadius: 22)).overlay(RoundedRectangle(cornerRadius: 22).stroke(.quaternary))
+        HStack(alignment:.top,spacing:12) {
+            Image(systemName: icon).font(.title2).foregroundStyle(.indigo).frame(width:26)
+            VStack(alignment:.leading,spacing:4) {
+                Text(title).font(.headline)
+                Text(subtitle).foregroundStyle(.secondary).font(.caption).lineLimit(2)
+            }
+            Spacer(minLength:0)
+        }.padding(16).frame(maxWidth: .infinity,minHeight: 78,alignment: .leading).background(.background,in: RoundedRectangle(cornerRadius: 16)).overlay(RoundedRectangle(cornerRadius: 16).stroke(.quaternary))
     }
+}
+struct QuickQuizStartView: View {
+    @ObservedObject var studio: Studio
+    @Environment(\.dismiss) private var dismiss
+    @State private var title = "Новый квиз"
+    @State private var questions = [QuickQuizDraft()]
+    var canCreate: Bool { !questions.isEmpty && questions.allSatisfy { !$0.text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty && !$0.answer.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty } }
+    var body: some View {
+        VStack(alignment:.leading,spacing:18) {
+            VStack(alignment:.leading,spacing:5) {
+                Text("Соберите короткий квиз").font(.title2.bold())
+                Text("Добавьте вопросы и ответы. Раунды и оформление можно настроить позже.").foregroundStyle(.secondary)
+            }
+            TextField("Название квиза",text:$title)
+            ScrollView {
+                VStack(spacing:10) {
+                    ForEach($questions) { $question in
+                        GroupBox {
+                            VStack(alignment:.leading,spacing:8) {
+                                TextEditor(text:$question.text).frame(height:72).overlay(RoundedRectangle(cornerRadius:7).stroke(.quaternary))
+                                TextField("Правильный ответ",text:$question.answer)
+                                if questions.count > 1 { Button("Удалить вопрос",systemImage:"minus.circle",role:.destructive) { let id=question.id; questions.removeAll { $0.id == id } }.font(.caption) }
+                            }
+                        } label: { Text("Вопрос \(questions.firstIndex(where:{$0.id == question.id}).map{$0+1} ?? 1)").font(.headline) }
+                    }
+                    Button("Добавить вопрос",systemImage:"plus.circle") { questions.append(QuickQuizDraft()) }
+                        .frame(maxWidth:.infinity,alignment:.leading).padding(.top,4)
+                }
+            }
+            .frame(maxHeight:360)
+            HStack {
+                Button("Пустой квиз") { studio.newQuiz(); dismiss() }
+                Spacer()
+                Button("Отмена") { dismiss() }
+                Button("Создать и открыть редактор") {
+                    studio.newQuiz()
+                    studio.quiz.title = title.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? "Новый квиз" : title.trimmingCharacters(in:.whitespacesAndNewlines)
+                    studio.quiz.rounds[0].questions = questions.map { Question(text:$0.text.trimmingCharacters(in:.whitespacesAndNewlines),answer:$0.answer.trimmingCharacters(in:.whitespacesAndNewlines)) }
+                    studio.roundIndex = 0; studio.questionIndex = 0
+                    studio.status = "Первый вопрос добавлен — продолжите в редакторе"
+                    dismiss()
+                }.buttonStyle(.borderedProminent).disabled(!canCreate)
+            }
+        }.textFieldStyle(.roundedBorder).padding(24).frame(width:560,height:620)
+    }
+}
+private struct QuickQuizDraft: Identifiable {
+    var id = UUID()
+    var text = ""
+    var answer = ""
 }
 struct QuizLibrary: View {
     @ObservedObject var studio: Studio
@@ -2198,8 +2643,24 @@ struct QuizLibrary: View {
     @State var search = ""
     @State private var newestFirst = true
     @State private var showQuizTemplates = false
+    @State private var selectedFolder = ""
+    @State private var selectedTag = ""
+    @State private var metadataURL: URL?
+    @State private var showMetadata = false
+    @State private var summaries: [String: QuizLibrarySummary] = [:]
+    @State private var summariesLoaded = false
+    @FocusState private var librarySearchFocused: Bool
+    var folders: [String] { Array(Set(studio.libraryFolders.values)).sorted() }
+    var tags: [String] { Array(Set(studio.libraryTags.values.flatMap { $0 })).sorted() }
     var visibleQuizzes: [URL] {
-        studio.recentQuizzes.filter { search.isEmpty || $0.deletingPathExtension().lastPathComponent.localizedCaseInsensitiveContains(search) }.sorted { a,b in
+        studio.recentQuizzes.filter { url in
+            let key = url.standardizedFileURL.path
+            let quizTags = studio.libraryTags[key] ?? []
+            let matchesSearch = search.isEmpty || url.deletingPathExtension().lastPathComponent.localizedCaseInsensitiveContains(search) || quizTags.contains { $0.localizedCaseInsensitiveContains(search) }
+            let matchesFolder = selectedFolder.isEmpty || studio.libraryFolders[key] == selectedFolder
+            let matchesTag = selectedTag.isEmpty || quizTags.contains(selectedTag)
+            return matchesSearch && matchesFolder && matchesTag
+        }.sorted { a,b in
             if newestFirst {
                 let ad = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
                 let bd = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
@@ -2209,7 +2670,7 @@ struct QuizLibrary: View {
         }
     }
     var body: some View {
-        VStack(alignment: .leading,spacing: 24) {
+        VStack(alignment: .leading,spacing: 18) {
             HStack {
                 Button("Главная") { studio.screen = .home }
                 Spacer()
@@ -2217,35 +2678,139 @@ struct QuizLibrary: View {
                 Button("Открыть квиз на Mac…") { studio.open(forPlay: !editing) }
                 if editing { Button("Создать с нуля",systemImage: "plus") { studio.newQuiz() }.buttonStyle(.borderedProminent) }
             }
-            Text(editing ? "Создать или редактировать квиз" : "Запустить квиз").font(.largeTitle.bold())
+            Text(editing ? "Мои квизы" : "Провести игру").font(.largeTitle.bold())
             Text(editing ? "Откройте сохранённый квиз для правок или начните новый с нуля." : "Выберите квиз для проведения. Его также можно открыть для редактирования.").foregroundStyle(.secondary)
-            HStack { TextField("Найти квиз по названию",text: $search).textFieldStyle(.roundedBorder); Picker("Порядок",selection: $newestFirst) { Text("По дате изменения").tag(true); Text("По названию").tag(false) }.frame(width: 260) }
+            HStack {
+                TextField("Найти квиз по названию",text: $search).textFieldStyle(.roundedBorder).frame(maxWidth: 420).focused($librarySearchFocused)
+                Picker("Порядок",selection: $newestFirst) { Text("По дате изменения").tag(true); Text("По названию").tag(false) }.frame(width: 240)
+                Picker("Папка", selection: $selectedFolder) {
+                    Text("Все папки").tag("")
+                    ForEach(folders,id:\.self) { Text($0).tag($0) }
+                }.frame(width: 150)
+                Picker("Тег", selection: $selectedTag) {
+                    Text("Все теги").tag("")
+                    ForEach(tags,id:\.self) { Text($0).tag($0) }
+                }.frame(width: 130)
+                Spacer()
+                Text("\(visibleQuizzes.count) квизов").font(.caption).foregroundStyle(.secondary)
+            }
             if studio.recentQuizzes.isEmpty {
                 ContentUnavailableView("Пока нет сохранённых квизов",systemImage: "rectangle.stack",description: Text(editing ? "Создайте квиз с нуля или откройте файл на Mac." : "Нажмите «Открыть квиз на Mac…» и укажите файл .quiz"))
             } else if visibleQuizzes.isEmpty {
                 ContentUnavailableView.search(text: search)
             } else {
-                List(visibleQuizzes,id: \.path) { url in
-                    HStack(spacing: 16) {
-                        Image(systemName: "doc.text").font(.title2).foregroundStyle(.indigo)
-                        VStack(alignment: .leading,spacing: 5) {
-                            Text(url.deletingPathExtension().lastPathComponent).font(.headline)
-                            if let date = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate { Text("Изменён: " + date.formatted(date: .abbreviated,time: .shortened)).font(.caption).foregroundStyle(.secondary) }
-                            Text(((try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true ? "Папка старого формата · " : "Файл .quiz · ") + url.path).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                ScrollView {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 285),spacing: 14)],spacing: 14) {
+                        ForEach(visibleQuizzes,id: \.path) { url in
+                            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { ByteCountFormatter.string(fromByteCount: Int64($0),countStyle: .file) } ?? "Квиз"
+                            VStack(alignment: .leading,spacing: 14) {
+                                HStack(alignment: .top,spacing: 12) {
+                                    Image(systemName: "rectangle.stack").font(.title2).foregroundStyle(.indigo).frame(width: 42,height: 42).background(.indigo.opacity(0.1),in: RoundedRectangle(cornerRadius: 11))
+                                    VStack(alignment: .leading,spacing: 4) {
+                                        Text(url.deletingPathExtension().lastPathComponent).font(.headline).lineLimit(2)
+                                        if let date = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
+                                            Text("Изменён " + date.formatted(date: .abbreviated,time: .shortened)).font(.caption).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Spacer(minLength: 0)
+                                    Menu {
+                                        Button("Создать копию…",systemImage:"doc.on.doc") { studio.duplicateQuiz(url) }
+                                        Button("Экспортировать…",systemImage:"square.and.arrow.up") { studio.exportQuiz(url) }
+                                        Button("Показать в Finder",systemImage:"folder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                                        Button("Папка и теги…",systemImage:"tag") { metadataURL = url; showMetadata = true }
+                                        Divider()
+                                        Button("Убрать из списка",systemImage:"xmark.circle",role:.destructive) { studio.removeFromLibrary(url) }
+                                        Button("Удалить файл с Mac…",systemImage:"trash",role:.destructive) { studio.deleteQuizFile(url) }
+                                    } label: { Image(systemName:"ellipsis").padding(6).contentShape(Rectangle()) }.menuStyle(.borderlessButton)
+                                }
+                                Text("\(size) · \(url.pathExtension.uppercased())")
+                                    .font(.caption).foregroundStyle(.tertiary).lineLimit(1)
+                                let summary = summaries[url.standardizedFileURL.path]
+                                if let summary {
+                                    Label("\(summary.questions) вопросов · \(summary.rounds) раундов",systemImage:"list.number").font(.caption).foregroundStyle(.secondary)
+                                } else {
+                                    Label(summariesLoaded ? "Сводка недоступна" : "Сводка загружается…",systemImage:summariesLoaded ? "exclamationmark.circle" : "list.number").font(.caption).foregroundStyle(.secondary)
+                                }
+                                let urlTags = studio.libraryTags[url.standardizedFileURL.path] ?? []
+                                let folder = studio.libraryFolders[url.standardizedFileURL.path]
+                                if folder != nil || !urlTags.isEmpty {
+                                    HStack(spacing:6) {
+                                        if let folder { Label(folder,systemImage:"folder").font(.caption2).padding(.horizontal,7).padding(.vertical,4).background(.quaternary,in:Capsule()) }
+                                        ForEach(urlTags,id:\.self) { tag in Text(tag).font(.caption2).padding(.horizontal,7).padding(.vertical,4).background(.indigo.opacity(0.1),in:Capsule()) }
+                                    }.lineLimit(1)
+                                }
+                                HStack {
+                                    Button("Редактировать",systemImage:"square.and.pencil") { studio.editQuiz(url) }
+                                    Spacer()
+                                    if !editing { Button("Начать",systemImage:"play.fill") { if studio.load(url) { studio.prepareGame() } }.buttonStyle(.borderedProminent) }
+                                }
+                            }
+                            .padding(16).frame(maxWidth:.infinity,alignment:.leading).background(.background,in:RoundedRectangle(cornerRadius:16)).overlay(RoundedRectangle(cornerRadius:16).stroke(.quaternary))
+                            .contextMenu {
+                                Button("Создать копию…") { studio.duplicateQuiz(url) }
+                                Button("Экспортировать…") { studio.exportQuiz(url) }
+                                Button("Показать в Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                                Button("Папка и теги…") { metadataURL = url; showMetadata = true }
+                                Button("Убрать из списка",role:.destructive) { studio.removeFromLibrary(url) }
+                                Button("Удалить файл с Mac…",role:.destructive) { studio.deleteQuizFile(url) }
+                            }
                         }
-                        Spacer()
-                        Button("Создать копию") { studio.duplicateQuiz(url) }
-                        Button("Редактировать",systemImage: "square.and.pencil") { studio.editQuiz(url) }
-                        if !editing { Button("Запустить",systemImage: "play.fill") { if studio.load(url) { studio.prepareGame() } }.buttonStyle(.borderedProminent) }
-                        Button { studio.removeFromLibrary(url) } label: { Image(systemName: "xmark.circle") }
-                            .buttonStyle(.borderless).help("Убрать из списка. Файл останется на Mac.").accessibilityLabel("Убрать из списка: " + url.deletingPathExtension().lastPathComponent)
-                    }.padding(10)
+                    }.padding(.vertical,4)
                 }
             }
             Text(studio.status).foregroundStyle(.secondary)
             Text("Удаление из списка не удаляет файл. Чтобы вернуть квиз, откройте его на Mac заново.").font(.caption).foregroundStyle(.secondary)
-        }.padding(36)
+        }.padding(28)
         .sheet(isPresented:$showQuizTemplates) { QuizTemplatePicker(studio:studio) }
+        .sheet(isPresented:$showMetadata) {
+            if let metadataURL {
+                QuizLibraryMetadataEditor(url:metadataURL, folder:studio.libraryFolders[metadataURL.standardizedFileURL.path] ?? "", tags:(studio.libraryTags[metadataURL.standardizedFileURL.path] ?? []).joined(separator:", ")) { folder,tags in
+                    studio.setLibraryMetadata(for:metadataURL,folder:folder,tags:tags)
+                }
+            }
+        }
+        .task(id: studio.recentQuizzes.map(\.path).joined(separator:"\n")) {
+            let urls = studio.recentQuizzes
+            let loaded = await Task.detached(priority:.utility) {
+                var result: [String:QuizLibrarySummary] = [:]
+                for url in urls {
+                    var isDirectory: ObjCBool = false
+                    guard FileManager.default.fileExists(atPath:url.path,isDirectory:&isDirectory) else { continue }
+                    let source = isDirectory.boolValue ? url.appendingPathComponent("quiz.json") : url
+                    guard let data = try? Data(contentsOf:source) else { continue }
+                    let quiz: Quiz?
+                    if isDirectory.boolValue { quiz = try? JSONDecoder().decode(Quiz.self,from:data) }
+                    else { quiz = try? JSONDecoder().decode(QuizLibraryContainer.self,from:data).quiz }
+                    if let quiz {
+                        result[url.standardizedFileURL.path] = QuizLibrarySummary(rounds:quiz.rounds.count,questions:quiz.rounds.reduce(0) { $0 + $1.questions.count })
+                    }
+                }
+                return result
+            }.value
+            summaries = loaded
+            summariesLoaded = true
+        }
+        .onChange(of: studio.focusLibrarySearch) { _, requested in
+            if requested { librarySearchFocused = true; studio.focusLibrarySearch = false }
+        }
+    }
+}
+private struct QuizLibraryContainer: Decodable { let quiz: Quiz }
+private struct QuizLibrarySummary: Sendable { let rounds: Int; let questions: Int }
+struct QuizLibraryMetadataEditor: View {
+    let url: URL
+    @State var folder: String
+    @State var tags: String
+    let save: (String,String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        VStack(alignment:.leading,spacing:16) {
+            Text("Папка и теги").font(.title2.bold())
+            Text(url.deletingPathExtension().lastPathComponent).foregroundStyle(.secondary).lineLimit(1)
+            TextField("Папка, например «Музыка»",text:$folder)
+            TextField("Теги через запятую",text:$tags)
+            HStack { Spacer(); Button("Отмена") { dismiss() }; Button("Сохранить") { save(folder,tags); dismiss() }.buttonStyle(.borderedProminent) }
+        }.textFieldStyle(.roundedBorder).padding(22).frame(width:420)
     }
 }
 struct TeamSetup: View {

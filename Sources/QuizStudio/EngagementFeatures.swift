@@ -50,14 +50,14 @@ struct ScoringRulesEditor: View {
     var body: some View {
         DisclosureGroup("Баллы и ставка") {
             VStack(alignment:.leading,spacing:10) {
-                HStack {
+                VStack(alignment:.leading,spacing:8) {
                     number("За правильный ответ",value:Binding(get:{ question.correctPoints ?? 1 },set:{ question.correctPoints=$0 }))
                     number("За неправильный",value:Binding(get:{ question.wrongPoints ?? 0 },set:{ question.wrongPoints=$0 }))
                     number("За частичный",value:Binding(get:{ question.partialPoints ?? 0 },set:{ question.partialPoints=$0 }))
                 }
                 Toggle("Разрешить команде сделать ставку",isOn:Binding(get:{ question.wagerEnabled ?? false },set:{ question.wagerEnabled=$0 }))
                 if question.wagerEnabled == true {
-                    HStack {
+                    VStack(alignment:.leading,spacing:8) {
                         number("Верно со ставкой",value:Binding(get:{ question.wagerCorrectPoints ?? 2 },set:{ question.wagerCorrectPoints=$0 }))
                         number("Ошибка со ставкой",value:Binding(get:{ question.wagerWrongPoints ?? -2 },set:{ question.wagerWrongPoints=$0 }))
                     }
@@ -67,7 +67,10 @@ struct ScoringRulesEditor: View {
         }
     }
     private func number(_ title:String,value:Binding<Double>) -> some View {
-        VStack(alignment:.leading) { Text(title).font(.caption); TextField(title,value:value,format:.number.precision(.fractionLength(0...2))).frame(minWidth:120) }
+        VStack(alignment:.leading,spacing:4) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            TextField(title,value:value,format:.number.precision(.fractionLength(0...2))).frame(maxWidth:.infinity)
+        }.frame(maxWidth:.infinity,alignment:.leading)
     }
 }
 
