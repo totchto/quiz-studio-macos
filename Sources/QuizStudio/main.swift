@@ -437,10 +437,17 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
     }
 }
 
+private struct AutosaveSnapshot {
+    let quiz: Quiz
+    let destination: URL
+    let media: [(String,URL?)]
+}
+
 @MainActor final class Studio: ObservableObject {
     enum LibraryIntent: Equatable { case edit, play }
     private static let autosaveQueue = DispatchQueue(label:"QuizStudio.autosave",qos:.utility)
     private var autosaveWorkItem: DispatchWorkItem?
+    private var pendingAutosaveSnapshot: AutosaveSnapshot?
     private(set) var autosavePending = false
     private(set) var autosaveFailed = false
     private var autosaveGeneration = 0
@@ -538,7 +545,7 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
     var transitionElapsed: Double = 0
     var timer: Timer?
     var tv: NSWindow?
-    let draft: URL
+    var draft: URL
     var step: Step? { steps.indices.contains(index) ? steps[index] : nil }
     var currentQuestion: Question? {
         guard let s = step, quiz.rounds.indices.contains(s.round), quiz.rounds[s.round].questions.indices.contains(s.question) else { return nil }
@@ -593,16 +600,23 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
         autosavePending = true
         autosaveFailed = false
         autosaveError = nil
-        autosaveWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.enqueueAutosave() }
-        autosaveWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline:.now()+0.45,execute:work)
+        let snapshot = AutosaveSnapshot(quiz:quiz,destination:draft,media:referencedAssets.map { name in (name,asset(name)) })
+        pendingAutosaveSnapshot = snapshot
+        autosaveWorkItem?.cancel(); autosaveWorkItem = nil
+        if !FileManager.default.fileExists(atPath:draft.appendingPathComponent("quiz.json").path) {
+            enqueueAutosave(snapshot:snapshot)
+        } else {
+            let work = DispatchWorkItem { [weak self] in self?.enqueueAutosave(snapshot:snapshot) }
+            autosaveWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline:.now()+0.45,execute:work)
+        }
     }
-    private func enqueueAutosave(completion:(@MainActor (Bool)->Void)? = nil) {
+    private func enqueueAutosave(snapshot:AutosaveSnapshot? = nil,completion:(@MainActor (Bool)->Void)? = nil) {
         let generation = autosaveGeneration
-        let quizSnapshot = quiz
-        let destination = draft
-        let media = referencedAssets.compactMap { name in asset(name).map { (name,$0) } }
+        let captured = snapshot ?? AutosaveSnapshot(quiz:quiz,destination:draft,media:referencedAssets.map { name in (name,asset(name)) })
+        let quizSnapshot = captured.quiz
+        let destination = captured.destination
+        let media = captured.media
         Self.autosaveQueue.async { [weak self] in
             do {
                 try FileManager.default.createDirectory(at:destination,withIntermediateDirectories:true)
@@ -610,14 +624,16 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
                 try FileManager.default.createDirectory(at:mediaFolder,withIntermediateDirectories:true)
                 for (name,source) in media {
                     let target = mediaFolder.appendingPathComponent(name)
-                    if source.standardizedFileURL == target.standardizedFileURL || FileManager.default.fileExists(atPath:target.path) { continue }
-                    guard FileManager.default.fileExists(atPath:source.path) else { continue }
-                    try FileManager.default.copyItem(at:source,to:target)
+                    if FileManager.default.fileExists(atPath:target.path) { continue }
+                    guard let source, FileManager.default.fileExists(atPath:source.path) else {
+                        throw CocoaError(.fileNoSuchFile, userInfo:[NSFilePathErrorKey:name])
+                    }
+                    if source.standardizedFileURL != target.standardizedFileURL { try FileManager.default.copyItem(at:source,to:target) }
                 }
                 try JSONEncoder().encode(quizSnapshot).write(to:destination.appendingPathComponent("quiz.json"),options:.atomic)
                 try JSONEncoder().encode(quizSnapshot.teams).write(to:destination.appendingPathComponent("game-results.json"),options:.atomic)
                 Task { @MainActor in
-                    if self?.autosaveGeneration == generation { self?.autosavePending = false; self?.autosaveFailed = false; self?.autosaveError = nil; self?.lastAutosave = Date() }
+                    if self?.autosaveGeneration == generation { self?.autosavePending = false; self?.pendingAutosaveSnapshot = nil; self?.autosaveFailed = false; self?.autosaveError = nil; self?.lastAutosave = Date() }
                     completion?(true)
                 }
             } catch {
@@ -632,7 +648,7 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
     func flushAutosave(completion:@escaping @MainActor (Bool)->Void) {
         autosaveWorkItem?.cancel(); autosaveWorkItem = nil
         guard autosavePending || autosaveFailed else { completion(true); return }
-        enqueueAutosave(completion:completion)
+        enqueueAutosave(snapshot:pendingAutosaveSnapshot,completion:completion)
     }
     func persistResults() throws {
         guard let documentURL else { return }
@@ -818,7 +834,9 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
                     try data.write(to: media.appendingPathComponent(name),options: .atomic)
                 }
             }
-            guard !decoded.rounds.isEmpty, decoded.rounds.allSatisfy({ $0.questions.allSatisfy { $0.choices.count == 4 } }) else { throw CocoaError(.fileReadCorruptFile) }
+            guard !decoded.rounds.isEmpty, decoded.rounds.allSatisfy({ round in round.questions.allSatisfy { question in
+                question.choices.count <= 8 && (question.kind != "Один из четырёх" || question.choices.count == 4)
+            } }) else { throw CocoaError(.fileReadCorruptFile) }
             quiz = decoded; folder = mediaFolder; documentURL = url.standardizedFileURL == draft.standardizedFileURL ? nil : url
             roundIndex = 0; questionIndex = 0; remember(url); status = ""
             registeredFontName = asset(quiz.appearance?.fontFile).flatMap { registerFont($0) }
@@ -827,9 +845,15 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
             return true
         } catch { status = "Не удалось открыть квиз: \(error.localizedDescription)"; return false }
     }
-    func newQuiz() { autosave(); screen = .editor; quiz = Quiz(); registeredFontName = nil; folder = nil; documentURL = nil; roundIndex = 0; questionIndex = 0; status = "Создан новый квиз"; undoHistory = []; redoHistory = [] }
+    func newQuiz() {
+        autosave(); flushAutosave { _ in }
+        let support = draft.deletingLastPathComponent()
+        draft = support.appendingPathComponent("Draft-" + UUID().uuidString + ".workspace")
+        screen = .editor; quiz = Quiz(); registeredFontName = nil; folder = nil; documentURL = nil
+        roundIndex = 0; questionIndex = 0; status = "Создан новый квиз"; undoHistory = []; redoHistory = []
+    }
     func duplicateSelectedQuestion() {
-        guard quiz.rounds.indices.contains(roundIndex), quiz.rounds[roundIndex].questions.indices.contains(questionIndex) else { return }
+        guard !playing, quiz.rounds.indices.contains(roundIndex), quiz.rounds[roundIndex].questions.indices.contains(questionIndex) else { return }
         var copy = quiz.rounds[roundIndex].questions[questionIndex]
         copy.id = UUID()
         quiz.rounds[roundIndex].questions.insert(copy, at: questionIndex + 1)
@@ -957,19 +981,19 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
     func questionBinding(_ id: UUID) -> Binding<Question> {
         let fallback = quiz.rounds.flatMap(\.questions).first { $0.id == id } ?? Question()
         return Binding(get: { self.quiz.rounds.flatMap(\.questions).first { $0.id == id } ?? fallback },set: { value in
-            guard let r = self.quiz.rounds.firstIndex(where: { $0.questions.contains(where: { $0.id == id }) }), let q = self.quiz.rounds[r].questions.firstIndex(where: { $0.id == id }) else { return }
+            guard !self.playing, let r = self.quiz.rounds.firstIndex(where: { $0.questions.contains(where: { $0.id == id }) }), let q = self.quiz.rounds[r].questions.firstIndex(where: { $0.id == id }) else { return }
             self.quiz.rounds[r].questions[q] = value
         })
     }
     func roundBinding(_ id: UUID) -> Binding<Round> {
         let fallback = quiz.rounds.first { $0.id == id } ?? Round()
         return Binding(get: { self.quiz.rounds.first { $0.id == id } ?? fallback },set: { value in
-            guard let index = self.quiz.rounds.firstIndex(where: { $0.id == id }) else { return }
+            guard !self.playing, let index = self.quiz.rounds.firstIndex(where: { $0.id == id }) else { return }
             self.quiz.rounds[index] = value
         })
     }
     @discardableResult func moveQuestion(_ id: UUID,toRound target: UUID,before anchor: UUID? = nil) -> Bool {
-        guard let source = quiz.rounds.firstIndex(where: { $0.questions.contains(where: { $0.id == id }) }),
+        guard !playing, let source = quiz.rounds.firstIndex(where: { $0.questions.contains(where: { $0.id == id }) }),
               let sourceIndex = quiz.rounds[source].questions.firstIndex(where: { $0.id == id }),
               let destination = quiz.rounds.firstIndex(where: { $0.id == target }) else { return false }
         if anchor == id { return false }
@@ -1021,26 +1045,27 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
         screen = .editor
     }
     func deleteEmptyRound(_ id: UUID) {
-        guard quiz.rounds.count > 1, let index = quiz.rounds.firstIndex(where: { $0.id == id }), quiz.rounds[index].questions.isEmpty else { return }
+        guard !playing, quiz.rounds.count > 1, let index = quiz.rounds.firstIndex(where: { $0.id == id }), quiz.rounds[index].questions.isEmpty else { return }
         let active = quiz.rounds[roundIndex].id
         quiz.rounds.remove(at: index)
         roundIndex = quiz.rounds.firstIndex(where: { $0.id == active }) ?? min(index,quiz.rounds.count-1)
         questionIndex = min(questionIndex,max(0,quiz.rounds[roundIndex].questions.count-1))
     }
     func deleteSelectedQuestion() {
-        guard quiz.rounds.indices.contains(roundIndex), quiz.rounds[roundIndex].questions.indices.contains(questionIndex) else { return }
+        guard !playing, quiz.rounds.indices.contains(roundIndex), quiz.rounds[roundIndex].questions.indices.contains(questionIndex) else { return }
         quiz.rounds[roundIndex].questions.remove(at: questionIndex)
         questionIndex = min(questionIndex,max(0,quiz.rounds[roundIndex].questions.count-1))
     }
-    func addRound() { quiz.rounds.append(Round(title: "Раунд \(quiz.rounds.count + 1)")); roundIndex = quiz.rounds.count-1; questionIndex = 0 }
+    func addRound() { guard !playing else { return }; quiz.rounds.append(Round(title: "Раунд \(quiz.rounds.count + 1)")); roundIndex = quiz.rounds.count-1; questionIndex = 0 }
     func duplicateRound(_ id: UUID) {
-        guard let index = quiz.rounds.firstIndex(where: { $0.id == id }) else { return }
+        guard !playing, let index = quiz.rounds.firstIndex(where: { $0.id == id }) else { return }
         var copy = quiz.rounds[index]; copy.id = UUID(); copy.title += " — копия"
         for questionIndex in copy.questions.indices { copy.questions[questionIndex].id = UUID() }
+        if var blocks = copy.blocks { for blockIndex in blocks.indices { blocks[blockIndex].id = UUID() }; copy.blocks = blocks }
         quiz.rounds.insert(copy,at:index+1); roundIndex = index+1; questionIndex = 0
     }
     @discardableResult func moveRound(_ id: UUID,before anchor: UUID?) -> Bool {
-        guard let source = quiz.rounds.firstIndex(where: { $0.id == id }), id != anchor,
+        guard !playing, let source = quiz.rounds.firstIndex(where: { $0.id == id }), id != anchor,
               anchor == nil || quiz.rounds.contains(where: { $0.id == anchor }) else { return false }
         let activeID = quiz.rounds.indices.contains(roundIndex) ? quiz.rounds[roundIndex].id : id
         var updated = quiz
@@ -1315,14 +1340,14 @@ extension Studio {
         } catch { status = "Не удалось восстановить игру: " + error.localizedDescription }
     }
     func undoEdit() {
-        guard let previous = undoHistory.popLast() else { return }
+        guard !playing, let previous = undoHistory.popLast() else { return }
         redoHistory.append(quiz)
         suppressUndo = true; quiz = previous; suppressUndo = false
         roundIndex = min(roundIndex,max(0,quiz.rounds.count-1)); questionIndex = min(questionIndex,max(0,quiz.rounds[roundIndex].questions.count-1))
         autosave()
     }
     func redoEdit() {
-        guard let next = redoHistory.popLast() else { return }
+        guard !playing, let next = redoHistory.popLast() else { return }
         undoHistory.append(quiz)
         suppressUndo = true; quiz = next; suppressUndo = false
         roundIndex = min(roundIndex,max(0,quiz.rounds.count-1)); questionIndex = min(questionIndex,max(0,quiz.rounds[roundIndex].questions.count-1))
@@ -1674,15 +1699,15 @@ struct RoundDropTarget: View {
         }
     }
     var body: some Scene {
-        WindowGroup("Квиз Студия · 0.18.0 — тестовая сборка") { Content(studio: studio).onAppear { appDelegate.install(studio) }.frame(minWidth: 1050,minHeight: 720).preferredColorScheme(appearance).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if url.pathExtension.lowercased() == "siq" { studio.chooseSIQ(url) } else if !studio.playing && studio.load(url) { studio.prepareGame() } } }
+        WindowGroup("Квиз Студия · 0.19.0") { Content(studio: studio).onAppear { appDelegate.install(studio) }.frame(minWidth: 1050,minHeight: 720).preferredColorScheme(appearance).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if url.pathExtension.lowercased() == "siq" { studio.chooseSIQ(url) } else if !studio.playing && studio.load(url) { studio.prepareGame() } } }
         .commands {
             CommandGroup(replacing: .newItem) { Button("Создать квиз") { studio.newQuiz() }.keyboardShortcut("n").disabled(studio.playing); Button("Открыть квиз…") { studio.open() }.keyboardShortcut("o").disabled(studio.playing); Button("Сохранить квиз…") { studio.save() }.keyboardShortcut("s") }
             CommandGroup(replacing:.undoRedo) {
-                Button("Отменить изменение") { studio.undoEdit() }.keyboardShortcut("z").disabled(studio.undoHistory.isEmpty)
-                Button("Повторить изменение") { studio.redoEdit() }.keyboardShortcut("z",modifiers:[.command,.shift]).disabled(studio.redoHistory.isEmpty)
+                Button("Отменить изменение") { studio.undoEdit() }.keyboardShortcut("z").disabled(studio.playing || studio.undoHistory.isEmpty)
+                Button("Повторить изменение") { studio.redoEdit() }.keyboardShortcut("z",modifiers:[.command,.shift]).disabled(studio.playing || studio.redoHistory.isEmpty)
             }
             CommandGroup(after:.pasteboard) {
-                Button("Дублировать вопрос") { studio.duplicateSelectedQuestion() }.disabled(studio.selectedQuestion == nil)
+                Button("Дублировать вопрос") { studio.duplicateSelectedQuestion() }.disabled(studio.playing || studio.selectedQuestion == nil)
             }
             CommandGroup(after:.textEditing) {
                 Button("Найти") {
@@ -1893,7 +1918,7 @@ struct BankQuestionEditor: View {
             Text("Можно сохранить незаполненную идею и вернуться к ней позже. Категории определятся по типу вопроса и медиа.").font(.caption).foregroundStyle(.secondary)
             if let error { Text(error).foregroundStyle(.red) }
             if session.status.hasPrefix("Не удалось открыть") { Text(session.status).foregroundStyle(.red) }
-            ScrollView { if let q = session.selectedQuestion { QuestionEditor(studio:session,question:session.questionBinding(q.id)).padding() } }
+            ScrollView { if let q = session.selectedQuestion { VStack(alignment:.leading,spacing:14) { QuestionSettingsPanel(studio:session,question:q,showsDoneButton:false); Divider(); QuestionEditor(studio:session,question:session.questionBinding(q.id)) }.padding() } }
         }.padding(20).frame(minWidth:740,idealWidth:920,minHeight:520,idealHeight:720)
         .sheet(item:$session.editorPreview) { mode in EditorPreview(studio:session,mode:mode) }
         .onDisappear { session.playback.stop(); session.timer?.invalidate() }
@@ -2198,9 +2223,9 @@ struct Editor: View {
                         Button("Поиск вопросов…",systemImage:"magnifyingglass") { questionSearchFocused = true }
                         Button(currentView == .table ? "Вид редактора" : "Табличный вид",systemImage:currentView == .table ? "rectangle.and.pencil.and.ellipsis" : "tablecells") { currentView = currentView == .table ? .question : .table }
                         Divider()
-                        Button("Отменить изменение",systemImage:"arrow.uturn.backward") { studio.undoEdit() }.disabled(studio.undoHistory.isEmpty)
-                        Button("Повторить изменение",systemImage:"arrow.uturn.forward") { studio.redoEdit() }.disabled(studio.redoHistory.isEmpty)
-                        Button("Дублировать вопрос",systemImage:"plus.square.on.square") { studio.duplicateSelectedQuestion() }.disabled(studio.selectedQuestion == nil)
+                        Button("Отменить изменение",systemImage:"arrow.uturn.backward") { studio.undoEdit() }.disabled(studio.playing || studio.undoHistory.isEmpty)
+                        Button("Повторить изменение",systemImage:"arrow.uturn.forward") { studio.redoEdit() }.disabled(studio.playing || studio.redoHistory.isEmpty)
+                        Button("Дублировать вопрос",systemImage:"plus.square.on.square") { studio.duplicateSelectedQuestion() }.disabled(studio.playing || studio.selectedQuestion == nil)
                         Button("Импортировать вопросы…",systemImage:"tablecells") { studio.showBulkImport = true }
                         Button("Собрать квиз из банка…",systemImage:"sparkles") { studio.showQuizAssembly = true }
                         Button("Открыть банк вопросов…",systemImage:"tray.full") { studio.showQuestionBank = true }
@@ -2378,6 +2403,7 @@ struct Editor: View {
 private struct QuestionSettingsPanel: View {
     @ObservedObject var studio: Studio
     let question: Question
+    var showsDoneButton = true
     @Environment(\.dismiss) private var dismiss
     var body: some View {
         ScrollView {
@@ -2396,7 +2422,7 @@ private struct QuestionSettingsPanel: View {
                 }
                 Stepper("Время: \(question.seconds == 0 ? "без таймера" : "\(question.seconds) сек")",value:studio.questionBinding(question.id).seconds,in:0...600,step:5)
                 ScoringRulesEditor(question:studio.questionBinding(question.id))
-                Button("Готово") { dismiss() }.keyboardShortcut(.defaultAction)
+                if showsDoneButton { Button("Готово") { dismiss() }.keyboardShortcut(.defaultAction) }
             }.padding(22)
         }.frame(minWidth:340,idealWidth:420,minHeight:360)
     }
@@ -2706,10 +2732,8 @@ struct QuestionEditor: View {
 struct PlayerView: View {
     @ObservedObject var studio: Studio
     var hostQuestion: Question? {
-        guard studio.step?.kind == .question || studio.step?.kind == .repeated,
-              studio.quiz.rounds.indices.contains(studio.roundIndex),
-              studio.quiz.rounds[studio.roundIndex].questions.indices.contains(studio.questionIndex) else { return nil }
-        return studio.quiz.rounds[studio.roundIndex].questions[studio.questionIndex]
+        guard studio.step?.kind == .question || studio.step?.kind == .repeated else { return nil }
+        return studio.currentQuestion
     }
     var nextHostQuestion: Question? {
         guard let current = studio.steps.indices.first(where: { $0 > studio.index && studio.steps[$0].kind == .question }),
@@ -2729,7 +2753,7 @@ struct PlayerView: View {
                         Label(studio.stepTitle(studio.index),systemImage:"number").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                         if hostQuestion != nil {
                             let total = studio.quiz.rounds.reduce(0) { $0 + $1.questions.count }
-                            let number = studio.quiz.rounds.prefix(studio.roundIndex).reduce(0) { $0 + $1.questions.count } + studio.questionIndex + 1
+                            let number = studio.quiz.rounds.prefix(studio.step?.round ?? 0).reduce(0) { $0 + $1.questions.count } + (studio.step?.question ?? 0) + 1
                             Text("Вопрос \(number) из \(total)").font(.caption).foregroundStyle(.secondary)
                         }
                         if studio.phoneMode { Label("\(studio.phoneRoom.joinedTeams.count) подключено",systemImage:"iphone").font(.caption).foregroundStyle(.secondary) }
@@ -2763,7 +2787,7 @@ struct PlayerView: View {
                     Button("Назад") { studio.back() }.help("Назад (← или Page Up)")
                     Button(studio.awaitingQuestionStart ? "Запустить таймер" : (studio.paused ? "Продолжить" : "Пауза")) { studio.togglePause() }.buttonStyle(.borderedProminent).help("Пауза / продолжить (пробел или Enter)")
                     Button(studio.step?.kind == .question || studio.step?.kind == .repeated ? "Ответ" : "Далее") { studio.next() }.buttonStyle(.borderedProminent).help("Далее (→ или Page Down)")
-                    if studio.phoneMode { Button("Ответы \(studio.phoneRoom.pending(through: studio.roundIndex).count)") { studio.showPhoneReview = true }.disabled(!studio.audienceScreenReady && !studio.showScoreInputLocally) }
+                    if studio.phoneMode { Button("Ответы \(studio.phoneRoom.pending(through: studio.step?.round ?? studio.roundIndex).count)") { studio.showPhoneReview = true }.disabled(!studio.audienceScreenReady && !studio.showScoreInputLocally) }
                     BackgroundMusicControls(music: studio.background)
                     Button("Завершить квиз…",role:.destructive) { studio.confirmExit() }
                     Menu {

@@ -182,7 +182,11 @@ extension Studio {
         var copy = template.quiz
         copy.title = "Новый квиз"; copy.teams = []; copy.bankHistoryID = nil; copy.importNotes = nil
         if copy.rounds.isEmpty { copy.rounds = [Round(title:"Раунд 1",questions:[])] }
-        quiz = copy; introductionSeconds = template.introductionSeconds; phoneMode = template.phoneMode; readBeforeTimer = template.readBeforeTimer; automaticAdvance = template.automaticAdvance; signalsEnabled = template.signalsEnabled; roundIndex = 0; questionIndex = 0; editorSelection = []; undoHistory = []
+        autosave(); flushAutosave { _ in }
+        draft = draft.deletingLastPathComponent().appendingPathComponent("Draft-" + UUID().uuidString + ".workspace")
+        quiz = copy; folder = nil; documentURL = nil; registeredFontName = nil
+        introductionSeconds = template.introductionSeconds; phoneMode = template.phoneMode; readBeforeTimer = template.readBeforeTimer; automaticAdvance = template.automaticAdvance; signalsEnabled = template.signalsEnabled
+        roundIndex = 0; questionIndex = 0; editorSelection = []; undoHistory = []; redoHistory = []
         screen = .editor; autosave(); status = "Создан квиз по шаблону: "+template.name
     }
     func recordBankUsage(played: Bool) {
