@@ -88,16 +88,13 @@ struct WaveformData {
         if let track = tracks.first {
             let reader = try AVAssetReader(asset:asset)
             let output = AVAssetReaderTrackOutput(track:track,outputSettings:[AVFormatIDKey:kAudioFormatLinearPCM,AVLinearPCMIsFloatKey:true,AVLinearPCMBitDepthKey:32,AVLinearPCMIsNonInterleaved:false])
-            output.alwaysCopiesSampleData = false
-            reader.add(output)
-            guard reader.startReading() else { throw reader.error ?? CocoaError(.fileReadCorruptFile) }
-            while let sample = output.copyNextSampleBuffer() {
+            func accumulate(_ sample: CMSampleBuffer) throws {
                 if Task.isCancelled { reader.cancelReading(); throw CancellationError() }
-                guard let block = CMSampleBufferGetDataBuffer(sample) else { continue }
+                guard let block = CMSampleBufferGetDataBuffer(sample) else { return }
                 let bytes = CMBlockBufferGetDataLength(block)
                 var data = [Float](repeating:0,count:bytes/4)
                 let status = data.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block,atOffset:0,dataLength:bytes,destination:$0.baseAddress!) }
-                guard status == kCMBlockBufferNoErr else { continue }
+                guard status == kCMBlockBufferNoErr else { return }
                 let start = CMSampleBufferGetPresentationTimeStamp(sample).seconds
                 let span = CMSampleBufferGetDuration(sample).seconds
                 for (i,value) in data.enumerated() where value.isFinite {
@@ -105,6 +102,16 @@ struct WaveformData {
                     let bin = min(peaks.count-1,max(0,Int(t/duration*Double(peaks.count))))
                     peaks[bin] = max(peaks[bin],abs(value))
                 }
+            }
+            if #available(macOS 26.0, *) {
+                let provider = reader.outputProvider(for:output)
+                try reader.start()
+                while let sample = try await provider.next() { try sample.withUnsafeSampleBuffer { try accumulate($0) } }
+            } else {
+                output.alwaysCopiesSampleData = false
+                reader.add(output)
+                guard reader.startReading() else { throw reader.error ?? CocoaError(.fileReadCorruptFile) }
+                while let sample = output.copyNextSampleBuffer() { try accumulate(sample) }
             }
             if reader.status == .failed { throw reader.error ?? CocoaError(.fileReadCorruptFile) }
         }
@@ -119,7 +126,7 @@ struct WaveformData {
             let generator = AVAssetImageGenerator(asset:asset); generator.appliesPreferredTrackTransform = true; generator.maximumSize = CGSize(width:160,height:90)
             for i in 0..<10 {
                 try Task.checkCancellation()
-                if let image = try? generator.copyCGImage(at:CMTime(seconds:duration*Double(i)/10,preferredTimescale:600),actualTime:nil) { thumbnails.append(NSImage(cgImage:image,size:.zero)) }
+                if let result = try? await generator.image(at:CMTime(seconds:duration*Double(i)/10,preferredTimescale:600)) { thumbnails.append(NSImage(cgImage:result.image,size:.zero)) }
             }
         }
         let maximum = peaks.max() ?? 0

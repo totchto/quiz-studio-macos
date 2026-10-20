@@ -9,20 +9,37 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   let writer = try AVAssetWriter(outputURL: url,fileType: .mp4)
   let input = AVAssetWriterInput(mediaType: .video,outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264,AVVideoWidthKey: 160,AVVideoHeightKey: 120])
   if portrait { input.transform = CGAffineTransform(rotationAngle:.pi/2) }
-  let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input,sourcePixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,kCVPixelBufferWidthKey as String:160,kCVPixelBufferHeightKey as String:120])
-  writer.add(input); guard writer.startWriting() else { throw writer.error! }; writer.startSession(atSourceTime: .zero)
-  for frame in 0..<60 {
-   while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 5_000_000) }
-   var buffer: CVPixelBuffer?; CVPixelBufferPoolCreatePixelBuffer(nil,adaptor.pixelBufferPool!,&buffer)
-   guard let buffer else { fatalError("pixel buffer") }
-   CVPixelBufferLockBaseAddress(buffer,[])
-   let address = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
-   let count = CVPixelBufferGetBytesPerRow(buffer) * CVPixelBufferGetHeight(buffer)
-   for i in stride(from: 0,to: count,by: 4) { address[i]=UInt8(frame*3); address[i+1]=80; address[i+2]=120; address[i+3]=255 }
-   CVPixelBufferUnlockBaseAddress(buffer,[])
-   guard adaptor.append(buffer,withPresentationTime: CMTime(value: Int64(frame),timescale:30)) else { throw writer.error! }
+  if #available(macOS 26.0, *) {
+   let receiver = writer.inputPixelBufferReceiver(for:input,pixelBufferAttributes:nil)
+   try writer.start(); writer.startSession(atSourceTime:.zero)
+   for frame in 0..<60 {
+    var buffer: CVPixelBuffer?
+    guard CVPixelBufferCreate(kCFAllocatorDefault,160,120,kCVPixelFormatType_32BGRA,nil,&buffer) == kCVReturnSuccess, let buffer else { throw CocoaError(.fileWriteUnknown) }
+    CVPixelBufferLockBaseAddress(buffer,[])
+    let address = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
+    let count = CVPixelBufferGetBytesPerRow(buffer) * CVPixelBufferGetHeight(buffer)
+    for i in stride(from: 0,to: count,by: 4) { address[i]=UInt8(frame*3); address[i+1]=80; address[i+2]=120; address[i+3]=255 }
+    CVPixelBufferUnlockBaseAddress(buffer,[])
+    try await receiver.append(CVReadOnlyPixelBuffer(unsafeBuffer:buffer),with:CMTime(value:Int64(frame),timescale:30))
+   }
+   receiver.finish()
+  } else {
+   let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput:input,sourcePixelBufferAttributes:[kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_32BGRA,kCVPixelBufferWidthKey as String:160,kCVPixelBufferHeightKey as String:120])
+   writer.add(input); guard writer.startWriting() else { throw writer.error! }; writer.startSession(atSourceTime:.zero)
+   for frame in 0..<60 {
+    while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds:5_000_000) }
+    var buffer: CVPixelBuffer?; CVPixelBufferPoolCreatePixelBuffer(nil,adaptor.pixelBufferPool!,&buffer)
+    guard let buffer else { fatalError("pixel buffer") }
+    CVPixelBufferLockBaseAddress(buffer,[])
+    let address = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to:UInt8.self)
+    let count = CVPixelBufferGetBytesPerRow(buffer)*CVPixelBufferGetHeight(buffer)
+    for i in stride(from:0,to:count,by:4) { address[i]=UInt8(frame*3); address[i+1]=80; address[i+2]=120; address[i+3]=255 }
+    CVPixelBufferUnlockBaseAddress(buffer,[])
+    guard adaptor.append(buffer,withPresentationTime:CMTime(value:Int64(frame),timescale:30)) else { throw writer.error! }
+   }
+   input.markAsFinished()
   }
-  input.markAsFinished(); await writer.finishWriting()
+  await writer.finishWriting()
   guard writer.status == .completed else { throw writer.error! }
  }
  @MainActor static func check(_ file: URL,start: Double,end: Double,expectVideo: Bool) async throws {
@@ -81,8 +98,7 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   try composition.addMutableTrack(withMediaType:.audio,preferredTrackID:kCMPersistentTrackID_Invalid)!.insertTimeRange(CMTimeRange(start:.zero,duration:CMTime(seconds:1.8,preferredTimescale:600)),of:aTrack,at:.zero)
   let avFile = root.appendingPathComponent("with-sound.mp4")
   let export = AVAssetExportSession(asset:composition,presetName:AVAssetExportPresetHighestQuality)!
-  export.outputURL = avFile; export.outputFileType = .mp4; await export.export()
-  assert(export.status == .completed)
+  try await export.export(to:avFile,as:.mp4)
   let avWave = try await Task.detached { try await WaveformData.read(avFile) }.value
   assert(avWave.hasVideo && avWave.hasAudio && avWave.peaks.max()! > 0.9)
   let avSession = MediaSession(); let avSettings = ClipSettings(start:0.2,end:1.5,regions:[CensorRegion(start:0.6,end:0.9,silence:true)])
@@ -103,10 +119,10 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   let asset = AVURLAsset(url:wav); let tracks = try await asset.loadTracks(withMediaType:.audio)
   let reader = try AVAssetReader(asset:asset)
   let audio = AVAssetReaderAudioMixOutput(audioTracks:tracks,audioSettings:[AVFormatIDKey:kAudioFormatLinearPCM,AVLinearPCMIsFloatKey:true,AVLinearPCMBitDepthKey:32,AVLinearPCMIsNonInterleaved:false])
-  audio.audioMix = settings.audioMix(tracks:tracks,range:range); reader.add(audio); assert(reader.startReading())
+  audio.audioMix = settings.audioMix(tracks:tracks,range:range)
   var mutePeak: Float = 0; var normalPeak: Float = 0
-  while let sample = audio.copyNextSampleBuffer() {
-   guard let block = CMSampleBufferGetDataBuffer(sample) else { continue }
+  func inspect(_ sample: CMSampleBuffer) {
+   guard let block = CMSampleBufferGetDataBuffer(sample) else { return }
    let count = CMBlockBufferGetDataLength(block)/4
    var data = [Float](repeating:0,count:count)
    _ = data.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block,atOffset:0,dataLength:count*4,destination:$0.baseAddress!) }
@@ -116,6 +132,13 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
     if (0.85...1.05).contains(t) || (1.65...1.85).contains(t) { mutePeak = max(mutePeak,abs(v)) }
     if (1.25...1.45).contains(t) { normalPeak = max(normalPeak,abs(v)) }
    }
+  }
+  if #available(macOS 26.0, *) {
+   let provider = reader.outputProvider(for:audio); try reader.start()
+   while let sample = try await provider.next() { sample.withUnsafeSampleBuffer { inspect($0) } }
+  } else {
+   reader.add(audio); assert(reader.startReading())
+   while let sample = audio.copyNextSampleBuffer() { inspect(sample) }
   }
   assert(reader.status == .completed && mutePeak < 0.0001 && normalPeak > 0.02 && normalPeak < 0.07)
   let configured = MediaSession(); configured.start(url:wav,start:settings.start,end:settings.end,autoplay:false,effects:settings)

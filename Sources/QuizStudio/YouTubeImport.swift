@@ -212,12 +212,20 @@ enum ImportProcess {
         }
         let output = directory.appendingPathComponent(audioOnly ? "import.m4a" : "import.mp4")
         guard let exporter = AVAssetExportSession(asset:composition,presetName:audioOnly ? AVAssetExportPresetAppleM4A : AVAssetExportPresetPassthrough) else { throw YouTubeImportError(message:"Не удалось подготовить запись.") }
-        exporter.outputURL = output; exporter.outputFileType = audioOnly ? .m4a : .mp4
-        let ticker = Task { @MainActor in while !Task.isCancelled { progress(Double(exporter.progress)); try? await Task.sleep(nanoseconds:150_000_000) } }
+        let fileType: AVFileType = audioOnly ? .m4a : .mp4
+        let ticker = Task { @MainActor in
+            if #available(macOS 15.0, *) {
+                for await state in exporter.states(updateInterval:0.15) {
+                    if Task.isCancelled { return }
+                    if case .exporting(let value) = state { progress(value.fractionCompleted) }
+                }
+            } else {
+                while !Task.isCancelled { progress(Double(exporter.progress)); try? await Task.sleep(nanoseconds:150_000_000) }
+            }
+        }
         defer { ticker.cancel() }
-        await withTaskCancellationHandler(operation: { await exporter.export() },onCancel: { exporter.cancelExport() })
+        try await exporter.export(to:output,as:fileType)
         try Task.checkCancellation()
-        guard exporter.status == .completed else { throw exporter.error ?? YouTubeImportError(message:"Не удалось объединить дорожки.") }
         let asset = AVURLAsset(url:output)
         guard try await asset.load(.isPlayable) else { throw YouTubeImportError(message:"Полученная запись не поддерживается macOS.") }
         progress(1); return output

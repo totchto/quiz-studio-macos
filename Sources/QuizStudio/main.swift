@@ -224,10 +224,10 @@ struct MediaRange: Equatable {
                 p.audioOutputDeviceUniqueID = self.outputDevice
                 p.volume = min(1,max(0,initialVolume)); p.isMuted = false
                 self.player = p; self.nativePlayer = p
-                self.endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime,object: item,queue: .main) { [weak self] _ in
+                self.endObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification,object: item,queue: .main) { [weak self] _ in
                     Task { @MainActor in guard self?.generation == token else { return }; self?.finish() }
                 }
-                self.failureObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime,object: item,queue: .main) { [weak self] note in
+                self.failureObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.failedToPlayToEndTimeNotification,object: item,queue: .main) { [weak self] note in
                     let message = (note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)?.localizedDescription ?? "Не удалось воспроизвести запись."
                     Task { @MainActor in guard self?.generation == token else { return }; self?.finish(message) }
                 }
@@ -455,6 +455,7 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
     @Published var editorPreview: EditorPreviewMode?
     var isEditorPreview = false
     lazy var roundTemplates = RoundTemplateStore(url:draft.deletingLastPathComponent().appendingPathComponent("RoundTemplates.json"))
+    lazy var quizTemplates = QuizTemplateStore(url:draft.deletingLastPathComponent().appendingPathComponent("QuizTemplates.json"))
     lazy var questionBank = QuestionBank(root:draft.deletingLastPathComponent().appendingPathComponent("QuestionBank"))
     lazy var teamRoster = TeamRoster(url:draft.deletingLastPathComponent().appendingPathComponent("Teams.json"))
     var siqSource: URL?
@@ -875,9 +876,8 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
     }
     func acceptQuestionDrop(_ providers: [NSItemProvider],toRound: UUID,before: UUID? = nil) -> Bool {
         guard let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.text.identifier) }) else { return false }
-        provider.loadItem(forTypeIdentifier: UTType.text.identifier,options: nil) { [weak self] item,_ in
-            let text = (item as? String) ?? (item as? Data).flatMap { String(data: $0,encoding: .utf8) }
-            guard let text, let id = UUID(uuidString: text) else { return }
+        provider.loadObject(ofClass: NSString.self) { [weak self] item,_ in
+            guard let text = item as? String, let id = UUID(uuidString: text) else { return }
             Task { @MainActor in _ = self?.moveQuestion(id,toRound: toRound,before: before) }
         }
         return true
@@ -1430,7 +1430,7 @@ struct RoundDropTarget: View {
     @NSApplicationDelegateAdaptor(GameAppDelegate.self) var appDelegate
     @StateObject var studio = Studio()
     var body: some Scene {
-        WindowGroup("Квиз Студия · 0.17.0 — локальная проверка") { Content(studio: studio).onAppear { appDelegate.install(studio) }.frame(minWidth: 1050,minHeight: 720).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if url.pathExtension.lowercased() == "siq" { studio.chooseSIQ(url) } else if !studio.playing && studio.load(url) { studio.prepareGame() } } }
+        WindowGroup("Квиз Студия · 0.18.0 — тестовая сборка") { Content(studio: studio).onAppear { appDelegate.install(studio) }.frame(minWidth: 1050,minHeight: 720).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if url.pathExtension.lowercased() == "siq" { studio.chooseSIQ(url) } else if !studio.playing && studio.load(url) { studio.prepareGame() } } }
         .commands { CommandGroup(replacing: .newItem) { Button("Создать квиз") { studio.newQuiz() }.keyboardShortcut("n").disabled(studio.playing); Button("Открыть квиз…") { studio.open() }.keyboardShortcut("o").disabled(studio.playing); Button("Сохранить квиз…") { studio.save() }.keyboardShortcut("s") } }
     }
 }
@@ -1456,7 +1456,7 @@ struct QuestionBankView: View {
     }
     var body: some View {
         VStack(alignment:.leading,spacing:14) {
-            HStack { Text("Банк вопросов").font(.largeTitle.bold()); Spacer(); Button("Импорт…") { bulkImport = true }; Button("Собрать квиз") { assembly = true }; Button("Новая идея",systemImage:"plus") { creating = true }.buttonStyle(.borderedProminent); Button("Закрыть") { dismiss() } }
+            HStack { Text("Банк вопросов").font(.largeTitle.bold()); Spacer(); Menu("Импорт…",systemImage:"square.and.arrow.down") { Button("Вопросы из таблицы или текста…") { bulkImport = true }; Button("Пак «Своя игра» (.siq)…") { studio.chooseSIQ() } }; Button("Собрать квиз") { assembly = true }; Button("Новая идея",systemImage:"plus") { creating = true }.buttonStyle(.borderedProminent); Button("Закрыть") { dismiss() } }
             Text("Вопрос может входить в несколько категорий. Открытый вопрос — игроки вводят ответ сами. Незавершённые идеи сохраняются как черновики.").font(.callout).foregroundStyle(.secondary)
             HStack { TextField("Поиск по вопросу, ответу или источнику",text:$search); Toggle("Архив",isOn:$showArchived).toggleStyle(.switch) }
             Picker("Категория",selection:$category) { ForEach(["Все","Аудио / видео","4 варианта","Открытые вопросы","Сопоставление","Числовой ответ","Порядок событий","Несколько вариантов","Категоризация"],id:\.self) { Text($0) } }
@@ -1657,10 +1657,15 @@ struct Content: View {
 }
 struct Editor: View {
     @ObservedObject var studio: Studio
+    @State private var editorSection = "Вопрос"
+    @State private var showQuizTemplateSave = false
     var body: some View {
         NavigationSplitView {
             VStack(alignment: .leading,spacing: 16) {
-                Text("КВИЗ СТУДИЯ").font(.headline).foregroundStyle(.secondary).padding(.horizontal)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("СОДЕРЖАНИЕ КВИЗА").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(studio.quiz.title.isEmpty ? "Без названия" : studio.quiz.title).font(.headline).lineLimit(1)
+                }.padding(.horizontal, 12).padding(.top, 8)
                 ScrollView {
                     LazyVStack(alignment: .leading,spacing: 8,pinnedViews: [.sectionHeaders]) {
                     ForEach(Array(studio.quiz.rounds.enumerated()),id: \.element.id) { ri,r in
@@ -1669,13 +1674,18 @@ struct Editor: View {
                                 HStack(spacing:5) {
                                 Toggle("Выбрать вопрос \(qi+1)",isOn:Binding(get:{ studio.editorSelection.contains(q.id) },set:{ if $0 { studio.editorSelection.insert(q.id) } else { studio.editorSelection.remove(q.id) } })).labelsHidden().help("Выбрать для массового изменения")
                                 DraggableQuestionRow(studio: studio,roundID: r.id,question: q,number: qi+1,selected: studio.selectedQuestion?.id == q.id) {
-                                    studio.roundIndex = ri; studio.questionIndex = qi
+                                    studio.roundIndex = ri; studio.questionIndex = qi; editorSection = "Вопрос"
                                 }
                                 }
                             }
                             RoundDropTarget(studio: studio,roundID: r.id)
                         } header: {
-                            Button { studio.selectRound(r.id) } label: { Text(r.title + " · \(r.questions.count)") }.buttonStyle(.plain).help("Открыть настройки раунда")
+                            HStack {
+                                Button { studio.selectRound(r.id); editorSection = "Раунд" } label: {
+                                    HStack { Text(r.title).font(.subheadline.weight(.semibold)); Spacer(); Text("\(r.questions.count)").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }.padding(.vertical, 3)
+                                }.buttonStyle(.plain).help("Открыть настройки раунда")
+                                Menu { Button("Настроить раунд") { studio.selectRound(r.id); editorSection = "Раунд" }; if r.questions.isEmpty && studio.quiz.rounds.count > 1 { Button("Удалить пустой раунд", role: .destructive) { studio.deleteEmptyRound(r.id) } } } label: { Image(systemName: "ellipsis").foregroundStyle(.secondary) }.menuStyle(.borderlessButton)
+                            }
                         }
                     }
                     }.padding(.horizontal,8)
@@ -1685,37 +1695,71 @@ struct Editor: View {
             .navigationSplitViewColumnWidth(min: 220,ideal: 260)
         } detail: {
             VStack(spacing: 0) {
-                HStack {
-                    TextField("Название квиза",text: $studio.quiz.title).font(.title2.bold()).textFieldStyle(.plain)
-                    Button("Главная") { studio.leaveEditor() }; Button("Создать") { studio.newQuiz() }; Button("Открыть") { studio.open() }
-                    Button("Завершить и сохранить") { studio.save() }
-                    Button("Старт",systemImage: "play.fill") { studio.prepareGame() }.buttonStyle(.borderedProminent)
+                HStack(spacing: 14) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Редактирование квиза").font(.caption).foregroundStyle(.secondary)
+                        TextField("Название квиза",text: $studio.quiz.title).font(.title2.bold()).textFieldStyle(.plain)
+                    }
+                    Spacer()
+                    Menu("Инструменты", systemImage: "ellipsis.circle") {
+                        Button("Отменить изменение", systemImage: "arrow.uturn.backward") { studio.undoEdit() }.disabled(studio.undoHistory.isEmpty)
+                        Divider()
+                        Button("Импортировать вопросы…", systemImage: "tablecells") { studio.showBulkImport = true }
+                        Button("Собрать квиз из банка…", systemImage: "sparkles") { studio.showQuizAssembly = true }
+                        Button("Открыть банк вопросов…", systemImage: "tray.full") { studio.showQuestionBank = true }
+                        Button("Сохранить как шаблон квиза…",systemImage:"square.grid.3x3") { showQuizTemplateSave = true }
+                        Divider()
+                        Button("Печатные бланки…", systemImage: "doc.text") { studio.printSheets() }
+                        Button("Сохранить копию…", systemImage: "doc.on.doc") { studio.saveCopy() }
+                    }
+                    Button("На главную",systemImage:"house") { studio.leaveEditor() }
+                    Button("Сохранить") { studio.save() }
+                    Button("Начать игру",systemImage: "play.fill") { studio.prepareGame() }.buttonStyle(.borderedProminent)
                 }.padding(22)
-                HStack { Button("Отменить изменение") { studio.undoEdit() }.disabled(studio.undoHistory.isEmpty); Button("Импорт вопросов…") { studio.showBulkImport = true }; Button("Собрать из банка…") { studio.showQuizAssembly = true }; Button("Бланки…") { studio.printSheets() }; Button("Сохранить копию…") { studio.saveCopy() }; Spacer() }.padding(.horizontal,22).padding(.bottom,10)
-                HStack {
-                    Button("Выбрать вопросы раунда") { studio.editorSelection = Set(studio.quiz.rounds[studio.roundIndex].questions.map(\.id)) }
-                    Button("Снять выбор") { studio.editorSelection = [] }
-                    Button("Массовые настройки (\(studio.editorSelection.intersection(Set(studio.quiz.rounds.flatMap(\.questions).map(\.id))).count))") { studio.showBulkEdit = true }.disabled(studio.editorSelection.intersection(Set(studio.quiz.rounds.flatMap(\.questions).map(\.id))).isEmpty)
+                HStack(spacing: 10) {
+                    Text("Раунд \(studio.roundIndex + 1) · выбрано \(studio.editorSelection.count)").font(.subheadline).foregroundStyle(.secondary)
+                    Spacer()
+                    if !studio.editorSelection.isEmpty {
+                        Button("Выбрать раунд") { studio.editorSelection = Set(studio.quiz.rounds[studio.roundIndex].questions.map(\.id)) }
+                        Button("Снять выбор") { studio.editorSelection = [] }
+                        Button("Массовые настройки…") { studio.showBulkEdit = true }.disabled(studio.editorSelection.intersection(Set(studio.quiz.rounds.flatMap(\.questions).map(\.id))).isEmpty)
+                    }
                 }.padding(.horizontal,22).padding(.bottom,10)
                 Divider()
-                ScrollView { VStack(alignment: .leading,spacing: 24) {
-                    AppearanceEditor(studio: studio)
-                    RoundSettings(studio: studio, round: studio.roundBinding(studio.quiz.rounds[studio.roundIndex].id))
-                    if let selected = studio.selectedQuestion {
-                        QuestionEditor(studio: studio,question: studio.questionBinding(selected.id)).id(selected.id)
-                    } else { Text("В этом раунде пока нет вопросов. Добавьте вопрос или перетащите его из другого раунда.").foregroundStyle(.secondary).padding() }
+                VStack(spacing: 0) {
                     HStack {
-                        Button("Из банка вопросов",systemImage:"tray.full") { studio.showQuestionBank = true }
-                        Button("Сохранить вопрос в банк") { studio.saveSelectedToBank() }.disabled(studio.selectedQuestion == nil)
-                        Button("Добавить вопрос",systemImage: "plus") { studio.addQuestion() }.buttonStyle(.borderedProminent)
-                        if studio.selectedQuestion != nil {
-                            Button("Удалить вопрос",role: .destructive) { studio.deleteSelectedQuestion() }
-                        }
+                        Picker("Раздел редактора", selection: $editorSection) {
+                            Text("Вопрос").tag("Вопрос")
+                            Text("Раунд").tag("Раунд")
+                            Text("Оформление").tag("Оформление")
+                        }.pickerStyle(.segmented).frame(maxWidth: 420)
+                        Spacer()
+                    }.padding(.horizontal, 22).padding(.vertical, 12)
+                    Divider()
+                    ScrollView { VStack(alignment: .leading,spacing: 24) {
+                    if editorSection == "Оформление" {
+                        AppearanceEditor(studio: studio, expanded: true)
+                    } else if editorSection == "Раунд" {
+                        RoundSettings(studio: studio, round: studio.roundBinding(studio.quiz.rounds[studio.roundIndex].id))
+                    } else if let selected = studio.selectedQuestion {
+                        QuestionEditor(studio: studio,question: studio.questionBinding(selected.id)).id(selected.id)
+                    } else {
+                        ContentUnavailableView("В этом раунде пока нет вопросов",systemImage: "text.badge.plus",description: Text("Добавьте вопрос или возьмите его из банка.")).frame(maxWidth: .infinity, minHeight: 220)
                     }
-                }.padding(24) }
+                    HStack {
+                        Button("Добавить из банка…",systemImage:"tray.full") { studio.showQuestionBank = true }
+                        Button("Добавить вопрос",systemImage: "plus") { studio.addQuestion() }.buttonStyle(.borderedProminent)
+                        Spacer()
+                        Menu {
+                            Button("Сохранить вопрос в банк") { studio.saveSelectedToBank() }.disabled(studio.selectedQuestion == nil)
+                            Button("Удалить вопрос",role: .destructive) { studio.deleteSelectedQuestion() }.disabled(studio.selectedQuestion == nil)
+                        } label: { Label("Ещё",systemImage:"ellipsis") }.contentShape(Rectangle()).help("Дополнительные действия")
+                    }
+                    }.padding(24) }
+                }
                 Text(studio.status).font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity,alignment: .leading).padding(10)
             }
-        }
+        }.sheet(isPresented:$showQuizTemplateSave) { QuizTemplateSaveView(store:studio.quizTemplates,quiz:studio.quiz,introductionSeconds:studio.introductionSeconds,phoneMode:studio.phoneMode,readBeforeTimer:studio.readBeforeTimer,automaticAdvance:studio.automaticAdvance,signalsEnabled:studio.signalsEnabled) }
     }
 }
 struct RoundSettings: View {
@@ -1723,33 +1767,39 @@ struct RoundSettings: View {
     @Binding var round: Round
     @State var editingIntro = false
     @State private var showTemplates = false
+    @State private var showFlowSettings = false
+    @State private var showDisplaySettings = false
     var body: some View {
         GroupBox {
             VStack(alignment: .leading,spacing: 12) {
                 HStack { TextField("Название раунда",text: $round.title).font(.title3.bold()); Button("Шаблоны…") { showTemplates = true }; Button("Посмотреть раунд") { studio.editorPreview = .round } }
-                DisclosureGroup("Заметки ведущего о раунде") { TextEditor(text: Binding(get: { round.hostNotes ?? "" },set: { round.hostNotes = $0 })).frame(height: 90); Text("На экран участников не выводятся.").font(.caption).foregroundStyle(.secondary) }
-                DisclosureGroup("Настройки новых вопросов и сохранения шаблона") {
+                DisclosureGroup("Заметки ведущего") { TextEditor(text: Binding(get: { round.hostNotes ?? "" },set: { round.hostNotes = $0 })).frame(height: 90); Text("На экран участников не выводятся.").font(.caption).foregroundStyle(.secondary) }
+                DisclosureGroup("Таймеры новых вопросов и шаблон") {
                     Stepper("Вопрос: \(round.defaultSeconds) сек (0 — без отсчёта)",value:$round.defaultSeconds,in:0...3600,step:5)
                     Stepper("Ответ: \(round.defaultAnswerSeconds ?? 20) сек",value:Binding(get:{ round.defaultAnswerSeconds ?? 20 },set:{ round.defaultAnswerSeconds = $0 }),in:1...600)
                     Toggle("Таймер после медиа",isOn:$round.defaultAfterMedia)
                     Toggle("Медиа без видео",isOn:Binding(get:{ round.defaultAudioOnly ?? false },set:{ round.defaultAudioOnly = $0 }))
                     Text("Существующие вопросы меняются через шаблон или массовые настройки.").font(.caption).foregroundStyle(.secondary)
                 }
-                Toggle("Дополнительный раунд при ничьей",isOn: Binding(get: { round.tieBreaker ?? false },set: { round.tieBreaker = $0 }))
-                if round.tieBreaker == true { Text("Пропускается в обычной игре. Ведущий запускает его через «Перейти…», в том числе с финального экрана.").font(.caption).foregroundStyle(.secondary) }
-                if round.questions.isEmpty && studio.quiz.rounds.count > 1 { Button("Удалить пустой раунд",role: .destructive) { studio.deleteEmptyRound(round.id) } }
-                HStack { Toggle("Повтор вопросов",isOn: $round.repeatQuestions); if round.repeatQuestions { Stepper("По \(round.repeatSeconds) сек",value: $round.repeatSeconds,in: 1...300) } }
-                if round.repeatQuestions { Stepper("Экран перед повтором: \(round.repeatIntroSeconds ?? 5) сек",value: Binding(get: { round.repeatIntroSeconds ?? 5 },set: { round.repeatIntroSeconds = $0 }),in: 2...30) }
-                Stepper("Сдача бланков: \(round.breakSeconds == 0 ? "до команды ведущего" : "\(round.breakSeconds) сек")",value: $round.breakSeconds,in: 0...600,step: 5)
-                Toggle("Показать ответы после раунда",isOn: $round.showAnswers)
-                Toggle("Промежуточные итоги после раунда",isOn: $round.standings)
-                Toggle("Отключить фоновую музыку в этом раунде",isOn: Binding(get: { round.muteBackground ?? false },set: { round.muteBackground = $0 }))
-                PresentationBlocksEditor(studio:studio,round:$round)
-                HStack {
-                    Button(round.intro == nil ? "Добавить объяснение раунда" : "Редактировать объяснение раунда",systemImage: "info.bubble") {
-                        if round.intro == nil { round.intro = RoundIntro() }; editingIntro = true
+                DisclosureGroup("Показ и переходы", isExpanded: $showDisplaySettings) {
+                    Toggle("Показать ответы после раунда",isOn: $round.showAnswers)
+                    Toggle("Промежуточные итоги после раунда",isOn: $round.standings)
+                    Toggle("Отключить фоновую музыку в этом раунде",isOn: Binding(get: { round.muteBackground ?? false },set: { round.muteBackground = $0 }))
+                    PresentationBlocksEditor(studio:studio,round:$round)
+                    HStack {
+                        Button(round.intro == nil ? "Добавить вступление раунда" : "Редактировать вступление",systemImage: "info.bubble") {
+                            if round.intro == nil { round.intro = RoundIntro() }; editingIntro = true
+                        }
+                        if round.intro != nil { Button("Убрать вступление",role: .destructive) { round.intro = nil } }
                     }
-                    if round.intro != nil { Button("Убрать объяснение",role: .destructive) { round.intro = nil } }
+                }
+                DisclosureGroup("Правила раунда", isExpanded: $showFlowSettings) {
+                    Toggle("Дополнительный раунд при ничьей",isOn: Binding(get: { round.tieBreaker ?? false },set: { round.tieBreaker = $0 }))
+                    if round.tieBreaker == true { Text("Ведущий запускает этот раунд вручную через меню перехода.").font(.caption).foregroundStyle(.secondary) }
+                    HStack { Toggle("Повтор вопросов",isOn: $round.repeatQuestions); if round.repeatQuestions { Stepper("Каждые \(round.repeatSeconds) сек",value: $round.repeatSeconds,in: 1...300) } }
+                    if round.repeatQuestions { Stepper("Заставка перед повтором: \(round.repeatIntroSeconds ?? 5) сек",value: Binding(get: { round.repeatIntroSeconds ?? 5 },set: { round.repeatIntroSeconds = $0 }),in: 2...30) }
+                    Stepper("Сдача бланков: \(round.breakSeconds == 0 ? "вручную" : "\(round.breakSeconds) сек")",value: $round.breakSeconds,in: 0...600,step: 5)
+                    if round.questions.isEmpty && studio.quiz.rounds.count > 1 { Button("Удалить пустой раунд",role: .destructive) { studio.deleteEmptyRound(round.id) } }
                 }
             }.padding(8)
         } label: { Label("Настройки раунда",systemImage: "rectangle.stack") }
@@ -1775,7 +1825,7 @@ struct QuestionEditor: View {
             if let notes = studio.quiz.importNotes {
                 DisclosureGroup("Отчёт импорта .siq") { ScrollView { Text(notes).font(.caption).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading) }.frame(height:180) }
             }
-            HStack { Text("Вопрос \(studio.questionIndex+1)").font(.title.bold()); Spacer(); Picker("Тип",selection: $question.kind) { ForEach(Question.kinds,id: \.self) { Text($0) } }.frame(width: 300) }
+            HStack { VStack(alignment: .leading, spacing: 3) { Text("Вопрос \(studio.questionIndex+1)").font(.title.bold()); Text("Раунд \(studio.roundIndex+1) · \(studio.quiz.rounds[studio.roundIndex].title)").font(.caption).foregroundStyle(.secondary) }; Spacer(); Picker("Тип ответа",selection: $question.kind) { ForEach(Question.kinds,id: \.self) { Text($0) } }.frame(width: 260) }
             QuestionMetadataEditor(question:$question)
             HStack { Button("Посмотреть вопрос",systemImage:"play.rectangle") { preview.stop(); explanationPreview.stop(); studio.editorPreview = .question }; Button("Посмотреть ответ") { preview.stop(); explanationPreview.stop(); studio.editorPreview = .answer } }
             TextEditor(text: $question.text).font(.title3).frame(height: 100).padding(8).background(.background,in: RoundedRectangle(cornerRadius: 10)).overlay(RoundedRectangle(cornerRadius: 10).stroke(.quaternary))
@@ -1911,22 +1961,52 @@ struct PlayerView: View {
             } else { Stage(studio: studio,audience: false) }
             if studio.audienceScreenReady { HostNotes(studio: studio) }
         }
+        .overlay(alignment: .top) {
+            if let step = studio.step, step.kind != .finish {
+                HStack(spacing: 12) {
+                    Label(studio.stepTitle(studio.index),systemImage:"sparkles.tv")
+                        .font(.subheadline.weight(.semibold)).lineLimit(1)
+                    Spacer(minLength: 12)
+                    if step.showsTimer {
+                        Text(studio.awaitingQuestionStart ? "Ожидает запуска" : studio.paused ? "Пауза" : (studio.waitingForMedia ? "Воспроизведение" : "Эфир"))
+                            .font(.caption.weight(.medium)).foregroundStyle(studio.paused ? .orange : .secondary)
+                        Text(studio.awaitingQuestionStart ? "—:—" : "\(studio.remaining / 60):\(String(format: "%02d",studio.remaining % 60))")
+                            .font(.system(.title3,design:.monospaced).weight(.bold))
+                            .foregroundStyle(studio.remaining <= 10 && !studio.paused && !studio.awaitingQuestionStart ? .orange : .primary)
+                    }
+                    if studio.phoneMode {
+                        Label("\(studio.phoneRoom.joinedTeams.count) команд",systemImage:"iphone")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal,18).padding(.vertical,10)
+                .background(.regularMaterial,in:Capsule())
+                .padding(.top,14).padding(.horizontal,24)
+            }
+        }
         .overlay(alignment: .bottom) {
             if studio.step?.kind == .finish {
-                HStack { Button("Вернуться в меню") { studio.returnToMenu() }; Button("Результаты и статистика") { studio.persistArchive(); studio.showGameArchive = true }; if studio.phoneMode { Button("Проверить ответы") { studio.showPhoneReview = true } }; Button("Дополнительный вопрос / этап…") { studio.showJump = true } }.buttonStyle(.borderedProminent).controlSize(.large).padding(28)
+                HStack(spacing: 12) {
+                    Button("Завершить игру") { studio.returnToMenu() }
+                    Button("Архив и статистика") { studio.persistArchive(); studio.showGameArchive = true }.buttonStyle(.borderedProminent)
+                    if studio.phoneMode { Button("Проверить ответы") { studio.showPhoneReview = true } }
+                    Button("Перейти к этапу…") { studio.showJump = true }
+                }.controlSize(.large).padding(28)
             } else if controls || studio.paused || studio.awaitingQuestionStart {
-                HStack(spacing: 18) {
-                    Button("Выход") { studio.confirmExit() }
-                    Button("Перейти…") { studio.showJump = true }
-                    if studio.phoneMode { Button("Ответы команд") { studio.showPhoneReview = true }.disabled(!studio.audienceScreenReady && !studio.showScoreInputLocally) }
+                HStack(spacing: 10) {
                     Button("Назад") { studio.back() }
-                    Button(studio.awaitingQuestionStart ? "Запустить таймер" : (studio.paused ? "Продолжить" : "Пауза")) { studio.togglePause() }
-                    Button("Вперёд") { studio.next() }
+                    Button(studio.awaitingQuestionStart ? "Запустить таймер" : (studio.paused ? "Продолжить" : "Пауза")) { studio.togglePause() }.buttonStyle(.borderedProminent)
+                    Button("Вперёд") { studio.next() }.buttonStyle(.borderedProminent)
+                    if studio.phoneMode { Button("Ответы \(studio.phoneRoom.pending(through: studio.roundIndex).count)") { studio.showPhoneReview = true }.disabled(!studio.audienceScreenReady && !studio.showScoreInputLocally) }
                     BackgroundMusicControls(music: studio.background)
-                    if studio.step?.kind == .standings && studio.publishedScores && !studio.scoresFullyRevealed { Button("Показать все места") { studio.revealAllScores() } }
-                    Button("Заново") { studio.enter() }
-                    Button("Экран ТВ") { studio.showTV() }
-                    Button("На весь экран") { NSApp.keyWindow?.toggleFullScreen(nil) }
+                    Button("Завершить квиз…",role:.destructive) { studio.confirmExit() }
+                    Menu {
+                        Button("Перейти к этапу…") { studio.showJump = true }
+                        Button("Заново начать этап") { studio.enter() }
+                        Button("Экран ТВ") { studio.showTV() }
+                        Button("На весь экран") { NSApp.keyWindow?.toggleFullScreen(nil) }
+                        if studio.step?.kind == .standings && studio.publishedScores && !studio.scoresFullyRevealed { Button("Показать все места") { studio.revealAllScores() } }
+                    } label: { Image(systemName:"ellipsis").frame(width: 28,height: 28).contentShape(Rectangle()) }.help("Ещё")
                 }.buttonStyle(.bordered).padding().background(.regularMaterial,in: Capsule()).padding(20)
             }
         }.sheet(isPresented: $studio.showJump) { JumpMenu(studio: studio) }
@@ -2094,24 +2174,22 @@ struct Welcome: View {
             Image(systemName: "sparkles.tv").font(.system(size: 72)).foregroundStyle(.indigo)
             Text("Квиз Студия").font(.system(size: 46,weight: .bold))
             Text("Создайте игру или проведите готовый квиз").font(.title3).foregroundStyle(.secondary)
-            HStack(spacing: 24) {
-                Button { studio.showLibrary(editing: true) } label: { entry("Создать квиз","Новый квиз или редактирование готового","square.and.pencil") }
-                Button { studio.showLibrary(editing: false) } label: { entry("Запустить квиз","Выбрать игру и представить команды","play.rectangle") }
-            }.buttonStyle(.plain)
+            LazyVGrid(columns: [GridItem(.flexible(),spacing: 20),GridItem(.flexible(),spacing: 20)],spacing: 20) {
+                Button { studio.newQuiz() } label: { entry("Создать квиз","Соберите игру и настройте вопросы","square.and.pencil") }
+                Button { studio.showLibrary(editing: false) } label: { entry("Провести игру","Выберите квиз и подготовьте команды","play.rectangle") }
+                Button { studio.showQuestionBank = true } label: { entry("Банк вопросов","Ищите, импортируйте и собирайте вопросы","tray.full") }
+                Button { studio.showGameArchive = true } label: { entry("Архив игр","Результаты и статистика проведённых игр","chart.bar.doc.horizontal") }
+            }.buttonStyle(.plain).frame(maxWidth: 740)
             if studio.recoveryAvailable { Button("Восстановить незавершённую игру") { studio.restoreGame() }.buttonStyle(.borderedProminent) }
-            HStack { Button("Импорт вопросов из таблицы / текста",systemImage:"tablecells") { studio.showBulkImport = true }; Button("Собрать квиз из банка",systemImage:"sparkles") { studio.showQuizAssembly = true } }
-            Button("Архив игр и статистика",systemImage:"chart.bar.doc.horizontal") { studio.showGameArchive = true }
-            Button("Банк вопросов",systemImage:"tray.full") { studio.showQuestionBank = true }
-            Button("Импортировать пак «Своя игра» (.siq)…",systemImage:"square.and.arrow.down") { studio.chooseSIQ() }
-            Button("Продолжить редактирование черновика") { studio.screen = .editor }
+            Button("Продолжить редактирование черновика",systemImage:"pencil") { studio.screen = .editor }.buttonStyle(.link)
             Text(studio.status).foregroundStyle(.secondary)
         }.padding(40).frame(maxWidth: .infinity,maxHeight: .infinity).background(Color.indigo.opacity(0.04))
     }
     func entry(_ title: String,_ subtitle: String,_ icon: String) -> some View {
-        VStack(alignment: .leading,spacing: 18) {
+        VStack(alignment: .leading,spacing: 14) {
             Image(systemName: icon).font(.largeTitle).foregroundStyle(.indigo)
-            Text(title).font(.title2.bold()); Text(subtitle).foregroundStyle(.secondary)
-        }.padding(30).frame(width: 340,height: 170,alignment: .leading).background(.background,in: RoundedRectangle(cornerRadius: 22)).overlay(RoundedRectangle(cornerRadius: 22).stroke(.quaternary))
+            Text(title).font(.title2.bold()); Text(subtitle).foregroundStyle(.secondary).font(.callout)
+        }.padding(26).frame(maxWidth: .infinity,minHeight: 150,alignment: .leading).background(.background,in: RoundedRectangle(cornerRadius: 22)).overlay(RoundedRectangle(cornerRadius: 22).stroke(.quaternary))
     }
 }
 struct QuizLibrary: View {
@@ -2119,6 +2197,7 @@ struct QuizLibrary: View {
     var editing = false
     @State var search = ""
     @State private var newestFirst = true
+    @State private var showQuizTemplates = false
     var visibleQuizzes: [URL] {
         studio.recentQuizzes.filter { search.isEmpty || $0.deletingPathExtension().lastPathComponent.localizedCaseInsensitiveContains(search) }.sorted { a,b in
             if newestFirst {
@@ -2134,7 +2213,7 @@ struct QuizLibrary: View {
             HStack {
                 Button("Главная") { studio.screen = .home }
                 Spacer()
-                Button("Импорт .siq…") { studio.chooseSIQ() }
+                if editing { Button("Из шаблона…") { showQuizTemplates = true } }
                 Button("Открыть квиз на Mac…") { studio.open(forPlay: !editing) }
                 if editing { Button("Создать с нуля",systemImage: "plus") { studio.newQuiz() }.buttonStyle(.borderedProminent) }
             }
@@ -2166,34 +2245,49 @@ struct QuizLibrary: View {
             Text(studio.status).foregroundStyle(.secondary)
             Text("Удаление из списка не удаляет файл. Чтобы вернуть квиз, откройте его на Mac заново.").font(.caption).foregroundStyle(.secondary)
         }.padding(36)
+        .sheet(isPresented:$showQuizTemplates) { QuizTemplatePicker(studio:studio) }
     }
 }
 struct TeamSetup: View {
     @ObservedObject var studio: Studio
     @State private var musicSettings = false
     @State private var deviceSettings = false
+    @State private var showGameOptions = false
+    @State private var preflightComplete = false
+    @State private var preflightPassed = false
+    var validTeamCount: Int { studio.quiz.teams.filter { !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count }
     var body: some View {
         ScrollView { VStack(alignment: .leading,spacing: 20) {
             HStack { Button("Назад") { studio.screen = .library }; Spacer(); Button("Открыть редактор") { studio.screen = .editor } }
-            Text("Команды на игру").font(.largeTitle.bold())
-            Text(studio.quiz.title).font(.title2).foregroundStyle(.secondary)
-            Picker("Формат игры",selection: $studio.phoneMode) { Text("ТВ и бумажные бланки").tag(false); Text("ТВ и ответы с телефонов").tag(true) }.pickerStyle(.segmented)
+            VStack(alignment: .leading,spacing: 5) {
+                Text("Подготовка к игре").font(.largeTitle.bold())
+                Text(studio.quiz.title).font(.title2).foregroundStyle(.secondary)
+            }
+            GroupBox {
+                VStack(alignment: .leading,spacing: 10) {
+                    Text("Как команды будут отвечать?").font(.headline)
+                    Picker("Формат игры",selection: $studio.phoneMode) { Text("Бумажные бланки").tag(false); Text("Телефоны").tag(true) }.pickerStyle(.segmented)
+                    Text(studio.phoneMode ? "Команды подключатся по QR-коду и отправят ответы со своих телефонов." : "Добавьте команды и внесите их баллы после каждого раунда.").font(.caption).foregroundStyle(.secondary)
+                }
+            }
             if studio.phoneMode { PhoneLobby(studio: studio,room: studio.phoneRoom) }
-            Text(studio.phoneMode ? "Команды вводят названия на телефонах. Перед первым раундом каждая появится на ТВ; баллы считаются по ответам." : "Введите команды один раз. Перед первым раундом каждая появится на экране, а в итогах останется только заполнить баллы.")
-            List {
+            if !studio.phoneMode {
+            GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+            HStack { Text("Команды").font(.headline); Spacer(); Button("Добавить",systemImage:"plus") { studio.quiz.teams.append(Team(name: "")) } }
+            if studio.quiz.teams.isEmpty { ContentUnavailableView("Команды ещё не добавлены",systemImage:"person.3",description:Text("Добавьте названия команд, чтобы начать игру.")).frame(minHeight:100) }
+            else { List {
                 ForEach($studio.quiz.teams) { $team in
                     HStack {
                         Image(systemName: "person.3.fill").foregroundStyle(.indigo)
                         TextField("Название команды",text: $team.name).textFieldStyle(.roundedBorder)
                         if team.total != 0 { Text(scoreText(team.total) + " баллов").foregroundStyle(.secondary) }
-                        Button("Удалить",role: .destructive) { studio.quiz.teams.removeAll { $0.id == team.id } }
+                        Button(role: .destructive) { studio.quiz.teams.removeAll { $0.id == team.id } } label: { Image(systemName:"trash") }.buttonStyle(.borderless).help("Удалить команду")
                     }.padding(6)
                 }
             }
-            .frame(height: studio.phoneMode ? 0 : 180).clipped().disabled(studio.phoneMode)
-            if !studio.phoneMode { Button("Добавить команду",systemImage: "plus") { studio.quiz.teams.append(Team(name: "")) } }
-            if !studio.phoneMode {
-                DisclosureGroup("Постоянные команды") {
+            .frame(minHeight:130,maxHeight:220) }
+            DisclosureGroup("Сохранённые команды") {
                     HStack { Button("Сохранить команды из этой игры") { studio.teamRoster.add(studio.quiz.teams.map(\.name)) }; Text("Хранятся на этом Mac и доступны в других квизах.").font(.caption).foregroundStyle(.secondary) }
                     LazyVGrid(columns:[GridItem(.adaptive(minimum:180))],spacing:8) {
                         ForEach(studio.teamRoster.teams,id:\.self) { name in
@@ -2203,28 +2297,52 @@ struct TeamSetup: View {
                     }
                 }
             }
-            Stepper("Представление каждой команды: \(studio.introductionSeconds) сек",value: $studio.introductionSeconds,in: 3...30)
-            VStack(alignment: .leading,spacing: 10) {
-                Text("Проведение квиза").font(.headline)
-                Picker("Переключение экранов",selection: $studio.automaticAdvance) {
-                    Text("Автоматически").tag(true)
-                    Text("Вручную ведущим").tag(false)
-                }.pickerStyle(.segmented)
-                Text(studio.automaticAdvance ? "После окончания времени квиз продолжится сам. Итоги и экраны без времени переключает ведущий." : "После окончания времени экран останется до нажатия «Вперёд» или стрелки вправо.")
-                    .font(.caption).foregroundStyle(.secondary)
-                Toggle("Запускать время вопроса после чтения ведущим",isOn: $studio.readBeforeTimer)
-                Text("Вопрос появится без отсчёта. После чтения нажмите «Запустить таймер» или пробел. Для аудио/видео эта кнопка запускает запись; отсчёт идёт во время фрагмента или после него по настройке вопроса.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
-            HStack { Button("Проверить квиз") { studio.showPreflight = true; Task { await studio.validateQuiz() } }; Button("Экран и звук…") { deviceSettings = true }; Button("Печатные бланки…") { studio.printSheets() } }
-            BackgroundMusicSetup(music: studio.background,showSettings: $musicSettings)
-            Toggle("Начать новую игру — обнулить прошлые баллы",isOn: $studio.resetScores)
-            Text("Снимите галочку, чтобы сохранить уже введённые результаты. Названия команд сохраняются в обоих случаях.").font(.caption).foregroundStyle(.secondary)
-            HStack { Text(studio.status).foregroundStyle(.secondary); Spacer(); Button("Начать игру",systemImage: "play.fill") { studio.beginCheckedGame() }.buttonStyle(.borderedProminent).disabled(studio.quiz.teams.isEmpty || studio.checkingQuiz || (studio.phoneMode && (!studio.phoneRoom.running || studio.phoneRoom.joinedTeams.isEmpty))) }
+            }
+            GroupBox("Сценарий ведущего") {
+                VStack(alignment: .leading,spacing: 12) {
+                    Picker("Переключение экранов",selection: $studio.automaticAdvance) { Text("Автоматически").tag(true); Text("Вручную").tag(false) }.pickerStyle(.segmented)
+                    Text(studio.automaticAdvance ? "По таймеру игра переходит дальше сама. Итоги и экраны без таймера переключает ведущий." : "После таймера экран ждёт команды ведущего.").font(.caption).foregroundStyle(.secondary)
+                    Toggle("Сначала прочитать вопрос, потом запустить таймер",isOn: $studio.readBeforeTimer)
+                    if !studio.phoneMode { Stepper("Представление команды: \(studio.introductionSeconds) сек",value: $studio.introductionSeconds,in: 3...30) }
+                }
+            }
+            DisclosureGroup("Дополнительные настройки",isExpanded:$showGameOptions) {
+                BackgroundMusicSetup(music: studio.background,showSettings: $musicSettings)
+                Toggle("Обнулить прошлые баллы перед игрой",isOn: $studio.resetScores)
+                Text("Если выключено, сохранённые баллы команд останутся.").font(.caption).foregroundStyle(.secondary)
+                HStack { Button("Проверить квиз") { studio.showPreflight = true; Task { await studio.validateQuiz() } }; Button("Экран и звук…") { deviceSettings = true }; if !studio.phoneMode { Button("Печатные бланки…") { studio.printSheets() } } }
+            }
+            GroupBox {
+                VStack(alignment: .leading,spacing: 10) {
+                    Text("Готовность к игре").font(.headline)
+                    readinessRow("Формат",detail:studio.phoneMode ? "Ответы с телефонов" : "Бумажные бланки",ready:true)
+                    readinessRow("Команды",detail:studio.phoneMode ? (studio.phoneRoom.running ? "Подключено: \(studio.phoneRoom.joinedTeams.count)" : "Комната не запущена") : "Добавлено: \(validTeamCount)",ready:studio.phoneMode ? (studio.phoneRoom.running && !studio.phoneRoom.joinedTeams.isEmpty) : validTeamCount > 0)
+                    readinessRow("Квиз",detail:preflightComplete ? (preflightPassed ? "Проверка пройдена" : "Найдены замечания") : "Будет проверен перед запуском",ready:preflightComplete && preflightPassed)
+                    if studio.checkingQuiz { ProgressView("Проверяем квиз…") }
+                    else if !studio.status.isEmpty { Text(studio.status).font(.caption).foregroundStyle(.secondary) }
+                    HStack { Spacer(); Button("Проверить и начать игру",systemImage: "play.fill") { studio.beginCheckedGame() }.buttonStyle(.borderedProminent).disabled((!studio.phoneMode && studio.quiz.teams.isEmpty) || studio.checkingQuiz || (studio.phoneMode && (!studio.phoneRoom.running || studio.phoneRoom.joinedTeams.isEmpty))) }
+                }
+            }
         }.padding(36) }
         .onChange(of: studio.phoneMode) { _,enabled in if !enabled { studio.phoneRoom.stop(); studio.tv?.close(); studio.tv = nil } }
         .sheet(isPresented: $deviceSettings) { DeviceSettings(studio: studio) }
         .sheet(isPresented: $studio.showPreflight) { PreflightReport(studio: studio) }
+        .task { await refreshPreflight() }
+        .onChange(of: studio.quiz) { _,_ in preflightComplete = false }
+    }
+    func readinessRow(_ title: String,detail: String,ready: Bool) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: ready ? "checkmark.circle.fill" : "circle.dashed").foregroundStyle(ready ? .green : .secondary)
+            Text(title).fontWeight(.medium)
+            Spacer()
+            Text(detail).foregroundStyle(.secondary)
+        }.font(.subheadline)
+    }
+    @MainActor func refreshPreflight() async {
+        await studio.validateQuiz()
+        preflightComplete = true
+        preflightPassed = studio.preflightIssues.isEmpty
     }
 }
 
@@ -2300,7 +2418,8 @@ struct BackgroundMusicControls: View {
             Divider()
             Button("Тише") { music.volume = max(0,music.volume-0.05) }
             Button("Громче") { music.volume = min(1,music.volume+0.05) }
-        } label: { Label("Музыка",systemImage: !music.enabled || music.muted ? "speaker.slash" : "music.note") }
+        } label: { Label("Музыка",systemImage: !music.enabled || music.muted ? "speaker.slash" : "music.note").contentShape(Rectangle()) }
+            .help("Управление фоновой музыкой")
     }
 }
 

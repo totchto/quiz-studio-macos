@@ -1,6 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import CryptoKit
+import PDFKit
 
 struct ImportedQuestionRow: Identifiable {
     var id = UUID()
@@ -34,6 +35,10 @@ enum QuestionTextImport {
         return rows
     }
     static func normalized(_ text: String) -> String { text.trimmingCharacters(in:.whitespacesAndNewlines).replacingOccurrences(of:"\u{FEFF}",with:"").lowercased().replacingOccurrences(of:" ",with:"").replacingOccurrences(of:"_",with:"") }
+    static func labeledField(_ text:String) -> String {
+        if normalized(text).range(of:"^вопрос(?:№)?[0-9]+$",options:.regularExpression) != nil { return "question" }
+        return field(text)
+    }
     static func field(_ header: String) -> String {
         let h = normalized(header)
         let aliases: [String:[String]] = ["question":["вопрос","question","q"],"answer":["ответ","answer","правильныйответ"],"explanation":["объяснение","пояснение","explanation"],"type":["тип","type","kind"],"correct":["правильныеварианты","верныеварианты","correct","correctchoices"],"tolerance":["погрешность","tolerance"],"events":["события","порядок","events","sequence"],"pairs":["пары","соответствия","pairs"],"tags":["темы","теги","tags","тематика"],"difficulty":["сложность","difficulty"],"seconds":["время","секунды","seconds"]]
@@ -44,10 +49,10 @@ enum QuestionTextImport {
     static func parse(_ text: String) throws -> QuestionImportResult {
         guard text.utf8.count <= 8*1024*1024 else { throw SIQError(message:"Текст больше 8 МБ.") }
         let text = text.replacingOccurrences(of:"\u{FEFF}",with:"").replacingOccurrences(of:"\r\n",with:"\n")
-        if text.split(separator:"\n").contains(where:{ $0.trimmingCharacters(in:.whitespaces).lowercased().hasPrefix("вопрос:") || $0.trimmingCharacters(in:.whitespaces).lowercased().hasPrefix("question:") }) {
+        if text.split(separator:"\n").contains(where:{ $0.range(of:"^\\s*(?:вопрос(?:\\s*№?\\s*\\d+)?|question(?:\\s*#?\\s*\\d+)?)\\s*:",options:[.regularExpression,.caseInsensitive]) != nil }) {
             var rows: [[String]] = []; var current = ["","",""]; var active = 0; var has = false
             for line in text.components(separatedBy:"\n") {
-                let parts = line.split(separator:":",maxSplits:1).map(String.init); let key = field(parts.first ?? "")
+                let parts = line.split(separator:":",maxSplits:1).map(String.init); let key = labeledField(parts.first ?? "")
                 if parts.count == 2 && ["question","answer","explanation"].contains(key) {
                     if key == "question" && has { rows.append(current); current = ["","",""] }
                     active = key == "question" ? 0 : key == "answer" ? 1 : 2; current[active] = parts[1].trimmingCharacters(in:.whitespaces); has = true
@@ -119,10 +124,64 @@ enum QuestionTextImport {
         let size = try url.resourceValues(forKeys:[.fileSizeKey]).fileSize ?? 0
         guard size <= 16*1024*1024 else { throw SIQError(message:"Файл больше 16 МБ.") }
         if url.pathExtension.lowercased() == "xlsx" { return try xlsx(url) }
+        if url.pathExtension.lowercased() == "pdf" {
+            guard let document = PDFDocument(url:url) else { throw SIQError(message:"Не удалось открыть PDF.") }
+            let text = (0..<document.pageCount).compactMap { document.page(at:$0)?.string }.joined(separator:"\n")
+            guard !text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else { throw SIQError(message:"В PDF нет извлекаемого текста. Для сканов нужно распознавание OCR.") }
+            var result = try parse(text)
+            result.warnings.append("Текст извлечён из PDF. Проверьте порядок и распознавание вопросов; сканы без текстового слоя не поддерживаются.")
+            return result
+        }
+        if url.pathExtension.lowercased() == "pptx" { return try pptx(url) }
         let data = try Data(contentsOf:url)
         guard let text = String(data:data,encoding:.utf8) ?? String(data:data,encoding:.utf16) ?? String(data:data,encoding:.windowsCP1251) else { throw SIQError(message:"Не удалось прочитать текстовую кодировку") }
         if url.pathExtension.lowercased() == "tsv" { return try table(delimited(text,separator:"\t")) }
         return try parse(text)
+    }
+    static func html(_ data: Data) throws -> QuestionImportResult {
+        guard data.count <= 8*1024*1024, let html = String(data:data,encoding:.utf8) ?? String(data:data,encoding:.windowsCP1251) else { throw SIQError(message:"Страница больше 8 МБ или имеет неподдерживаемую кодировку.") }
+        var text = html
+        for tag in ["script","style","noscript","svg"] {
+            text = text.replacingOccurrences(of:"(?is)<\\s*\(tag)\\b[^>]*>.*?<\\s*/\\s*\(tag)\\s*>",with:" ",options:.regularExpression)
+        }
+        text = text.replacingOccurrences(of:"(?i)<\\s*(br|/p|/div|/li|/tr|/h[1-6])\\b[^>]*>",with:"\n",options:.regularExpression)
+        text = text.replacingOccurrences(of:"<[^>]+>",with:" ",options:.regularExpression)
+        let entities = ["&nbsp;":" ","&amp;":"&","&lt;":"<","&gt;":">","&quot;":"\"","&#39;":"'","&apos;":"'","&mdash;":"—","&ndash;":"–","&laquo;":"«","&raquo;":"»","&hellip;":"…"]
+        for (entity,value) in entities { text = text.replacingOccurrences(of:entity,with:value,options:.caseInsensitive) }
+        if let regex = try? NSRegularExpression(pattern:"&#(x[0-9a-fA-F]+|[0-9]+);",options:.caseInsensitive) {
+            let nsText = text as NSString
+            for match in regex.matches(in:text,range:NSRange(location:0,length:nsText.length)).reversed() {
+                let raw = nsText.substring(with:match.range(at:1)); let value: UInt32?
+                if raw.lowercased().hasPrefix("x") { value = UInt32(raw.dropFirst(),radix:16) }
+                else { value = UInt32(raw) }
+                if let value, let scalar = UnicodeScalar(value) { text = (text as NSString).replacingCharacters(in:match.range,with:String(scalar)) }
+            }
+        }
+        text = text.replacingOccurrences(of:"[ \\t]+",with:" ",options:.regularExpression)
+        var result = try parse(text)
+        result.warnings.append("Импортировано из HTML-страницы. Проверьте границы вопросов и ответы перед добавлением в банк.")
+        return result
+    }
+    static func pptx(_ url: URL) throws -> QuestionImportResult {
+        let files = try SIQArchive().read(url,maxBytes:64*1024*1024)
+        let paths = files.keys.filter { $0.range(of:"^ppt/slides/slide[0-9]+\\.xml$",options:.regularExpression) != nil }.sorted { a,b in
+            func number(_ path:String) -> Int { Int(path.split(separator:"/").last!.dropFirst(5).dropLast(4)) ?? 0 }
+            return number(a) < number(b)
+        }
+        guard !paths.isEmpty else { throw SIQError(message:"В презентации не найдены слайды.") }
+        var slides: [String] = []
+        for path in paths {
+            guard let data = files[path] else { continue }
+            let root = try SIQXML().parse(data,expectedRoot:"sld")
+            func collect(_ node: SIQNode) -> [String] {
+                if node.name == "t" { return [node.value] }
+                return node.children.flatMap(collect)
+            }
+            slides.append(collect(root).filter { !$0.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty }.joined(separator:" "))
+        }
+        var result = try parse(slides.joined(separator:"\n"))
+        result.warnings.append("Текст извлечён из PPTX по порядку слайдов. Проверьте, что вопросы и ответы не разделены изображениями или анимацией.")
+        return result
     }
     static func xlsx(_ url: URL) throws -> QuestionImportResult {
         let files = try SIQArchive().read(url,maxBytes:64*1024*1024)

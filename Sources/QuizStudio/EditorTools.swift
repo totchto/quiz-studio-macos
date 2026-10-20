@@ -51,6 +51,96 @@ struct RoundTemplate: Codable, Identifiable, Equatable {
         return round
     }
 }
+struct QuizTemplate: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var name: String
+    var quiz: Quiz
+    var introductionSeconds: Int
+    var phoneMode: Bool
+    var readBeforeTimer: Bool
+    var automaticAdvance: Bool
+    var signalsEnabled: Bool
+    init(name: String,quiz source: Quiz,introductionSeconds: Int,phoneMode: Bool,readBeforeTimer: Bool,automaticAdvance: Bool,signalsEnabled: Bool) {
+        self.name = name.trimmingCharacters(in:.whitespacesAndNewlines)
+        var copy = source
+        copy.title = self.name; copy.teams = []; copy.bankHistoryID = nil; copy.importNotes = nil
+        if var appearance = copy.appearance { appearance.backgroundImage = nil; appearance.fontFile = nil; copy.appearance = appearance }
+        for i in copy.rounds.indices {
+            copy.rounds[i].questions = []; copy.rounds[i].hostNotes = nil
+            if copy.rounds[i].intro != nil { copy.rounds[i].intro = RoundIntro(text:"",seconds:copy.rounds[i].intro?.seconds ?? 20) }
+            copy.rounds[i].blocks = copy.rounds[i].blocks?.map { block in
+                var value = block; value.title = ""; value.text = ""; value.image = nil; value.options = nil; return value
+            }
+        }
+        self.quiz = copy; self.introductionSeconds = introductionSeconds; self.phoneMode = phoneMode; self.readBeforeTimer = readBeforeTimer; self.automaticAdvance = automaticAdvance; self.signalsEnabled = signalsEnabled
+    }
+}
+@MainActor final class QuizTemplateStore: ObservableObject {
+    let url: URL
+    @Published var templates: [QuizTemplate] = []
+    @Published var error = ""
+    init(url: URL) {
+        self.url = url
+        if FileManager.default.fileExists(atPath:url.path) { do { templates = try JSONDecoder().decode([QuizTemplate].self,from:Data(contentsOf:url)) } catch { self.error = "Не удалось прочитать шаблоны квизов: "+error.localizedDescription } }
+    }
+    func save(name: String,quiz: Quiz,introductionSeconds: Int,phoneMode: Bool,readBeforeTimer: Bool,automaticAdvance: Bool,signalsEnabled: Bool) throws {
+        let clean = name.trimmingCharacters(in:.whitespacesAndNewlines)
+        guard !clean.isEmpty else { throw SIQError(message:"Введите название шаблона.") }
+        var updated = templates
+        let value = QuizTemplate(name:clean,quiz:quiz,introductionSeconds:introductionSeconds,phoneMode:phoneMode,readBeforeTimer:readBeforeTimer,automaticAdvance:automaticAdvance,signalsEnabled:signalsEnabled)
+        if let i = updated.firstIndex(where: { $0.name.localizedCaseInsensitiveCompare(clean) == .orderedSame }) { var replacement = value; replacement.id = updated[i].id; updated[i] = replacement }
+        else { updated.append(value) }
+        try FileManager.default.createDirectory(at:url.deletingLastPathComponent(),withIntermediateDirectories:true)
+        try JSONEncoder().encode(updated).write(to:url,options:.atomic); templates = updated; error = ""
+    }
+}
+struct QuizTemplatePicker: View {
+    @ObservedObject var studio: Studio
+    @ObservedObject var store: QuizTemplateStore
+    @Environment(\.dismiss) var dismiss
+    @State private var selectedID: UUID?
+    init(studio: Studio) { self.studio = studio; self.store = studio.quizTemplates }
+    var selected: QuizTemplate? { store.templates.first { $0.id == selectedID } }
+    var body: some View {
+        VStack(alignment:.leading,spacing:16) {
+            Text("Шаблоны квизов").font(.title2.bold())
+            if store.templates.isEmpty { ContentUnavailableView("Пока нет шаблонов",systemImage:"rectangle.stack",description:Text("Сохраните структуру квиза из редактора.")) }
+            else {
+                List(store.templates,selection:$selectedID) { template in
+                    VStack(alignment:.leading,spacing:4) { Text(template.name).font(.headline); Text("\(template.quiz.rounds.count) раундов · настройки таймеров, пауз и показа ответов").font(.caption).foregroundStyle(.secondary) }.tag(template.id as UUID?)
+                }.frame(minHeight:220)
+                if let selected { Text("Вопросы и команды не переносятся. В каждом раунде можно добавить вопрос вручную или выбрать его из банка.").font(.callout).foregroundStyle(.secondary); Text("Выбрано: \(selected.name)").font(.caption).foregroundStyle(.secondary) }
+            }
+            HStack { Button("Отмена") { dismiss() }; Spacer(); Button("Создать квиз") { if let selected { studio.applyQuizTemplate(selected); dismiss() } }.buttonStyle(.borderedProminent).disabled(selected == nil) }
+            if !store.error.isEmpty { Text(store.error).foregroundStyle(.red) }
+        }.padding(24).frame(width:540,height:430)
+    }
+}
+struct QuizTemplateSaveView: View {
+    @ObservedObject var store: QuizTemplateStore
+    let quiz: Quiz
+    let introductionSeconds: Int
+    let phoneMode: Bool
+    let readBeforeTimer: Bool
+    let automaticAdvance: Bool
+    let signalsEnabled: Bool
+    @Environment(\.dismiss) var dismiss
+    @State private var name: String
+    @State private var error: String?
+    init(store: QuizTemplateStore,quiz: Quiz,introductionSeconds: Int,phoneMode: Bool,readBeforeTimer: Bool,automaticAdvance: Bool,signalsEnabled: Bool) { self.store = store; self.quiz = quiz; self.introductionSeconds = introductionSeconds; self.phoneMode = phoneMode; self.readBeforeTimer = readBeforeTimer; self.automaticAdvance = automaticAdvance; self.signalsEnabled = signalsEnabled; _name = State(initialValue:quiz.title) }
+    var body: some View {
+        VStack(alignment:.leading,spacing:16) {
+            Text("Сохранить шаблон квиза").font(.title2.bold())
+            Text("Сохранится структура раундов, их настройки и параметры проведения. Вопросы, команды и содержимое заставок будут очищены.").foregroundStyle(.secondary)
+            TextField("Название шаблона",text:$name)
+            HStack { Button("Отмена") { dismiss() }; Spacer(); Button("Сохранить шаблон") {
+                do { try store.save(name:name,quiz:quiz,introductionSeconds:introductionSeconds,phoneMode:phoneMode,readBeforeTimer:readBeforeTimer,automaticAdvance:automaticAdvance,signalsEnabled:signalsEnabled); dismiss() }
+                catch { self.error = error.localizedDescription }
+            }.buttonStyle(.borderedProminent).disabled(name.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty) }
+            if let error { Text(error).foregroundStyle(.red) }
+        }.padding(24).frame(width:520)
+    }
+}
 @MainActor final class RoundTemplateStore: ObservableObject {
     let url: URL
     @Published var custom: [RoundTemplate] = []
@@ -88,6 +178,13 @@ extension QuestionBank {
     }
 }
 extension Studio {
+    func applyQuizTemplate(_ template: QuizTemplate) {
+        var copy = template.quiz
+        copy.title = "Новый квиз"; copy.teams = []; copy.bankHistoryID = nil; copy.importNotes = nil
+        if copy.rounds.isEmpty { copy.rounds = [Round(title:"Раунд 1",questions:[])] }
+        quiz = copy; introductionSeconds = template.introductionSeconds; phoneMode = template.phoneMode; readBeforeTimer = template.readBeforeTimer; automaticAdvance = template.automaticAdvance; signalsEnabled = template.signalsEnabled; roundIndex = 0; questionIndex = 0; editorSelection = []; undoHistory = []
+        screen = .editor; autosave(); status = "Создан квиз по шаблону: "+template.name
+    }
     func recordBankUsage(played: Bool) {
         guard !isEditorPreview else { return }
         let ids = Set(quiz.rounds.flatMap(\.questions).compactMap(\.bankEntryID))

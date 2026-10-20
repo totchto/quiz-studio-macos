@@ -86,6 +86,7 @@ struct BulkQuestionImportView: View {
     @ObservedObject var studio: Studio
     @Environment(\.dismiss) var dismiss
     @State private var text = ""
+    @State private var pageURL = ""
     @State private var rows: [ImportedQuestionRow] = []
     @State private var warnings: [String] = []
     @State private var error: String?
@@ -97,14 +98,19 @@ struct BulkQuestionImportView: View {
     var body: some View {
         VStack(alignment:.leading,spacing:12) {
             HStack { Text("Массовый импорт вопросов").font(.title2.bold()); Spacer(); Button("Закрыть") { importTask?.cancel(); dismiss() } }
-            HStack { Button("Открыть XLSX / CSV / TSV / TXT…") {
-                let panel = NSOpenPanel(); panel.allowedContentTypes = ["xlsx","csv","tsv","txt"].compactMap { UTType(filenameExtension:$0) }; panel.allowsMultipleSelection = false
+            HStack { Button("Открыть XLSX / CSV / TSV / TXT / PDF / PPTX…") {
+                let panel = NSOpenPanel(); panel.allowedContentTypes = ["xlsx","csv","tsv","txt","pdf","pptx"].compactMap { UTType(filenameExtension:$0) }; panel.allowsMultipleSelection = false
                 guard panel.runModal() == .OK, let url = panel.url else { return }; source = url.lastPathComponent
                 load { try QuestionTextImport.file(url) }
             }; Button("Шаблон CSV…") { saveTemplate() }; if busy { ProgressView().controlSize(.small) } }
+            HStack {
+                TextField("Ссылка на открытую страницу с пакетом вопросов",text:$pageURL).textFieldStyle(.roundedBorder)
+                Button("Загрузить страницу") { importPage() }.disabled(pageURL.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty || busy)
+            }
             DisclosureGroup("Формат и ограничения") {
                 Text("Таблица: заголовки Вопрос, Ответ, Объяснение, Тип, Вариант1…Вариант8, Правильные варианты (номера через запятую), Погрешность, События (через | в верном порядке), Темы, Сложность, Время. XLSX: первый видимый лист; формулы не вычисляются. Для сопоставления: столбец Пары, например Франция=Париж|Италия=Рим. Из Numbers экспортируйте XLSX/CSV.").font(.caption)
-                Text("Текст: по строке «вопрос — ответ — объяснение» либо блоки с метками «Вопрос:», «Ответ:», «Объяснение:». До 5000 вопросов за импорт. Перед сохранением проверьте распознавание.").font(.caption)
+                Text("Текст, извлечённый из PDF/PPTX, и открытые веб-страницы разбираются автоматически. Для PDF нужен текстовый слой; сканы без OCR не читаются. В презентациях берётся текст слайдов, картинки и анимация не разбираются. До 5000 вопросов за импорт. Перед сохранением проверьте распознавание.").font(.caption)
+                Text("Текст: по строке «вопрос — ответ — объяснение» либо блоки с метками «Вопрос:», «Вопрос 1:», «Ответ:», «Объяснение:». ").font(.caption)
             }
             HStack { Text("Или вставьте текст").bold(); Spacer(); Button("Распознать текст") { let input = text; source = "Вставленный текст"; load { try QuestionTextImport.parse(input) } }.disabled(text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty || busy) }
             TextEditor(text:$text).frame(height:95).border(.quaternary)
@@ -136,15 +142,29 @@ struct BulkQuestionImportView: View {
             }
         }.padding(22).frame(width:920,height:760).onDisappear { importTask?.cancel() }
     }
-    func load(_ operation: @escaping @Sendable () throws -> QuestionImportResult) {
+    func load(_ operation: @escaping @Sendable () async throws -> QuestionImportResult) {
         importTask?.cancel(); busy = true; error = nil; rows = []; warnings = []
         importTask = Task {
             do {
-                let worker = Task.detached(priority:.userInitiated) { try operation() }
+                let worker = Task.detached(priority:.userInitiated) { try await operation() }
                 let result = try await withTaskCancellationHandler(operation:{ try await worker.value },onCancel:{ worker.cancel() })
                 guard !Task.isCancelled else { return }; rows = result.rows; warnings = result.warnings; busy = false
                 if rows.isEmpty { error = "Вопросы не найдены. Проверьте формат." }
             } catch { if !Task.isCancelled { self.error = error.localizedDescription; busy = false } }
+        }
+    }
+    func importPage() {
+        guard let url = URL(string:pageURL.trimmingCharacters(in:.whitespacesAndNewlines)),
+              ["https","http"].contains(url.scheme?.lowercased() ?? ""),
+              let host = url.host, !host.isEmpty, url.user == nil, url.password == nil,
+              host != "localhost", !host.hasSuffix(".local") else { error = "Введите публичную ссылку, начинающуюся с http:// или https://."; return }
+        source = url.absoluteString
+        load {
+            var request = URLRequest(url:url); request.timeoutInterval = 25; request.setValue("text/html, text/plain;q=0.9, */*;q=0.5",forHTTPHeaderField:"Accept")
+            let (data,response) = try await URLSession.shared.data(for:request)
+            guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode) else { throw SIQError(message:"Сайт не отдал страницу (проверьте ссылку и доступность сайта).") }
+            guard let final = response.url, final.host != "localhost", !(final.host?.hasSuffix(".local") ?? false) else { throw SIQError(message:"Ссылка перенаправила на локальный адрес.") }
+            return try QuestionTextImport.html(data)
         }
     }
     func saveTemplate() {
