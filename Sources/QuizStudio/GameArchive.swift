@@ -223,7 +223,7 @@ struct GameArchiveView: View {
             if !archive.error.isEmpty { Text(archive.error).foregroundStyle(.red) }
             if let exportError { Text(exportError).foregroundStyle(.red) }
             if tab == 0 {
-                HStack(alignment:.top,spacing:18) {
+                HSplitView {
                     List(visible,selection:$selected) { game in
                         VStack(alignment:.leading,spacing:5) {
                             Text(game.title).font(.headline)
@@ -231,7 +231,7 @@ struct GameArchiveView: View {
                             Text("\(game.statusText) · \(game.phone ? "Телефоны" : "Бланки") · Команд: \(game.teams.count)").font(.caption).foregroundStyle(.secondary)
                             if game.pending > 0 { Text("Ответов без оценки: \(game.pending)").font(.caption).foregroundStyle(.orange) }
                         }.padding(.vertical,6).tag(game.id)
-                    }.frame(width:290)
+                    }.frame(minWidth:210,idealWidth:270,maxWidth:360)
                     if let game = visible.first(where:{ $0.id == selected }) {
                         ScrollView { ArchivedGameDetail(game:game,export:{ type in export(game,type:type) }).frame(maxWidth:.infinity,alignment:.leading) }
                     } else { ContentUnavailableView("Выберите игру",systemImage:"chart.bar.doc.horizontal",description:Text(visible.isEmpty ? "Результаты появятся после запуска квиза. Старые игры автоматически восстановить нельзя." : "Слева — отдельные проведения квизов." )).frame(maxWidth:.infinity) }
@@ -243,13 +243,13 @@ struct GameArchiveView: View {
                 if rows.isEmpty { ContentUnavailableView("Пока нет статистики",systemImage:"chart.bar",description:Text("Проведите игру с телефонов и завершите её. Для бланков приложение знает баллы по раундам, но не ответы на отдельные вопросы.")) }
                 List(rows) { row in
                     VStack(alignment:.leading,spacing:6) {
-                        HStack { Text(row.question.text).font(.headline); Spacer(); Text("\(row.gradedPercent.map { $0.formatted(.number.precision(.fractionLength(0...1))) } ?? "—")% верно среди оценённых").bold() }
+                        HStack(alignment:.top) { Text(row.question.text).font(.headline).lineLimit(2); Spacer(minLength:8); Text("\(row.gradedPercent.map { $0.formatted(.number.precision(.fractionLength(0...1))) } ?? "—")% верно среди оценённых").bold().fixedSize(horizontal:true,vertical:false) }
                         Text("Игр: \(row.games) · Верно: \(row.correct) из \(row.graded) оценённых · Ответили: \(row.responsePercent.formatted(.number.precision(.fractionLength(0...1))))% · Частично: \(row.partial) · Без оценки: \(row.pending) · Нет ответа: \(row.missing)").font(.caption).foregroundStyle(.secondary)
                         Text("Ответ: "+row.question.answer).font(.caption)
                     }.padding(.vertical,6)
                 }
             }
-        }.padding(22).frame(minWidth:1050,minHeight:700)
+        }.padding(22).frame(minWidth:900,idealWidth:1050,minHeight:600,idealHeight:700)
         .onAppear { if selected == nil { selected = visible.first?.id } }
         .onChange(of:visible.map(\.id)) { _,ids in if selected.map({ !ids.contains($0) }) ?? true { selected = ids.first } }
     }
