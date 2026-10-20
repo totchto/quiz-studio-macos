@@ -438,8 +438,16 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
 }
 
 @MainActor final class Studio: ObservableObject {
+    enum LibraryIntent: Equatable { case edit, play }
+    private static let autosaveQueue = DispatchQueue(label:"QuizStudio.autosave",qos:.utility)
+    private var autosaveWorkItem: DispatchWorkItem?
+    private(set) var autosavePending = false
+    private(set) var autosaveFailed = false
+    private var autosaveGeneration = 0
+    private var quizValidationTask: Task<Void,Never>?
     enum Screen { case home, library, createLibrary, editor, teams }
     @Published var screen: Screen = .home
+    @Published var libraryIntent: LibraryIntent = .edit
     @Published var introductionSeconds = 6
     @Published var phoneMode = false
     let phoneRoom = PhoneRoom()
@@ -503,7 +511,9 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
     @Published var index = 0
     @Published var status = ""
     @Published var lastAutosave: Date?
+    @Published var autosaveError: String?
     @Published var focusEditorSearch = false
+    @Published var focusEditorQuestionID: UUID?
     @Published var focusLibrarySearch = false
     @Published var publishedScores = false
     @Published var scoreSnapshot: [Team] = []
@@ -576,9 +586,54 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
         recoveryAvailable = FileManager.default.fileExists(atPath: recoveryURL.path)
         timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
     }
-    func autosave() { do { try writeDirectory(to: draft)
-        if (playing || screen == .teams) && !phoneMode { try persistResults() }; if playing { checkpoint() }; lastAutosave = Date()
-    } catch { status = "Ошибка автосохранения: \(error.localizedDescription)" } }
+    func autosave() {
+        if (playing || screen == .teams) && !phoneMode { do { try persistResults() } catch { status = "Ошибка автосохранения: \(error.localizedDescription)" } }
+        if playing { checkpoint() }
+        autosaveGeneration += 1
+        autosavePending = true
+        autosaveFailed = false
+        autosaveError = nil
+        autosaveWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.enqueueAutosave() }
+        autosaveWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline:.now()+0.45,execute:work)
+    }
+    private func enqueueAutosave(completion:(@MainActor (Bool)->Void)? = nil) {
+        let generation = autosaveGeneration
+        let quizSnapshot = quiz
+        let destination = draft
+        let media = referencedAssets.compactMap { name in asset(name).map { (name,$0) } }
+        Self.autosaveQueue.async { [weak self] in
+            do {
+                try FileManager.default.createDirectory(at:destination,withIntermediateDirectories:true)
+                let mediaFolder = destination.appendingPathComponent("Media")
+                try FileManager.default.createDirectory(at:mediaFolder,withIntermediateDirectories:true)
+                for (name,source) in media {
+                    let target = mediaFolder.appendingPathComponent(name)
+                    if source.standardizedFileURL == target.standardizedFileURL || FileManager.default.fileExists(atPath:target.path) { continue }
+                    guard FileManager.default.fileExists(atPath:source.path) else { continue }
+                    try FileManager.default.copyItem(at:source,to:target)
+                }
+                try JSONEncoder().encode(quizSnapshot).write(to:destination.appendingPathComponent("quiz.json"),options:.atomic)
+                try JSONEncoder().encode(quizSnapshot.teams).write(to:destination.appendingPathComponent("game-results.json"),options:.atomic)
+                Task { @MainActor in
+                    if self?.autosaveGeneration == generation { self?.autosavePending = false; self?.autosaveFailed = false; self?.autosaveError = nil; self?.lastAutosave = Date() }
+                    completion?(true)
+                }
+            } catch {
+                let message = error.localizedDescription
+                Task { @MainActor in
+                    if self?.autosaveGeneration == generation { self?.autosavePending = false; self?.autosaveFailed = true; self?.autosaveError = message; self?.status = "Ошибка автосохранения: \(message)" }
+                    completion?(false)
+                }
+            }
+        }
+    }
+    func flushAutosave(completion:@escaping @MainActor (Bool)->Void) {
+        autosaveWorkItem?.cancel(); autosaveWorkItem = nil
+        guard autosavePending || autosaveFailed else { completion(true); return }
+        enqueueAutosave(completion:completion)
+    }
     func persistResults() throws {
         guard let documentURL else { return }
         var isDirectory: ObjCBool = false
@@ -640,7 +695,7 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
             persistLibrary(); status = "Квиз удалён с Mac: " + url.lastPathComponent
         } catch { status = "Не удалось удалить квиз: " + error.localizedDescription }
     }
-    func showLibrary() { status = ""; screen = .createLibrary }
+    func showLibrary(forPlay:Bool = false) { status = ""; libraryIntent = forPlay ? .play : .edit; screen = .createLibrary }
     func editQuiz(_ url: URL) {
         autosave()
         if load(url) { screen = .editor }
@@ -937,6 +992,33 @@ struct BackgroundTrack: Identifiable, Codable, Equatable {
     func selectRound(_ id: UUID) {
         guard let index = quiz.rounds.firstIndex(where: { $0.id == id }) else { return }
         roundIndex = index; questionIndex = 0
+    }
+    func openPreflightIssue(_ issue:String) {
+        var target: (round:Int,question:Int)?
+        for (roundIndex,round) in quiz.rounds.enumerated() {
+            let prefix = "\(round.title), вопрос "
+            if issue.hasPrefix(prefix) {
+                let number = issue.dropFirst(prefix.count).prefix { $0.isNumber }
+                if let index = Int(number), round.questions.indices.contains(index-1) { target = (roundIndex,index-1); break }
+            }
+            if (issue.contains(round.title + ": ") || issue.hasPrefix("Объяснение:")),
+               let questionIndex = round.questions.firstIndex(where: { !$0.text.isEmpty && issue.contains($0.text) }) {
+                target = (roundIndex,questionIndex); break
+            }
+            if let assetName = ["Нет файла: ","Не читается изображение: "].compactMap({ prefix in
+                issue.hasPrefix(prefix) ? String(issue.dropFirst(prefix.count)) : nil
+            }).first,
+               let questionIndex = round.questions.firstIndex(where: { question in
+                   ([question.image,question.media,question.explanationImage,question.explanationMedia].compactMap { $0 } + (question.imageGallery ?? []) + (question.explanationGallery ?? []) + (question.choiceImages ?? []).compactMap { $0 } + (question.siqAttachments ?? []).map(\.name)).contains(assetName)
+               }) {
+                target = (roundIndex,questionIndex); break
+            }
+        }
+        if let target {
+            roundIndex = target.round; questionIndex = target.question
+            focusEditorQuestionID = quiz.rounds[target.round].questions[target.question].id
+        } else { focusEditorQuestionID = nil }
+        screen = .editor
     }
     func deleteEmptyRound(_ id: UUID) {
         guard quiz.rounds.count > 1, let index = quiz.rounds.firstIndex(where: { $0.id == id }), quiz.rounds[index].questions.isEmpty else { return }
@@ -1283,15 +1365,28 @@ extension Studio {
         signalPlayer?.stop(); p.currentDevice = audioOutputUID.isEmpty ? nil : audioOutputUID; p.volume = Float(signalVolume); p.enableRate = true; p.rate = rate; p.play(); signalPlayer = p
     }
     func validateQuiz() async {
-        guard !checkingQuiz else { return }
-        checkingQuiz = true; defer { checkingQuiz = false }
-        var issues = incompleteQuestions
-        for name in referencedAssets {
+        if let existing = quizValidationTask { await existing.value; return }
+        checkingQuiz = true
+        let task = Task { @MainActor in await self.performQuizValidation() }
+        quizValidationTask = task
+        await task.value
+        quizValidationTask = nil
+        checkingQuiz = false
+    }
+    private func performQuizValidation() async {
+        let checkedQuiz = quiz
+        let checkedAssets = referencedAssets
+        var issues = checkedQuiz.rounds.flatMap { round in
+            (round.questions.isEmpty ? ["\(round.title): нет вопросов"] : []) + round.questions.enumerated().compactMap { index,question in
+                question.issues.isEmpty ? nil : "\(round.title), вопрос \(index+1): \(question.issues.joined(separator: "; "))"
+            }
+        }
+        for name in checkedAssets {
             guard let url = asset(name), FileManager.default.fileExists(atPath: url.path) else { issues.append("Нет файла: " + name); continue }
             if ["png","jpg","jpeg","gif","heic","tiff","webp"].contains(url.pathExtension.lowercased()), NSImage(contentsOf: url) == nil { issues.append("Не читается изображение: " + name) }
         }
         var checked: [String: Double] = [:]
-        for round in quiz.rounds {
+        for round in checkedQuiz.rounds {
             let entries = round.questions.flatMap { q -> [(String,Double,Double,String)] in
                 var a: [(String,Double,Double,String)] = []
                 let questionSettings = q.settings(answer:false); let answerSettings = q.settings(answer:true)
@@ -1312,7 +1407,11 @@ extension Studio {
                 } catch { issues.append(label + ": " + error.localizedDescription) }
             }
         }
-        preflightIssues = Array(Set(issues)).sorted()
+        if quiz == checkedQuiz {
+            preflightIssues = Array(Set(issues)).sorted()
+        } else {
+            preflightIssues = ["Квиз изменился во время проверки. Запустите проверку снова."]
+        }
     }
     func beginCheckedGame() {
         Task { let checked = quiz; await validateQuiz(); guard checked == quiz else { status = "Квиз изменился во время проверки. Нажмите старт ещё раз."; return }; if preflightIssues.isEmpty { beginGame() } else { showPreflight = true } }
@@ -1322,11 +1421,20 @@ extension Studio {
 final class GameWindowGuard: NSObject, NSWindowDelegate {
     weak var studio: Studio?
     let original: NSWindowDelegate?
+    var allowClose = false
     init(studio: Studio,original: NSWindowDelegate?) { self.studio = studio; self.original = original }
     override func responds(to selector: Selector!) -> Bool { super.responds(to: selector) || (original?.responds(to: selector) ?? false) }
     override func forwardingTarget(for selector: Selector!) -> Any? { original?.responds(to: selector) == true ? original : super.forwardingTarget(for: selector) }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if allowClose { return original?.windowShouldClose?(sender) ?? true }
         if let studio, studio.playing { studio.confirmExit(); if studio.playing { return false } }
+        if let studio, studio.autosavePending || studio.autosaveFailed {
+            studio.flushAutosave { [weak self,weak sender] success in
+                guard success,let self,let sender else { return }
+                self.allowClose = true; sender.close(); self.allowClose = false
+            }
+            return false
+        }
         return original?.windowShouldClose?(sender) ?? true
     }
 }
@@ -1339,8 +1447,11 @@ final class GameAppDelegate: NSObject, NSApplicationDelegate {
         let guarder = GameWindowGuard(studio: studio,original: window.delegate); guards.append(guarder); window.delegate = guarder
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let studio, studio.playing else { return .terminateNow }
-        studio.confirmExit(); return studio.playing ? .terminateCancel : .terminateNow
+        guard let studio else { return .terminateNow }
+        if studio.playing { studio.confirmExit(); if studio.playing { return .terminateCancel } }
+        guard studio.autosavePending || studio.autosaveFailed else { return .terminateNow }
+        studio.flushAutosave { success in NSApp.reply(toApplicationShouldTerminate:success) }
+        return .terminateLater
     }
 }
 
@@ -1566,6 +1677,13 @@ struct RoundDropTarget: View {
         WindowGroup("Квиз Студия · 0.18.0 — тестовая сборка") { Content(studio: studio).onAppear { appDelegate.install(studio) }.frame(minWidth: 1050,minHeight: 720).preferredColorScheme(appearance).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if url.pathExtension.lowercased() == "siq" { studio.chooseSIQ(url) } else if !studio.playing && studio.load(url) { studio.prepareGame() } } }
         .commands {
             CommandGroup(replacing: .newItem) { Button("Создать квиз") { studio.newQuiz() }.keyboardShortcut("n").disabled(studio.playing); Button("Открыть квиз…") { studio.open() }.keyboardShortcut("o").disabled(studio.playing); Button("Сохранить квиз…") { studio.save() }.keyboardShortcut("s") }
+            CommandGroup(replacing:.undoRedo) {
+                Button("Отменить изменение") { studio.undoEdit() }.keyboardShortcut("z").disabled(studio.undoHistory.isEmpty)
+                Button("Повторить изменение") { studio.redoEdit() }.keyboardShortcut("z",modifiers:[.command,.shift]).disabled(studio.redoHistory.isEmpty)
+            }
+            CommandGroup(after:.pasteboard) {
+                Button("Дублировать вопрос") { studio.duplicateSelectedQuestion() }.disabled(studio.selectedQuestion == nil)
+            }
             CommandGroup(after:.textEditing) {
                 Button("Найти") {
                     if studio.screen == .editor { studio.focusEditorSearch = true }
@@ -1613,7 +1731,7 @@ struct QuestionBankView: View {
         bank.entries.filter { entry in entry.archived == showArchived && (tag == "Все темы" || (entry.question.tags ?? []).contains(tag)) && (difficulty == "Любая сложность" || (entry.question.difficulty ?? "Не указана") == difficulty) && (!unusedOnly || (entry.history ?? []).isEmpty) && (category == "Все" || entry.question.bankCategories.contains(category)) && (search.isEmpty || [entry.question.text,entry.question.correctAnswer,entry.question.hostNotes ?? "",entry.origin ?? "",(entry.question.tags ?? []).joined(separator:" ")].joined(separator:" ").localizedCaseInsensitiveContains(search)) }
     }
     var filtersActive: Bool { category != "Все" || tag != "Все темы" || difficulty != "Любая сложность" || unusedOnly }
-    func resetFilters() { category = "Все"; tag = "Все темы"; difficulty = "Любая сложность"; unusedOnly = false; search = "" }
+    func resetFilters() { category = "Все"; tag = "Все темы"; difficulty = "Любая сложность"; unusedOnly = false }
     var body: some View {
         VStack(alignment:.leading,spacing:14) {
             HStack { Text("Банк вопросов").font(.largeTitle.bold()); Spacer(); Menu("Импорт…",systemImage:"square.and.arrow.down") { Button("Вопросы из таблицы или текста…") { bulkImport = true }; Button("Пак «Своя игра» (.siq)…") { studio.chooseSIQ() } }; Button("Собрать квиз") { assembly = true }; Button("Новая идея",systemImage:"plus") { creating = true }.buttonStyle(.borderedProminent) }
@@ -1654,8 +1772,8 @@ struct QuestionBankView: View {
                 .frame(minWidth:280,idealWidth:370)
                 .overlay { if visible.isEmpty {
                     VStack(spacing:8) {
-                        ContentUnavailableView("Нет подходящих вопросов",systemImage:"magnifyingglass",description:Text("Измените поиск или фильтры."))
-                        if filtersActive || !search.isEmpty { Button("Сбросить поиск и фильтры") { resetFilters() }.buttonStyle(.bordered) }
+                        ContentUnavailableView(bank.entries.filter { $0.archived == showArchived }.isEmpty ? "Банк вопросов пуст" : "Нет подходящих вопросов",systemImage:bank.entries.filter { $0.archived == showArchived }.isEmpty ? "tray" : "magnifyingglass",description:Text(bank.entries.filter { $0.archived == showArchived }.isEmpty ? "Сохраните вопрос из редактора, чтобы добавить его в банк." : "Измените поиск или фильтры."))
+                        if filtersActive || !search.isEmpty { Button("Очистить поиск и фильтры") { resetFilters(); search = "" }.buttonStyle(.bordered) }
                     }
                 } }
             if let entry = visible.first(where:{$0.id == previewID}) {
@@ -1912,6 +2030,7 @@ struct AppSectionBar: View {
             }
             section("Мои квизы","rectangle.stack",selected:(studio.screen == .library || studio.screen == .createLibrary) && !studio.showQuestionBank && !studio.showGameArchive) {
                 studio.showQuestionBank=false; studio.showGameArchive=false
+                studio.libraryIntent = .edit
                 if studio.screen == .editor { studio.leaveEditor(destination:.createLibrary) } else { studio.screen = .createLibrary }
             }
             section("Банк вопросов","tray.full",selected:studio.showQuestionBank) {
@@ -1936,11 +2055,12 @@ struct AppSectionBar: View {
 }
 struct Editor: View {
     @ObservedObject var studio: Studio
-    @State private var editorSection = "Вопрос"
+    private enum EditorView { case question, round, appearance, table }
+    @State private var currentView: EditorView = .question
     @State private var showQuizTemplateSave = false
     @State private var showInspector = true
     @State private var editorLayoutWidth: CGFloat = 1200
-    @State private var tableMode = false
+    @State private var showQuestionSettings = false
     @State private var questionSearch = ""
     @State private var showEditorIssues = false
     @FocusState private var questionSearchFocused: Bool
@@ -1970,7 +2090,7 @@ struct Editor: View {
                                 HStack(spacing:5) {
                                 Toggle("Выбрать вопрос \(qi+1)",isOn:Binding(get:{ studio.editorSelection.contains(q.id) },set:{ if $0 { studio.editorSelection.insert(q.id) } else { studio.editorSelection.remove(q.id) } })).labelsHidden().help("Выбрать для массового изменения")
                                 DraggableQuestionRow(studio: studio,roundID: r.id,question: q,number: qi+1,selected: studio.selectedQuestion?.id == q.id) {
-                                    studio.roundIndex = ri; studio.questionIndex = qi; editorSection = "Вопрос"
+                                    studio.roundIndex = ri; studio.questionIndex = qi; currentView = .question
                                 }
                                 if q.correctAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                     Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange).help("Не указан правильный ответ")
@@ -1995,19 +2115,19 @@ struct Editor: View {
                                 Image(systemName:"line.3.horizontal").font(.caption).foregroundStyle(.tertiary)
                                     .onDrag { NSItemProvider(object:r.id.uuidString as NSString) }
                                     .help("Перетащите, чтобы изменить порядок раундов")
-                                Button { studio.selectRound(r.id); editorSection = "Раунд" } label: {
+                                Button { studio.selectRound(r.id); currentView = .round } label: {
                                     HStack { Text(r.title).font(.subheadline.weight(.semibold)); Spacer(); Text(questionSearch.isEmpty ? "\(r.questions.count)" : "\(visibleQuestions.count)/\(r.questions.count)").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }.padding(.vertical, 3)
                                 }.buttonStyle(.plain).help("Открыть настройки раунда")
                                 if questionSearch.isEmpty {
                                     Button {
                                         studio.selectRound(r.id)
                                         studio.addQuestion()
-                                        editorSection = "Вопрос"
+                                        currentView = .question
                                     } label: { Image(systemName: "plus") }
                                         .buttonStyle(.borderless).help("Добавить вопрос в раунд «\(r.title)»")
                                 }
                                 Menu {
-                                    Button("Настроить раунд") { studio.selectRound(r.id); editorSection = "Раунд" }
+                                    Button("Настроить раунд") { studio.selectRound(r.id); currentView = .round }
                                     Button("Дублировать раунд",systemImage:"plus.square.on.square") { studio.duplicateRound(r.id) }
                                     if ri > 0 { Button("Переместить выше",systemImage:"arrow.up") { _ = studio.moveRound(r.id,before:studio.quiz.rounds[ri-1].id) } }
                                     if ri+1 < studio.quiz.rounds.count { Button("Переместить ниже",systemImage:"arrow.down") { _ = studio.moveRound(r.id,before:ri+2 < studio.quiz.rounds.count ? studio.quiz.rounds[ri+2].id : nil) } }
@@ -2021,7 +2141,7 @@ struct Editor: View {
                     }
                     }.padding(.horizontal,8)
                 }
-                Button("Следующий раунд",systemImage: "plus.rectangle.on.rectangle") { studio.addRound() }
+                Button("Добавить раунд",systemImage: "plus.rectangle.on.rectangle") { studio.addRound() }
                     .keyboardShortcut("n",modifiers:[.command,.shift])
                     .help("Добавить раунд (⌘⇧N)").padding()
             }.padding(.top)
@@ -2031,19 +2151,18 @@ struct Editor: View {
                 ViewThatFits(in: .horizontal) {
                 HStack(spacing: 8) {
                     TextField("Название квиза",text: $studio.quiz.title).font(.title2.bold()).textFieldStyle(.plain).lineLimit(1).frame(minWidth:70,idealWidth:220,maxWidth:300)
-                    Button { editorSection = "Оформление" } label: { Image(systemName:"paintpalette") }.help("Оформление квиза")
-                    Button { showInspector.toggle() } label: { Image(systemName: "sidebar.right") }
-                        .help(editorLayoutWidth <= 900 ? "Параметры скрыты для компактного окна" : showInspector ? "Скрыть параметры" : "Показать параметры")
-                        .disabled(editorLayoutWidth <= 900)
+                    Button { currentView = .appearance } label: { Image(systemName:"paintpalette") }.help("Оформление квиза")
+                    Button { if editorLayoutWidth > 900 { showInspector.toggle() } else { showQuestionSettings = true } } label: { Image(systemName: "sidebar.right") }
+                        .help(editorLayoutWidth <= 900 ? "Параметры вопроса" : showInspector ? "Скрыть параметры" : "Показать параметры")
                     Button { questionSearchFocused = true } label: { Image(systemName: "magnifyingglass") }
                         .keyboardShortcut("f", modifiers: .command).help("Найти вопрос (⌘F)")
-                    Button { tableMode.toggle() } label: {
-                        Image(systemName: tableMode ? "tablecells" : "rectangle.and.pencil.and.ellipsis")
-                    }.help(tableMode ? "Табличный вид" : "Вид редактора")
+                    Button { currentView = currentView == .table ? .question : .table } label: {
+                        Image(systemName: currentView == .table ? "rectangle.and.pencil.and.ellipsis" : "tablecells")
+                    }.help(currentView == .table ? "Вид редактора" : "Табличный вид")
                     Menu {
-                        Button("Отменить изменение", systemImage: "arrow.uturn.backward") { studio.undoEdit() }.keyboardShortcut("z").disabled(studio.undoHistory.isEmpty)
-                        Button("Повторить изменение", systemImage: "arrow.uturn.forward") { studio.redoEdit() }.keyboardShortcut("z", modifiers: [.command, .shift]).disabled(studio.redoHistory.isEmpty)
-                        Button("Дублировать вопрос", systemImage: "plus.square.on.square") { studio.duplicateSelectedQuestion() }.keyboardShortcut("d").disabled(studio.selectedQuestion == nil)
+                        Button("Отменить изменение", systemImage: "arrow.uturn.backward") { studio.undoEdit() }.disabled(studio.undoHistory.isEmpty)
+                        Button("Повторить изменение", systemImage: "arrow.uturn.forward") { studio.redoEdit() }.disabled(studio.redoHistory.isEmpty)
+                        Button("Дублировать вопрос", systemImage: "plus.square.on.square") { studio.duplicateSelectedQuestion() }.disabled(studio.selectedQuestion == nil)
                         Divider()
                         Button("Импортировать вопросы…", systemImage: "tablecells") { studio.showBulkImport = true }
                         Button("Собрать квиз из банка…", systemImage: "sparkles") { studio.showQuizAssembly = true }
@@ -2072,13 +2191,12 @@ struct Editor: View {
                 HStack(spacing:8) {
                     TextField("Название квиза",text:$studio.quiz.title).font(.headline).textFieldStyle(.plain).lineLimit(1).frame(minWidth:50,maxWidth:220)
                     Spacer(minLength:2)
-                    Button { editorSection = "Оформление" } label: { Image(systemName:"paintpalette") }.help("Оформление квиза")
-                    Button { showInspector.toggle() } label: { Image(systemName:"sidebar.right") }
-                        .help(editorLayoutWidth <= 900 ? "Параметры скрыты для компактного окна" : showInspector ? "Скрыть параметры" : "Показать параметры")
-                        .disabled(editorLayoutWidth <= 900)
+                    Button { currentView = .appearance } label: { Image(systemName:"paintpalette") }.help("Оформление квиза")
+                    Button { if editorLayoutWidth > 900 { showInspector.toggle() } else { showQuestionSettings = true } } label: { Image(systemName:"sidebar.right") }
+                        .help(editorLayoutWidth <= 900 ? "Параметры вопроса" : showInspector ? "Скрыть параметры" : "Показать параметры")
                     Menu {
                         Button("Поиск вопросов…",systemImage:"magnifyingglass") { questionSearchFocused = true }
-                        Button(tableMode ? "Вид редактора" : "Табличный вид",systemImage:tableMode ? "rectangle.and.pencil.and.ellipsis" : "tablecells") { tableMode.toggle() }
+                        Button(currentView == .table ? "Вид редактора" : "Табличный вид",systemImage:currentView == .table ? "rectangle.and.pencil.and.ellipsis" : "tablecells") { currentView = currentView == .table ? .question : .table }
                         Divider()
                         Button("Отменить изменение",systemImage:"arrow.uturn.backward") { studio.undoEdit() }.disabled(studio.undoHistory.isEmpty)
                         Button("Повторить изменение",systemImage:"arrow.uturn.forward") { studio.redoEdit() }.disabled(studio.redoHistory.isEmpty)
@@ -2107,12 +2225,12 @@ struct Editor: View {
                 HSplitView {
                     VStack(spacing: 0) {
                         ScrollView { VStack(alignment: .leading,spacing: 24) {
-                            if editorSection == "Оформление" {
+                            if currentView == .appearance {
                                 AppearanceEditor(studio: studio, expanded: true)
-                            } else if editorSection == "Раунд" {
-                                RoundSettings(studio: studio, round: studio.roundBinding(studio.quiz.rounds[studio.roundIndex].id))
-                            } else if tableMode {
+                            } else if currentView == .table {
                                 QuizQuestionTable(studio: studio,filter:questionSearch)
+                            } else if currentView == .round {
+                                RoundSettings(studio: studio, round: studio.roundBinding(studio.quiz.rounds[studio.roundIndex].id))
                             } else if let selected = studio.selectedQuestion {
                                 QuestionEditor(studio: studio,question: studio.questionBinding(selected.id)).id(selected.id)
                             } else if studio.quiz.rounds.allSatisfy({ $0.questions.isEmpty }) {
@@ -2137,21 +2255,9 @@ struct Editor: View {
                                     }
                                 }.frame(maxWidth: .infinity, minHeight: 260)
                             }
-                            HStack {
-                                Button("Добавить из банка…",systemImage:"tray.full") { studio.showQuestionBank = true }
-                                Button(studio.selectedQuestion == nil ? "Добавить вопрос" : "Добавить следующий",systemImage: "plus") {
-                                    studio.addQuestion(afterSelected: studio.selectedQuestion != nil)
-                                }.keyboardShortcut("n",modifiers:[.command,.option]).buttonStyle(.borderedProminent)
-                                    .help(studio.selectedQuestion == nil ? "Добавить вопрос в конец раунда (⌘⌥N)" : "Создать вопрос сразу после выбранного (⌘⌥N)")
-                                Spacer()
-                                Menu {
-                                    Button("Сохранить вопрос в банк") { studio.saveSelectedToBank() }.disabled(studio.selectedQuestion == nil)
-                                    Button("Удалить вопрос",role: .destructive) { studio.deleteSelectedQuestion() }.disabled(studio.selectedQuestion == nil)
-                                } label: { Label("Ещё",systemImage:"ellipsis") }.contentShape(Rectangle()).help("Дополнительные действия")
-                            }
                         }.padding(16) }
                     }
-                    if showInspector && editorLayoutWidth > 900 && !tableMode && editorSection == "Вопрос" {
+                    if showInspector && editorLayoutWidth > 900 && currentView == .question {
                         Group {
                             if let selected = studio.selectedQuestion {
                                 ScrollView {
@@ -2187,10 +2293,32 @@ struct Editor: View {
                             .onChange(of: geometry.size.width) { _, width in editorLayoutWidth = width }
                     }
                 }
+                let issueCount = studio.incompleteQuestions.count
+                ViewThatFits(in:.horizontal) {
+                HStack(spacing:8) {
+                    Button("Из банка…",systemImage:"tray.full") { studio.showQuestionBank = true }
+                    Button(studio.selectedQuestion == nil ? "Добавить вопрос" : "Добавить следующий",systemImage:"plus") {
+                        studio.addQuestion(afterSelected: studio.selectedQuestion != nil)
+                    }.keyboardShortcut("n",modifiers:[.command,.option]).buttonStyle(.borderedProminent)
+                    Spacer()
+                    Menu {
+                        Button("Сохранить вопрос в банк") { studio.saveSelectedToBank() }.disabled(studio.selectedQuestion == nil)
+                        Button("Удалить вопрос",role:.destructive) { studio.deleteSelectedQuestion() }.disabled(studio.selectedQuestion == nil)
+                    } label: { Label("Ещё",systemImage:"ellipsis") }.help("Дополнительные действия")
+                }.padding(.horizontal,12).padding(.vertical,8)
+                HStack(spacing:8) {
+                    Button { studio.showQuestionBank = true } label: { Image(systemName:"tray.full") }.help("Добавить из банка")
+                    Button { studio.addQuestion(afterSelected:studio.selectedQuestion != nil) } label: { Label("Добавить вопрос",systemImage:"plus") }.buttonStyle(.borderedProminent)
+                    Spacer(minLength:2)
+                    Menu { Button("Сохранить вопрос в банк") { studio.saveSelectedToBank() }.disabled(studio.selectedQuestion == nil); Button("Удалить вопрос",role:.destructive) { studio.deleteSelectedQuestion() }.disabled(studio.selectedQuestion == nil) } label: { Image(systemName:"ellipsis") }.help("Дополнительные действия")
+                }.padding(.horizontal,12).padding(.vertical,6)
+                }
+                Divider()
+                ViewThatFits(in:.horizontal) {
                 HStack(spacing:12) {
-                    let issueCount = studio.incompleteQuestions.count
-                    Label(studio.lastAutosave.map { "Сохранено \($0.formatted(date:.omitted,time:.shortened))" } ?? "Черновик сохраняется автоматически",systemImage:"checkmark.circle.fill")
-                        .font(.caption).foregroundStyle(.secondary)
+                    Label(studio.autosaveError.map { "Ошибка сохранения: \($0)" } ?? (studio.autosavePending ? "Сохраняю черновик…" : (studio.lastAutosave.map { "Сохранено \($0.formatted(date:.omitted,time:.shortened))" } ?? "Черновик сохраняется автоматически")),systemImage:studio.autosaveError == nil ? (studio.autosavePending ? "arrow.triangle.2.circlepath" : "checkmark.circle.fill") : "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(studio.autosaveError == nil ? Color.secondary : Color.orange).lineLimit(1).help(studio.autosaveError ?? "")
+                    if studio.autosaveFailed { Button("Повторить") { studio.autosave() }.font(.caption) }
                     Spacer(minLength:4)
                     Text("\(studio.quiz.rounds.reduce(0) { $0 + $1.questions.count }) вопросов · \(studio.quiz.rounds.count) раундов").font(.caption).foregroundStyle(.secondary)
                     if issueCount > 0 {
@@ -2203,12 +2331,39 @@ struct Editor: View {
                         Label(studio.checkingQuiz ? "Проверка…" : "Проверить квиз",systemImage:studio.checkingQuiz ? "hourglass" : "checkmark.circle")
                     }.font(.caption).disabled(studio.checkingQuiz)
                 }.padding(.horizontal,12).padding(.vertical,9)
+                HStack(spacing:8) {
+                    Image(systemName:studio.autosaveError == nil ? (studio.autosavePending ? "arrow.triangle.2.circlepath" : "checkmark.circle.fill") : "exclamationmark.triangle.fill").foregroundStyle(studio.autosaveError == nil ? Color.secondary : Color.orange).help(studio.autosaveError ?? (studio.autosavePending ? "Сохраняю черновик…" : (studio.lastAutosave.map { "Сохранено \($0.formatted(date:.omitted,time:.shortened))" } ?? "Черновик сохраняется автоматически")))
+                    if studio.autosaveFailed { Button { studio.autosave() } label: { Image(systemName:"arrow.clockwise") }.help("Повторить сохранение") }
+                    if issueCount > 0 { Label("\(issueCount)",systemImage:"exclamationmark.triangle.fill").foregroundStyle(.orange) }
+                    Spacer(minLength:2)
+                    Text("\(studio.quiz.rounds.reduce(0) { $0 + $1.questions.count }) вопр. · \(studio.quiz.rounds.count) раунд.").font(.caption).foregroundStyle(.secondary)
+                    Button { Task { await studio.validateQuiz(); showEditorIssues = true } } label: { Image(systemName:"checkmark.circle") }.disabled(studio.checkingQuiz).help("Проверить квиз")
+                }.padding(.horizontal,12).padding(.vertical,7)
+                }
             }
         }.sheet(isPresented:$showQuizTemplateSave) { QuizTemplateSaveView(store:studio.quizTemplates,quiz:studio.quiz,introductionSeconds:studio.introductionSeconds,phoneMode:studio.phoneMode,readBeforeTimer:studio.readBeforeTimer,automaticAdvance:studio.automaticAdvance,signalsEnabled:studio.signalsEnabled) }
         .sheet(isPresented:$showEditorIssues) { PreflightReport(studio:studio) }
+        .sheet(isPresented:$showQuestionSettings) {
+            if let question = studio.selectedQuestion { QuestionSettingsPanel(studio:studio, question:question) }
+            else { ContentUnavailableView("Выберите вопрос",systemImage:"slider.horizontal.3") }
+        }
         .onChange(of: studio.focusEditorSearch) { _, requested in
             if requested { questionSearchFocused = true; studio.focusEditorSearch = false }
         }
+        .onAppear { focusPendingQuestion() }
+        .onChange(of: studio.focusEditorQuestionID) { _, _ in focusPendingQuestion() }
+    }
+    private func focusPendingQuestion() {
+        guard let id = studio.focusEditorQuestionID else { return }
+        for (roundIndex,round) in studio.quiz.rounds.enumerated() {
+            if let questionIndex = round.questions.firstIndex(where: { $0.id == id }) {
+                studio.roundIndex = roundIndex; studio.questionIndex = questionIndex
+                currentView = .question
+                studio.focusEditorQuestionID = nil
+                return
+            }
+        }
+        studio.focusEditorQuestionID = nil
     }
     private func moveQuestion(in round: Int, from question: Int, by offset: Int) {
         let destination = question + offset
@@ -2220,6 +2375,33 @@ struct Editor: View {
         studio.questionIndex = destination
     }
 }
+private struct QuestionSettingsPanel: View {
+    @ObservedObject var studio: Studio
+    let question: Question
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        ScrollView {
+            VStack(alignment:.leading,spacing:16) {
+                Label("Параметры вопроса",systemImage:"slider.horizontal.3").font(.headline)
+                Picker("Тип вопроса",selection:studio.questionBinding(question.id).kind) {
+                    ForEach(Question.kinds,id:\.self) { Text($0) }
+                }
+                VStack(alignment:.leading,spacing:8) {
+                    Text("Темы").font(.caption).foregroundStyle(.secondary)
+                    TextField("Кино, музыка…",text:Binding(get:{ (question.tags ?? []).joined(separator:", ") },set:{ studio.questionBinding(question.id).wrappedValue.tags = Question.cleanTags($0) }))
+                    Text("Сложность").font(.caption).foregroundStyle(.secondary)
+                    Picker("Сложность",selection:Binding(get:{ question.difficulty ?? "Не указана" },set:{ studio.questionBinding(question.id).wrappedValue.difficulty = $0 == "Не указана" ? nil : $0 })) {
+                        ForEach(["Не указана","Лёгкий","Средний","Сложный"],id:\.self) { Text($0) }
+                    }
+                }
+                Stepper("Время: \(question.seconds == 0 ? "без таймера" : "\(question.seconds) сек")",value:studio.questionBinding(question.id).seconds,in:0...600,step:5)
+                ScoringRulesEditor(question:studio.questionBinding(question.id))
+                Button("Готово") { dismiss() }.keyboardShortcut(.defaultAction)
+            }.padding(22)
+        }.frame(minWidth:340,idealWidth:420,minHeight:360)
+    }
+}
+
 struct QuizQuestionTable: View {
     @ObservedObject var studio: Studio
     var filter = ""
@@ -2804,8 +2986,8 @@ struct Welcome: View {
             Button("Продолжить черновик",systemImage:"pencil") { studio.screen = .editor }.buttonStyle(.link).frame(maxWidth:.infinity,alignment:.leading)
             LazyVGrid(columns: [GridItem(.flexible(),spacing: 12),GridItem(.flexible(),spacing: 12)],spacing: 12) {
                 Button { showQuickCreate = true } label: { entry("Создать квиз","Начните с первого вопроса, затем настройте игру","square.and.pencil") }
-                Button { studio.showLibrary() } label: { entry("Мои квизы","Редактируйте проект или подготовьте игру","rectangle.stack") }
-                Button { studio.showLibrary() } label: { entry("Провести игру","Выберите квиз и подготовьте команды","play.rectangle") }
+                Button { studio.showLibrary() } label: { entry("Мои квизы","Редактируйте проекты и управляйте библиотекой","rectangle.stack") }
+                Button { studio.showLibrary(forPlay:true) } label: { entry("Провести игру","Выберите квиз — подготовка начнётся сразу","play.rectangle") }
                 Button { studio.showQuestionBank = true } label: { entry("Банк вопросов","Ищите, импортируйте и собирайте вопросы","tray.full") }
             }.buttonStyle(.plain).frame(maxWidth: 740)
             if geometry.size.height > 800 && !studio.recentQuizzes.isEmpty {
@@ -2949,8 +3131,8 @@ struct QuizLibrary: View {
                 Button("Открыть квиз на Mac…") { studio.open(forPlay: false) }
                 Button("Создать с нуля",systemImage: "plus") { studio.newQuiz() }.buttonStyle(.borderedProminent)
             }
-            Text("Мои квизы").font(.largeTitle.bold())
-            Text("Откройте квиз для редактирования или подготовьте его к игре.").foregroundStyle(.secondary)
+            Text(studio.libraryIntent == .play ? "Выберите квиз для игры" : "Мои квизы").font(.largeTitle.bold())
+            Text(studio.libraryIntent == .play ? "Выберите «Подготовить игру» у нужного квиза, чтобы перейти к командам и настройкам." : "Откройте квиз для редактирования или подготовьте его к игре.").foregroundStyle(.secondary)
             ViewThatFits(in:.horizontal) {
                 HStack {
                     librarySearchField.frame(maxWidth:420)
@@ -3021,7 +3203,7 @@ struct QuizLibrary: View {
                                     Spacer(minLength:8)
                                     readinessLabel(for:summary)
                                     Button("Редактировать",systemImage:"square.and.pencil") { studio.editQuiz(url) }.labelStyle(.iconOnly).help("Редактировать квиз")
-                                    Button("Начать",systemImage:"play.fill") { if studio.load(url) { studio.prepareGame() } }.buttonStyle(.borderedProminent).labelStyle(.iconOnly).help("Начать игру")
+                                    Button(studio.libraryIntent == .play ? "Подготовить" : "Начать",systemImage:"play.fill") { if studio.load(url) { studio.prepareGame() } }.buttonStyle(.borderedProminent).labelStyle(.iconOnly).help(studio.libraryIntent == .play ? "Подготовить игру" : "Начать игру")
                                     quizActions(for:url)
                                 }.padding(.horizontal,12).padding(.vertical,8)
                                     .background(.background,in:RoundedRectangle(cornerRadius:9))
@@ -3069,7 +3251,7 @@ struct QuizLibrary: View {
                                 HStack {
                                     Button("Редактировать",systemImage:"square.and.pencil") { studio.editQuiz(url) }
                                     Spacer()
-                                    Button("Начать",systemImage:"play.fill") { if studio.load(url) { studio.prepareGame() } }.buttonStyle(.borderedProminent)
+                    Button(studio.libraryIntent == .play ? "Подготовить игру" : "Начать",systemImage:"play.fill") { if studio.load(url) { studio.prepareGame() } }.buttonStyle(.borderedProminent)
                                 }
                             }
                             .padding(16).frame(maxWidth:.infinity,alignment:.leading).background(.background,in:RoundedRectangle(cornerRadius:16)).overlay(RoundedRectangle(cornerRadius:16).stroke(.quaternary))
@@ -3170,6 +3352,8 @@ struct TeamSetup: View {
     @State private var preflightComplete = false
     @State private var preflightPassed = false
     @State private var setupStep = 0
+    @State private var soundCheck: Bool?
+    @State private var soundTestPlayed = false
     var validTeamCount: Int { studio.quiz.teams.filter { !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count }
     var body: some View {
         ScrollView { VStack(alignment: .leading,spacing: 20) {
@@ -3179,13 +3363,13 @@ struct TeamSetup: View {
                 Text(studio.quiz.title).font(.title2).foregroundStyle(.secondary)
             }
             HStack(spacing:10) {
-                preparationStep("1 · Формат",detail:studio.phoneMode ? "Телефоны" : "Бланки",ready:true,active:setupStep == 0)
+                Button { setupStep = 0 } label: { preparationStep("1 · Формат",detail:studio.phoneMode ? "Телефоны" : "Бланки",ready:true,active:setupStep == 0) }.buttonStyle(.plain)
                 Image(systemName:"chevron.right").font(.caption2).foregroundStyle(.tertiary)
-                preparationStep("2 · Команды",detail:studio.phoneMode ? "\(studio.phoneRoom.joinedTeams.count) подключено" : "\(validTeamCount) добавлено",ready:studio.phoneMode ? (studio.phoneRoom.running && !studio.phoneRoom.joinedTeams.isEmpty) : validTeamCount > 0,active:setupStep == 1)
+                Button { setupStep = 1 } label: { preparationStep("2 · Команды",detail:studio.phoneMode ? "\(studio.phoneRoom.joinedTeams.count) подключено" : "\(validTeamCount) добавлено",ready:studio.phoneMode ? (studio.phoneRoom.running && !studio.phoneRoom.joinedTeams.isEmpty) : validTeamCount > 0,active:setupStep == 1) }.buttonStyle(.plain)
                 Image(systemName:"chevron.right").font(.caption2).foregroundStyle(.tertiary)
-                preparationStep("3 · Экран и звук",detail:"Сценарий и устройства",ready:true,active:setupStep == 2)
+                Button { setupStep = 2 } label: { preparationStep("3 · Экран и звук",detail:NSScreen.screens.count > 1 ? "Экран: \(NSScreen.screens.indices.contains(studio.selectedScreen) ? NSScreen.screens[studio.selectedScreen].localizedName : "не выбран")" : "Локальный экран Mac",ready:NSScreen.screens.indices.contains(studio.selectedScreen),active:setupStep == 2) }.buttonStyle(.plain)
                 Image(systemName:"chevron.right").font(.caption2).foregroundStyle(.tertiary)
-                preparationStep("4 · Проверка",detail:preflightComplete ? (preflightPassed ? "Пройдена" : "Есть замечания") : "Ожидает",ready:preflightComplete && preflightPassed,active:setupStep == 3)
+                Button { setupStep = 3 } label: { preparationStep("4 · Проверка",detail:preflightComplete ? (preflightPassed ? "Пройдена" : "Есть замечания") : "Не проверено",ready:preflightComplete ? preflightPassed : nil,active:setupStep == 3) }.buttonStyle(.plain)
             }.padding(12).background(.quaternary.opacity(0.55),in:RoundedRectangle(cornerRadius:10))
             if setupStep == 0 { GroupBox {
                 VStack(alignment: .leading,spacing: 10) {
@@ -3225,6 +3409,8 @@ struct TeamSetup: View {
             }
             if setupStep == 2 { GroupBox("Сценарий ведущего") {
                 VStack(alignment: .leading,spacing: 12) {
+                    Text(NSScreen.screens.count < 2 ? "Экран: локальный экран Mac" : "Экран: \(NSScreen.screens.indices.contains(studio.selectedScreen) ? NSScreen.screens[studio.selectedScreen].localizedName : "не выбран")").font(.subheadline)
+                    Button("Настроить экран и звук…") { deviceSettings = true }
                     Picker("Переключение экранов",selection: $studio.automaticAdvance) { Text("Автоматически").tag(true); Text("Вручную").tag(false) }.pickerStyle(.segmented)
                     Text(studio.automaticAdvance ? "По таймеру игра переходит дальше сама. Итоги и экраны без таймера переключает ведущий." : "После таймера экран ждёт команды ведущего.").font(.caption).foregroundStyle(.secondary)
                     Toggle("Сначала прочитать вопрос, потом запустить таймер",isOn: $studio.readBeforeTimer)
@@ -3243,7 +3429,15 @@ struct TeamSetup: View {
                     Text("Готовность к игре").font(.headline)
                     readinessRow("Формат",detail:studio.phoneMode ? "Ответы с телефонов" : "Бумажные бланки",ready:true)
                     readinessRow("Команды",detail:studio.phoneMode ? (studio.phoneRoom.running ? "Подключено: \(studio.phoneRoom.joinedTeams.count)" : "Комната не запущена") : "Добавлено: \(validTeamCount)",ready:studio.phoneMode ? (studio.phoneRoom.running && !studio.phoneRoom.joinedTeams.isEmpty) : validTeamCount > 0)
-                    readinessRow("Квиз",detail:preflightComplete ? (preflightPassed ? "Проверка пройдена" : "Найдены замечания") : "Будет проверен перед запуском",ready:preflightComplete && preflightPassed)
+                    readinessRow("Экран",detail:NSScreen.screens.count < 2 ? "Локальный экран Mac" : (NSScreen.screens.indices.contains(studio.selectedScreen) ? NSScreen.screens[studio.selectedScreen].localizedName : "Не выбран"),ready:NSScreen.screens.indices.contains(studio.selectedScreen))
+                    readinessRow("Звук",detail:soundCheck == true ? "Проверено: звук слышен" : soundCheck == false ? "Проблема: звук не слышен" : soundTestPlayed ? "Сигнал запущен — подтвердите результат" : "Не проверен",ready:soundCheck)
+                    readinessRow("Квиз",detail:preflightComplete ? (preflightPassed ? "Проверка пройдена" : "Найдены замечания") : "Не проверен",ready:preflightComplete ? preflightPassed : nil)
+                    HStack {
+                        Button("Команды") { setupStep = 1 }
+                        Button("Экран и звук…") { deviceSettings = true }
+                        Button("Проверить квиз") { studio.showPreflight = true; Task { await refreshPreflight() } }
+                        Button("Исправить в редакторе") { studio.showPreflight = false; studio.screen = .editor }
+                    }.buttonStyle(.bordered)
                     if studio.checkingQuiz { ProgressView("Проверяем квиз…") }
                     else if !studio.status.isEmpty { Text(studio.status).font(.caption).foregroundStyle(.secondary) }
                     HStack { Spacer(); Button("Проверить и начать игру",systemImage: "play.fill") { studio.beginCheckedGame() }.buttonStyle(.borderedProminent).disabled((!studio.phoneMode && validTeamCount == 0) || studio.checkingQuiz || (studio.phoneMode && (!studio.phoneRoom.running || studio.phoneRoom.joinedTeams.isEmpty))) }
@@ -3256,22 +3450,24 @@ struct TeamSetup: View {
             }
         }.padding(36) }
         .onChange(of: studio.phoneMode) { _,enabled in if !enabled { studio.phoneRoom.stop(); studio.tv?.close(); studio.tv = nil } }
-        .sheet(isPresented: $deviceSettings) { DeviceSettings(studio: studio) }
+        .sheet(isPresented: $deviceSettings) { DeviceSettings(studio: studio,soundCheck:$soundCheck,soundTestPlayed:$soundTestPlayed) }
         .sheet(isPresented: $studio.showPreflight) { PreflightReport(studio: studio) }
         .task { await refreshPreflight() }
         .onChange(of: studio.quiz) { _,_ in preflightComplete = false }
     }
-    func readinessRow(_ title: String,detail: String,ready: Bool) -> some View {
+    func readinessRow(_ title: String,detail: String,ready: Bool?) -> some View {
         HStack(spacing: 10) {
-            Image(systemName: ready ? "checkmark.circle.fill" : "circle.dashed").foregroundStyle(ready ? .green : .secondary)
+            Image(systemName: ready == true ? "checkmark.circle.fill" : ready == false ? "exclamationmark.circle.fill" : "questionmark.circle")
+                .foregroundStyle(ready == true ? Color.green : ready == false ? Color.orange : Color.secondary)
             Text(title).fontWeight(.medium)
             Spacer()
             Text(detail).foregroundStyle(.secondary)
         }.font(.subheadline)
     }
-    func preparationStep(_ title: String,detail: String,ready: Bool,active: Bool) -> some View {
+    func preparationStep(_ title: String,detail: String,ready: Bool?,active: Bool) -> some View {
         HStack(spacing:6) {
-            Image(systemName:ready ? "checkmark.circle.fill" : "circle.dashed").foregroundStyle(ready ? Color.green : Color.secondary)
+            Image(systemName:ready == true ? "checkmark.circle.fill" : ready == false ? "exclamationmark.circle.fill" : "questionmark.circle")
+                .foregroundStyle(ready == true ? Color.green : ready == false ? Color.orange : Color.secondary)
             VStack(alignment:.leading,spacing:2) {
                 Text(title).font(.caption.weight(.semibold))
                 Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
@@ -3548,9 +3744,20 @@ struct PreflightReport: View {
             Text("Проверка перед игрой").font(.title.bold())
             if studio.checkingQuiz { ProgressView("Проверяем вопросы, файлы и границы записей…") }
             else if studio.preflightIssues.isEmpty { Label("Проблем не найдено",systemImage: "checkmark.circle.fill").foregroundStyle(.green) }
-            List(Array(studio.preflightIssues.enumerated()),id: \.offset) { _,issue in Text(issue).foregroundStyle(.orange) }
+            List(Array(studio.preflightIssues.enumerated()),id: \.offset) { _,issue in
+                Button { studio.openPreflightIssue(issue); dismiss() } label: {
+                    HStack(alignment:.top) {
+                        Text(issue).foregroundStyle(.orange).frame(maxWidth:.infinity,alignment:.leading)
+                        Image(systemName:"arrow.up.right.square").foregroundStyle(.secondary).help("Открыть в редакторе")
+                    }.contentShape(Rectangle())
+                }.buttonStyle(.plain)
+            }
             Text("Проверка не заменяет пробный показ на телевизоре. Звук можно проверить в настройках экрана и звука.").font(.caption).foregroundStyle(.secondary)
-            HStack { Button("Проверить снова") { Task { await studio.validateQuiz() } }.disabled(studio.checkingQuiz); Spacer(); Button("Закрыть") { dismiss() } }
+            HStack {
+                Button("Проверить снова") { Task { await studio.validateQuiz() } }.disabled(studio.checkingQuiz)
+                if !studio.preflightIssues.isEmpty { Button("Исправить в редакторе") { studio.screen = .editor; dismiss() } }
+                Spacer(); Button("Закрыть") { dismiss() }
+            }
         }.padding(24).frame(width: 650,height: 450)
     }
 }
@@ -3572,6 +3779,8 @@ struct JumpMenu: View {
 }
 struct DeviceSettings: View {
     @ObservedObject var studio: Studio
+    @Binding var soundCheck: Bool?
+    @Binding var soundTestPlayed: Bool
     @Environment(\.dismiss) var dismiss
     @State private var outputs = AudioOutput.available()
     @State private var testWindow: NSWindow?
@@ -3593,8 +3802,18 @@ struct DeviceSettings: View {
                 Text("Системное по умолчанию").tag("")
                 ForEach(outputs) { Text($0.name).tag($0.id) }
             }
-            HStack { Button("Обновить устройства") { outputs = AudioOutput.available() }; Button("Проверить звук") { studio.signal() } }
-            Text("Выбор применяется к записям, фоновой музыке и сигналам приложения. При отключении устройства выберите другое или системное по умолчанию.").font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Button("Обновить устройства") { outputs = AudioOutput.available() }
+                Button("Проверить звук") { studio.signal(); soundTestPlayed = true; soundCheck = nil }
+            }
+            if soundTestPlayed {
+                HStack {
+                    Text("Вы услышали сигнал?").font(.caption)
+                    Button("Да, слышно") { soundCheck = true }
+                    Button("Нет, звука нет") { soundCheck = false }.tint(.orange)
+                }
+            }
+            Text(NSScreen.screens.count < 2 ? "Используется локальный экран этого Mac." : "Выбранный экран: \(NSScreen.screens.indices.contains(studio.selectedScreen) ? NSScreen.screens[studio.selectedScreen].localizedName : "не выбран"). Выбор применяется к показу игры.").font(.caption).foregroundStyle(.secondary)
             Divider()
             Toggle("Звуковые сигналы начала и окончания обсуждения",isOn: $studio.signalsEnabled)
             HStack { Text("Громкость сигналов"); Slider(value: $studio.signalVolume,in: 0...1); Text("\(Int(studio.signalVolume*100))%") }
