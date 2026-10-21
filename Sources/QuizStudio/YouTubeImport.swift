@@ -136,7 +136,7 @@ enum ImportProcess {
     private var token = UUID()
     let toolsFolder: URL
     init(toolsFolder: URL? = nil) {
-        self.toolsFolder = toolsFolder ?? Bundle.main.resourceURL!.appendingPathComponent("ImportTools")
+        self.toolsFolder = toolsFolder ?? (Bundle.main.resourceURL ?? Bundle.main.bundleURL).appendingPathComponent("ImportTools")
     }
     var available: Bool { ["yt-dlp","deno"].allSatisfy { FileManager.default.isExecutableFile(atPath:toolsFolder.appendingPathComponent($0).path) } }
     func cancel() { token = UUID(); task?.cancel(); task = nil; busy = false; message = "Загрузка отменена" }

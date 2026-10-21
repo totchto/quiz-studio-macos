@@ -87,7 +87,7 @@ struct CategoryQuestionEditor: View {
             ForEach(Array((question.categoryItems ?? []).enumerated()),id:\.element.id) { i,item in
                 HStack {
                     TextField("Элемент \(i+1)",text:Binding(get:{ question.categoryItems?[i].text ?? "" },set:{ question.categoryItems?[i].text=$0 }))
-                    Picker("Категория",selection:Binding(get:{ question.categoryItems?[i].category ?? 0 },set:{ question.categoryItems?[i].category=$0 })) { ForEach((question.categoryGroups ?? []).indices,id:\.self) { n in Text(question.categoryGroups?[n].isEmpty == false ? question.categoryGroups![n] : "Категория \(n+1)").tag(n) } }.frame(width:220)
+                    Picker("Категория",selection:Binding(get:{ question.categoryItems?[i].category ?? 0 },set:{ question.categoryItems?[i].category=$0 })) { ForEach((question.categoryGroups ?? []).indices,id:\.self) { n in let groups=question.categoryGroups ?? []; Text(groups[n].isEmpty ? "Категория \(n+1)" : groups[n]).tag(n) } }.frame(width:220)
                     Button("Удалить") { question.categoryItems?.remove(at:i) }.disabled((question.categoryItems?.count ?? 0)<=2)
                 }
             }
@@ -95,8 +95,11 @@ struct CategoryQuestionEditor: View {
         }
     }
     private func removeGroup(_ index:Int) {
-        question.categoryGroups?.remove(at:index)
-        for i in (question.categoryItems ?? []).indices { if question.categoryItems![i].category == index { question.categoryItems![i].category=0 } else if question.categoryItems![i].category > index { question.categoryItems![i].category -= 1 } }
+        guard var groups=question.categoryGroups,groups.indices.contains(index) else { return }
+        groups.remove(at:index);question.categoryGroups=groups
+        var items=question.categoryItems ?? []
+        for i in items.indices { if items[i].category == index { items[i].category=0 } else if items[i].category > index { items[i].category -= 1 } }
+        question.categoryItems=items
     }
 }
 

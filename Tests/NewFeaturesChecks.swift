@@ -26,6 +26,13 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   var wager=numeric;wager.correctPoints=1;wager.wrongPoints=0;wager.wagerEnabled=true;wager.wagerCorrectPoints=2;wager.wagerWrongPoints = -2
   assert(wager.awardedPoints(correct:true,wagered:false)==1 && wager.awardedPoints(correct:false,wagered:false)==0 && wager.awardedPoints(correct:true,wagered:true)==2 && wager.awardedPoints(correct:false,wagered:true) == -2)
   var category=Question();category.text="Распределите";category.kind="Категоризация";category.partialPoints=0.5;category.categoryGroups=["Животные","Растения"];category.categoryItems=[CategoryItem(text:"Кот",category:0),CategoryItem(text:"Дуб",category:1),CategoryItem(text:"Пёс",category:0)]
+  assert(category.extraAnswer == "Кот — Животные\nДуб — Растения\nПёс — Животные")
+  var incompleteCategory=category;incompleteCategory.categoryGroups=nil
+  assert(incompleteCategory.extraAnswer == "Кот — \nДуб — \nПёс — ")
+  incompleteCategory.categoryGroups=[]
+  assert(incompleteCategory.extraAnswer == "Кот — \nДуб — \nПёс — ")
+  incompleteCategory.categoryGroups=["Животные"]
+  assert(incompleteCategory.extraAnswer == "Кот — Животные\nДуб — \nПёс — Животные")
   let categoryOrder=category.displayedCategoryItems,categoryExact=Dictionary(uniqueKeysWithValues:categoryOrder.enumerated().map{(String($0.offset),$0.element.category)})
   let categoryExactGrade=try category.gradeExtra(["categories":categoryExact]);assert(category.issues.isEmpty && categoryExactGrade?.points==1)
   var categoryPartial=categoryExact;categoryPartial["0"]=categoryPartial["0"]==0 ? 1:0;let categoryPartialGrade=try category.gradeExtra(["categories":categoryPartial]);assert(categoryPartialGrade?.points==2)

@@ -1262,7 +1262,11 @@ struct AudioOutput: Identifiable {
         var size: UInt32 = 0
         guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject),&address,0,nil,&size) == noErr else { return [] }
         var devices = [AudioDeviceID](repeating: 0,count: Int(size)/MemoryLayout<AudioDeviceID>.size)
-        let result = devices.withUnsafeMutableBytes { AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),&address,0,nil,&size,$0.baseAddress!) }
+        guard !devices.isEmpty else { return [] }
+        let result = devices.withUnsafeMutableBytes { buffer in
+            guard let baseAddress=buffer.baseAddress else { return kAudioHardwareBadPropertySizeError }
+            return AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),&address,0,nil,&size,baseAddress)
+        }
         guard result == noErr else { return [] }
         return devices.compactMap { device in
             var channels = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration,mScope: kAudioDevicePropertyScopeOutput,mElement: kAudioObjectPropertyElementMain)
@@ -2906,7 +2910,7 @@ struct Stage: View {
                                 }
                                 if q.kind == "Порядок событий" { VStack(alignment:.leading,spacing:6) { ForEach(Array((s.kind == .answer ? q.sequenceItems ?? [] : q.displayedSequence).enumerated()),id:\.element.id) { i,item in Text("\(s.kind == .answer ? String(i+1) : MatchLayout.letter(i)). \(item.text)").font(studio.stageFont(size:min(24,CGFloat(220/max(2,q.sequenceItems?.count ?? 2))))).foregroundStyle(s.kind == .answer ? .green : .white).lineLimit(2).minimumScaleFactor(0.7) } } }
                                 if q.kind == "Категоризация" {
-                                    if s.kind == .answer { HStack(alignment:.top,spacing:14) { ForEach((q.categoryGroups ?? []).indices,id:\.self) { group in VStack { Text(q.categoryGroups![group]).bold().foregroundStyle(.green);ForEach((q.categoryItems ?? []).filter{$0.category==group}) { Text($0.text).font(studio.stageFont(size:20)) } }.padding().frame(maxWidth:.infinity).background(.white.opacity(0.08),in:RoundedRectangle(cornerRadius:12)) } } }
+                                    if s.kind == .answer { HStack(alignment:.top,spacing:14) { ForEach((q.categoryGroups ?? []).indices,id:\.self) { group in let groups=q.categoryGroups ?? []; if groups.indices.contains(group) { VStack { Text(groups[group]).bold().foregroundStyle(.green);ForEach((q.categoryItems ?? []).filter{$0.category==group}) { Text($0.text).font(studio.stageFont(size:20)) } }.padding().frame(maxWidth:.infinity).background(.white.opacity(0.08),in:RoundedRectangle(cornerRadius:12)) } } } }
                                     else { VStack(alignment:.leading) { ForEach(Array(q.displayedCategoryItems.enumerated()),id:\.element.id) { i,item in Text("\(MatchLayout.letter(i)). \(item.text)").font(studio.stageFont(size:22)) };Text("Категории: \((q.categoryGroups ?? []).joined(separator:" · "))").foregroundStyle(.orange) } }
                                 }
                                 if s.kind == .answer,q.kind == "Один из четырёх",let choice=q.selectedChoice,let images=q.choiceImages,images.indices.contains(choice),let name=images[choice],let url=studio.asset(name) { QuizImage(url:url).frame(height:geometry.size.height*0.28) }
@@ -3871,7 +3875,7 @@ extension Studio {
         }
         if answers {
             for round in quiz.rounds { for (i,q) in round.questions.enumerated() {
-                let correct = q.kind == "Сопоставление" && q.matchPairs != nil ? q.matchPairs!.map { $0.left + " — " + $0.right }.joined(separator: "\n") : q.correctAnswer
+                let correct = q.kind == "Сопоставление" ? (q.matchPairs ?? []).map { $0.left + " — " + $0.right }.joined(separator: "\n") : q.correctAnswer
                 // Split long content to preserve every character on printed pages.
                 let text = q.text + "\n\nОтвет:\n" + correct + "\n\nОбъяснение:\n" + (q.explanation ?? "")
                 var chunks: [String] = []; var rest = text as NSString

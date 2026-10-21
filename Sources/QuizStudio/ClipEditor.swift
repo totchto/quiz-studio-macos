@@ -92,8 +92,12 @@ struct WaveformData {
                 if Task.isCancelled { reader.cancelReading(); throw CancellationError() }
                 guard let block = CMSampleBufferGetDataBuffer(sample) else { return }
                 let bytes = CMBlockBufferGetDataLength(block)
+                guard bytes >= MemoryLayout<Float>.size else { return }
                 var data = [Float](repeating:0,count:bytes/4)
-                let status = data.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block,atOffset:0,dataLength:bytes,destination:$0.baseAddress!) }
+                let status = data.withUnsafeMutableBytes { buffer in
+                    guard let baseAddress=buffer.baseAddress else { return kCMBlockBufferBadLengthParameterErr }
+                    return CMBlockBufferCopyDataBytes(block,atOffset:0,dataLength:bytes,destination:baseAddress)
+                }
                 guard status == kCMBlockBufferNoErr else { return }
                 let start = CMSampleBufferGetPresentationTimeStamp(sample).seconds
                 let span = CMSampleBufferGetDuration(sample).seconds

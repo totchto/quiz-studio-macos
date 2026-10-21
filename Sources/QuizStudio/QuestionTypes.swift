@@ -12,7 +12,12 @@ extension Question {
             return Self.numberText(value)+(tolerance > 0 ? " ± "+Self.numberText(tolerance) : "")
         case "Порядок событий": return (sequenceItems ?? []).enumerated().map { "\($0.offset+1). \($0.element.text)" }.joined(separator:"\n")
         case "Несколько вариантов": return (correctChoices ?? []).sorted().compactMap { choices.indices.contains($0) ? choices[$0] : nil }.joined(separator:"; ")
-        case "Категоризация": return (categoryItems ?? []).map { item in item.text+" — "+((categoryGroups ?? []).indices.contains(item.category) ? categoryGroups![item.category] : "") }.joined(separator:"\n")
+        case "Категоризация":
+            let groups = categoryGroups ?? []
+            return (categoryItems ?? []).map { item in
+                let name = groups.indices.contains(item.category) ? groups[item.category] : ""
+                return item.text + " — " + name
+            }.joined(separator:"\n")
         default: return nil
         }
     }
