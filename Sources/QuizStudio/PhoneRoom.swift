@@ -221,7 +221,7 @@ struct PhoneRecovery: Codable {
         }
         if request.method == "GET",request.path.hasPrefix(base+"/asset/") {
             let name=String(request.path.dropFirst((base+"/asset/").count));let allowed=Set(studio.currentQuestion?.choiceImages?.compactMap{$0} ?? [])
-            guard name == (name as NSString).lastPathComponent,allowed.contains(name),let url=studio.asset(name),let data=try? Data(contentsOf:url),data.count<=12_000_000 else { return .json(["error":"Изображение не найдено"],status:404) }
+            guard !name.isEmpty,name == (name as NSString).lastPathComponent,!name.contains("\\"),!name.contains("%"),allowed.contains(name),let url=studio.asset(name),url.lastPathComponent == name,let data=try? Data(contentsOf:url),data.count<=12_000_000 else { return .json(["error":"Изображение не найдено"],status:404) }
             let ext=url.pathExtension.lowercased(),type=ext=="png" ? "image/png" : ext=="webp" ? "image/webp" : "image/jpeg";return LANResponse(type:type,data:data)
         }
         let object = (try? JSONSerialization.jsonObject(with:request.body)) as? [String:Any] ?? [:]
@@ -276,13 +276,19 @@ struct PhoneRecovery: Codable {
                 let right=n == correct;points = q.awardedPoints(correct:right,wagered:wagered);outcome=right ? "correct":"wrong"
             } else if q.kind == "Сопоставление", let pairs = q.matchPairs, let layout = studio.matchLayouts[q.id] {
                 let matches = payload["matches"] as? [String:String] ?? [:]
-                guard matches.count == pairs.count, Set(matches.values).count == pairs.count else { return .json(["error":"Сопоставьте все пары, без повторений"],status:400) }
+                let expectedKeys = Set(layout.left.indices.map { "l\($0)" })
+                guard layout.left.count == pairs.count, layout.right.count == pairs.count,
+                      matches.count == pairs.count, Set(matches.keys) == expectedKeys,
+                      Set(matches.values).count == pairs.count else { return .json(["error":"Сопоставьте все пары, без повторений"],status:400) }
                 var allCorrect = true; var lines: [String] = []
+                var correctCount = 0
                 for (i,leftID) in layout.left.enumerated() {
-                    guard let raw = matches["l\(i)"], raw.hasPrefix("r"), let j = Int(raw.dropFirst()), layout.right.indices.contains(j), let left = pairs.first(where: { $0.id == leftID }), let right = pairs.first(where: { $0.id == layout.right[j] }) else { return .json(["error":"Неверная пара"],status:400) }
-                    allCorrect = allCorrect && leftID == layout.right[j]; lines.append(left.left + " — " + right.right)
+                    guard let raw = matches["l\(i)"], raw.hasPrefix("r"), let j = Int(raw.dropFirst()), "r\(j)" == raw, layout.right.indices.contains(j), let left = pairs.first(where: { $0.id == leftID }), let right = pairs.first(where: { $0.id == layout.right[j] }) else { return .json(["error":"Неверная пара"],status:400) }
+                    let correct = leftID == layout.right[j]
+                    allCorrect = allCorrect && correct
+                    if correct { correctCount += 1 }
+                    lines.append(left.left + " — " + right.right)
                 }
-                let correctCount=lines.enumerated().filter { layout.left[$0.offset] == layout.right[Int(matches["l\($0.offset)"]!.dropFirst())!] }.count
                 display = lines.joined(separator:"\n"); points = allCorrect ? q.awardedPoints(correct:true,wagered:wagered) : correctCount>0 ? (q.partialPoints ?? q.awardedPoints(correct:false,wagered:wagered)) : q.awardedPoints(correct:false,wagered:wagered);outcome=allCorrect ? "correct" : correctCount>0 && q.partialPoints != nil ? "partial":"wrong"
             } else {
                 let text = (payload["text"] as? String ?? "").trimmingCharacters(in:.whitespacesAndNewlines)

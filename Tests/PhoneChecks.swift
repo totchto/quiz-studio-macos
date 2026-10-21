@@ -92,6 +92,13 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
         assert(app.phoneRoom.answers.first { $0.teamID == app.quiz.teams[0].id && $0.questionID == matching.id }!.points == 1)
         assert(app.phoneRoom.answers.first { $0.teamID == app.quiz.teams[1].id && $0.questionID == matching.id }!.points == 0)
         let missing = try await call("/answer",token:tokens[2],body:["question":matchEpoch,"answer":["matches":["l0":"r0"]]]); assert(missing.0 == 400)
+        let empty = try await call("/answer",token:tokens[3],body:["question":matchEpoch,"answer":["matches":[:] as [String:String]]]); assert(empty.0 == 400)
+        var extra = correct; extra["l99"] = "r0"
+        let extraKey = try await call("/answer",token:tokens[4],body:["question":matchEpoch,"answer":["matches":extra]]); assert(extraKey.0 == 400)
+        var badRight = correct; badRight["l0"] = "r99"
+        let invalidRight = try await call("/answer",token:tokens[5],body:["question":matchEpoch,"answer":["matches":badRight]]); assert(invalidRight.0 == 400)
+        var wrongKey = correct; wrongKey.removeValue(forKey:"l0"); wrongKey["l99"] = "r0"
+        let invalidLeft = try await call("/answer",token:tokens[6],body:["question":matchEpoch,"answer":["matches":wrongKey]]); assert(invalidLeft.0 == 400)
         let publicMatching = String(data:try JSONSerialization.data(withJSONObject:matchState.1),encoding:.utf8)!
         assert(!(matching.matchPairs ?? []).contains { publicMatching.contains($0.id.uuidString) })
         app.jump(to:app.steps.firstIndex { $0.kind == .question && $0.question == 2 }!); app.startQuestionTimer()
