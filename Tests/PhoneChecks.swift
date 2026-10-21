@@ -99,6 +99,13 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
         let invalidRight = try await call("/answer",token:tokens[5],body:["question":matchEpoch,"answer":["matches":badRight]]); assert(invalidRight.0 == 400)
         var wrongKey = correct; wrongKey.removeValue(forKey:"l0"); wrongKey["l99"] = "r0"
         let invalidLeft = try await call("/answer",token:tokens[6],body:["question":matchEpoch,"answer":["matches":wrongKey]]); assert(invalidLeft.0 == 400)
+        var paddedRight = correct; paddedRight["l0"] = "r0" + String(repeating:"0",count:1)
+        let nonCanonicalRight = try await call("/answer",token:tokens[7],body:["question":matchEpoch,"answer":["matches":paddedRight]]); assert(nonCanonicalRight.0 == 400)
+        var signedRight = correct; signedRight["l0"] = "r+0"
+        let signedIndex = try await call("/answer",token:tokens[8],body:["question":matchEpoch,"answer":["matches":signedRight]]); assert(signedIndex.0 == 400)
+        let reordered = Dictionary(uniqueKeysWithValues:correct.sorted { $0.key > $1.key })
+        let reorderedAnswer = try await call("/answer",token:tokens[9],body:["question":matchEpoch,"answer":["matches":reordered]])
+        assert(reorderedAnswer.0 == 200)
         let publicMatching = String(data:try JSONSerialization.data(withJSONObject:matchState.1),encoding:.utf8)!
         assert(!(matching.matchPairs ?? []).contains { publicMatching.contains($0.id.uuidString) })
         app.jump(to:app.steps.firstIndex { $0.kind == .question && $0.question == 2 }!); app.startQuestionTimer()
