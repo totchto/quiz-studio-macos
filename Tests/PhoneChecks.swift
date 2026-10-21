@@ -26,6 +26,11 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
         assert(decodedQR.contains(app.phoneRoom.address!))
         let port = app.phoneRoom.port; let path = "/"+app.phoneRoom.roomKey
         let origin = "http://127.0.0.1:\(port)"
+        for rawPath in [path+"/asset/%2e%2e%2foutside.png",path+"/asset/../outside.png",path+"/asset/%5coutside.png"] {
+            let requestData=Data("GET \(rawPath) HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\n\r\n".utf8)
+            let parsed=try LANRequest.parse(requestData)!
+            assert(app.phoneRoom.handle(parsed).status == 404)
+        }
         if CommandLine.arguments.count > 1 {
             let marker = URL(fileURLWithPath:CommandLine.arguments[1])
             try (origin+path+"/").write(to:marker,atomically:true,encoding:.utf8)

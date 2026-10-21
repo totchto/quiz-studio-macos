@@ -220,8 +220,13 @@ struct PhoneRecovery: Codable {
             return LANResponse(type:"text/html; charset=utf-8",data:Data(Self.page.utf8))
         }
         if request.method == "GET",request.path.hasPrefix(base+"/asset/") {
-            let name=String(request.path.dropFirst((base+"/asset/").count));let allowed=Set(studio.currentQuestion?.choiceImages?.compactMap{$0} ?? [])
-            guard !name.isEmpty,name == (name as NSString).lastPathComponent,!name.contains("\\"),!name.contains("%"),allowed.contains(name),let url=studio.asset(name),url.lastPathComponent == name,let data=try? Data(contentsOf:url),data.count<=12_000_000 else { return .json(["error":"Изображение не найдено"],status:404) }
+            let rawName=String(request.path.dropFirst((base+"/asset/").count))
+            guard let name=rawName.removingPercentEncoding,name == rawName,name.range(of:"^[A-Za-z0-9._-]{1,255}$",options:.regularExpression) != nil,name != ".",name != ".." else { return .json(["error":"Изображение не найдено"],status:404) }
+            let allowed=Set(studio.currentQuestion?.choiceImages?.compactMap{$0} ?? [])
+            guard allowed.contains(name),let url=studio.asset(name),let folder=studio.folder else { return .json(["error":"Изображение не найдено"],status:404) }
+            let mediaRoot=folder.appendingPathComponent("Media",isDirectory:true).standardizedFileURL
+            let fileURL=url.standardizedFileURL
+            guard fileURL.deletingLastPathComponent() == mediaRoot,let data=try? Data(contentsOf:fileURL),data.count<=12_000_000 else { return .json(["error":"Изображение не найдено"],status:404) }
             let ext=url.pathExtension.lowercased(),type=ext=="png" ? "image/png" : ext=="webp" ? "image/webp" : "image/jpeg";return LANResponse(type:type,data:data)
         }
         let object = (try? JSONSerialization.jsonObject(with:request.body)) as? [String:Any] ?? [:]
