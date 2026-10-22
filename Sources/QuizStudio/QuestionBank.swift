@@ -29,19 +29,34 @@ struct BankRecord: Codable { var entry: BankEntry; var assets: [String:Data] }
         self.root = root
         do {
             guard FileManager.default.fileExists(atPath:root.path) else { return }
+            var failures: [String] = []
             for url in try FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:nil) where url.pathExtension == "bankitem" {
                 do {
                     var entry = try JSONDecoder().decode(BankRecord.self,from:Data(contentsOf:url)).entry
                     if entry.question.tags == nil, let theme = entry.question.hostNotes?.components(separatedBy:"\n").first(where:{ $0.hasPrefix("Импорт .siq · Тема: ") }) { entry.question.tags = [String(theme.dropFirst("Импорт .siq · Тема: ".count))] }
                     entries.append(entry)
                 }
-                catch { message = "Не удалось прочитать некоторые записи банка. Файлы сохранены: " + error.localizedDescription }
+                catch { failures.append("\(url.lastPathComponent): \(error.localizedDescription)") }
             }
             entries.sort { $0.updated > $1.updated }
+            if !failures.isEmpty { message = "Не удалось загрузить записи банка (файлы сохранены):\n" + failures.joined(separator:"\n") }
         } catch { message = error.localizedDescription }
     }
     func record(_ entry: BankEntry) throws -> BankRecord {
         try JSONDecoder().decode(BankRecord.self,from:Data(contentsOf:root.appendingPathComponent(entry.id.uuidString+".bankitem")))
+    }
+    @discardableResult func saveDraftQuestion(_ question: Question,existing: BankEntry? = nil,origin: String? = nil,originKey: String? = nil) throws -> BankEntry {
+        guard question.bankAssets.isEmpty else { throw SIQError(message:"Черновик с медиа нельзя сохранить без медиафайлов.") }
+        return try save(question,assets:[:],existing:existing,origin:origin,originKey:originKey)
+    }
+    @discardableResult func saveQuestionWithAssets(_ question: Question,assets: [String:Data],existing: BankEntry? = nil,origin: String? = nil,originKey: String? = nil) throws -> BankEntry {
+        try rejectQuestionWithoutAssets(question,assets:assets)
+        return try save(question,assets:assets,existing:existing,origin:origin,originKey:originKey)
+    }
+    func rejectQuestionWithoutAssets(_ question: Question,assets: [String:Data]) throws {
+        guard question.bankAssets.allSatisfy({ assets[$0] != nil }) else {
+            throw SIQError(message:"Не удалось сохранить вопрос: отсутствует медиафайл.")
+        }
     }
     @discardableResult func save(_ question: Question,assets: [String:Data],existing: BankEntry? = nil,origin: String? = nil,originKey: String? = nil) throws -> BankEntry {
         let names = question.bankAssets
@@ -67,7 +82,7 @@ struct BankRecord: Codable { var entry: BankEntry; var assets: [String:Data] }
         for round in result.quiz.rounds { for q in round.questions {
             let key = result.sourceFingerprint+"/\(ordinal)"; ordinal += 1
             guard !known.contains(key) else { continue }
-            _ = try save(q,assets:result.assets,origin:result.quiz.title+" · "+round.title,originKey:key); added += 1
+            _ = try saveQuestionWithAssets(q,assets:result.assets,origin:result.quiz.title+" · "+round.title,originKey:key); added += 1
         } }
         message = "Добавлено в банк: \(added). Уже сохранённые вопросы пропущены."
         return added
@@ -81,7 +96,7 @@ extension Studio {
     }
     func saveSelectedToBank() {
         guard let q = selectedQuestion else { return }
-        do { let entry = try questionBank.save(q,assets:bankQuestionAssets(q),origin:quiz.title); questionBinding(q.id).wrappedValue.bankEntryID = entry.id; status = "Вопрос сохранён в банк" }
+        do { let entry = try questionBank.saveQuestionWithAssets(q,assets:bankQuestionAssets(q),origin:quiz.title); questionBinding(q.id).wrappedValue.bankEntryID = entry.id; status = "Вопрос сохранён в банк" }
         catch { status = "Ошибка банка: "+error.localizedDescription }
     }
     func copyBankQuestions(_ entries: [BankEntry]) throws -> (questions:[Question],folder:URL) {
@@ -89,29 +104,61 @@ extension Studio {
         var questions: [Question] = []
         let workspace = folder ?? FileManager.default.temporaryDirectory.appendingPathComponent("QuizStudio-Bank-"+UUID().uuidString)
         let mediaFolder = workspace.appendingPathComponent("Media")
-        try FileManager.default.createDirectory(at:mediaFolder,withIntermediateDirectories:true)
-        for entry in entries {
+        let records = try entries.map { entry -> BankRecord in
             let record = try questionBank.record(entry)
-            var mapping: [String:String] = [:]
-            for name in record.entry.question.bankAssets {
-                guard let data = record.assets[name] else { throw CocoaError(.fileNoSuchFile) }
-                let ext = (name as NSString).pathExtension
-                let newName = UUID().uuidString+(ext.isEmpty ? "" : "."+ext)
-                try data.write(to:mediaFolder.appendingPathComponent(newName),options:.atomic); mapping[name] = newName
+            guard record.entry.question.bankAssets.allSatisfy({ record.assets[$0] != nil }) else {
+                throw SIQError(message:"У записи банка отсутствует медиафайл.")
             }
-            var q = record.entry.question
-            q.image = q.image.map { mapping[$0] ?? $0 }; q.media = q.media.map { mapping[$0] ?? $0 }
-            q.explanationImage = q.explanationImage.map { mapping[$0] ?? $0 }; q.explanationMedia = q.explanationMedia.map { mapping[$0] ?? $0 }
-            q.imageGallery = q.imageGallery?.map { mapping[$0] ?? $0 }; q.explanationGallery = q.explanationGallery?.map { mapping[$0] ?? $0 }
-            q.choiceImages = q.choiceImages?.map { $0.map { mapping[$0] ?? $0 } }
-            q.siqAttachments = q.siqAttachments?.map { item in var copy = item; copy.name = mapping[item.name] ?? item.name; return copy }
-            q.id = UUID(); q.bankEntryID = entry.id
-            q.sequenceItems = q.sequenceItems?.map { item in var copy = item; copy.id = UUID(); return copy }
-            q.matchPairs = q.matchPairs?.map { pair in var copy = pair; copy.id = UUID(); return copy }
-            q.siqAttachments = q.siqAttachments?.map { item in var copy = item; copy.id = UUID(); return copy }
-            questions.append(q)
+            return record
         }
-        return (questions,workspace)
+        let ownsWorkspace = folder == nil
+        let workspaceExisted = FileManager.default.fileExists(atPath:workspace.path)
+        let mediaFolderExisted = FileManager.default.fileExists(atPath:mediaFolder.path)
+        let staging = FileManager.default.temporaryDirectory.appendingPathComponent("QuizStudio-Bank-Staging-"+UUID().uuidString)
+        var committedFiles: [URL] = []
+        do {
+            let stagedMedia = staging.appendingPathComponent("Media")
+            try FileManager.default.createDirectory(at:stagedMedia,withIntermediateDirectories:true)
+            for record in records {
+                var mapping: [String:String] = [:]
+                for name in record.entry.question.bankAssets {
+                    guard let data = record.assets[name] else { throw SIQError(message:"У записи банка отсутствует медиафайл.") }
+                    let ext = (name as NSString).pathExtension
+                    let newName = UUID().uuidString+(ext.isEmpty ? "" : "."+ext)
+                    try data.write(to:stagedMedia.appendingPathComponent(newName),options:.atomic)
+                    mapping[name] = newName
+                }
+                var q = record.entry.question
+                q.image = q.image.map { mapping[$0] ?? $0 }; q.media = q.media.map { mapping[$0] ?? $0 }
+                q.explanationImage = q.explanationImage.map { mapping[$0] ?? $0 }; q.explanationMedia = q.explanationMedia.map { mapping[$0] ?? $0 }
+                q.imageGallery = q.imageGallery?.map { mapping[$0] ?? $0 }; q.explanationGallery = q.explanationGallery?.map { mapping[$0] ?? $0 }
+                q.choiceImages = q.choiceImages?.map { $0.map { mapping[$0] ?? $0 } }
+                q.siqAttachments = q.siqAttachments?.map { item in var copy = item; copy.name = mapping[item.name] ?? item.name; return copy }
+                q.id = UUID(); q.bankEntryID = record.entry.id
+                q.sequenceItems = q.sequenceItems?.map { item in var copy = item; copy.id = UUID(); return copy }
+                q.matchPairs = q.matchPairs?.map { pair in var copy = pair; copy.id = UUID(); return copy }
+                q.siqAttachments = q.siqAttachments?.map { item in var copy = item; copy.id = UUID(); return copy }
+                questions.append(q)
+            }
+            if ownsWorkspace {
+                try FileManager.default.moveItem(at:staging,to:workspace)
+            } else {
+                try FileManager.default.createDirectory(at:mediaFolder,withIntermediateDirectories:true)
+                for url in try FileManager.default.contentsOfDirectory(at:stagedMedia,includingPropertiesForKeys:nil) {
+                    let destination = mediaFolder.appendingPathComponent(url.lastPathComponent)
+                    try FileManager.default.moveItem(at:url,to:destination)
+                    committedFiles.append(destination)
+                }
+                try FileManager.default.removeItem(at:staging)
+            }
+            return (questions,workspace)
+        } catch {
+            try? FileManager.default.removeItem(at:staging)
+            committedFiles.forEach { try? FileManager.default.removeItem(at:$0) }
+            if !mediaFolderExisted { try? FileManager.default.removeItem(at:mediaFolder) }
+            if !workspaceExisted { try? FileManager.default.removeItem(at:workspace) }
+            throw error
+        }
     }
     func insertBankQuestions(_ entries: [BankEntry]) throws {
         guard quiz.rounds.indices.contains(roundIndex) else { throw SIQError(message:"Сначала создайте раунд.") }

@@ -221,15 +221,27 @@ enum QuestionTextImport {
 }
 extension QuestionBank {
     func importQuestions(_ questions: [Question],origin: String) throws -> (entries:[BankEntry],added:Int) {
+        guard questions.allSatisfy({ $0.bankAssets.isEmpty }) else {
+            throw SIQError(message:"Импорт вопросов с медиафайлами не поддерживается. Импортируйте их из исходного пакета с медиа.")
+        }
         var known = Dictionary(entries.compactMap { e in e.originKey.map { ($0,e) } },uniquingKeysWith:{ first,_ in first })
         var selected: [BankEntry] = []; var added = 0
         for q in questions {
-            var canonical = q; canonical.id = UUID(uuidString:"00000000-0000-0000-0000-000000000000")!; canonical.bankEntryID = nil
+            var canonical = q
+            canonical.id = UUID(uuidString:"00000000-0000-0000-0000-000000000000")!
+            canonical.bankEntryID = nil
+            canonical.editorialReviewStatus = nil
+            canonical.editorialReviewNote = nil
             canonical.sequenceItems = canonical.sequenceItems?.map { item in var copy = item; copy.id = canonical.id; return copy }
+            canonical.matchPairs = canonical.matchPairs?.map { pair in var copy = pair; copy.id = canonical.id; return copy }
+            canonical.siqAttachments = canonical.siqAttachments?.map { attachment in var copy = attachment; copy.id = canonical.id; return copy }
+            canonical.questionImageMasks = canonical.questionImageMasks?.map { mask in var copy = mask; copy.id = canonical.id; return copy }
+            canonical.answerImageMasks = canonical.answerImageMasks?.map { mask in var copy = mask; copy.id = canonical.id; return copy }
+            canonical.categoryItems = canonical.categoryItems?.map { item in var copy = item; copy.id = canonical.id; return copy }
             let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
             let key = "bulk:"+SHA256.hash(data:try encoder.encode(canonical)).map { String(format:"%02x",$0) }.joined()
             if let old = known[key] { if !selected.contains(where:{ $0.id == old.id }) { selected.append(old) }; continue }
-            let entry = try save(q,assets:[:],origin:origin,originKey:key); known[key] = entry; selected.append(entry); added += 1
+            let entry = try saveDraftQuestion(q,origin:origin,originKey:key); known[key] = entry; selected.append(entry); added += 1
         }
         return (selected,added)
     }

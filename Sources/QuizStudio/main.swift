@@ -2084,7 +2084,7 @@ struct BankQuestionEditor: View {
         VStack(alignment:.leading,spacing:12) {
             HStack { Text(entry == nil ? "Новая идея для вопроса" : "Редактирование вопроса банка").font(.title2.bold()); Spacer(); Button("Отмена") { dismiss() }; Button("Сохранить в банк") {
                 guard let q = session.selectedQuestion else { return }
-                do { _ = try bank.save(q,assets:session.bankQuestionAssets(q),existing:entry); dismiss() } catch { self.error = error.localizedDescription }
+                do { _ = try bank.saveQuestionWithAssets(q,assets:session.bankQuestionAssets(q),existing:entry); dismiss() } catch { self.error = error.localizedDescription }
             }.buttonStyle(.borderedProminent).disabled(session.status.hasPrefix("Не удалось открыть")) }
             Text("Можно сохранить незаполненную идею и вернуться к ней позже. Категории определятся по типу вопроса и медиа.").font(.caption).foregroundStyle(.secondary)
             if let error { Text(error).foregroundStyle(.red) }
