@@ -173,6 +173,20 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   reloadedLibrary.remember(libraryFile); assert(reloadedLibrary.recentQuizzes.count == 1)
   reloadedLibrary.showLibrary(); assert(reloadedLibrary.screen == .createLibrary)
   reloadedLibrary.newQuiz(); assert(reloadedLibrary.screen == .editor && reloadedLibrary.documentURL == nil && reloadedLibrary.quiz.title == "Новый квиз")
+  let appSupport=FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent("QuizStudio")
+  let seedDraft=appSupport.appendingPathComponent("ActiveDraftCheck-"+UUID().uuidString+".workspace")
+  let activeSuite="QuizStudioActiveDraft-"+UUID().uuidString
+  let activeDefaults=UserDefaults(suiteName:activeSuite)!
+  var createdActivePath:String?
+  defer { activeDefaults.removePersistentDomain(forName:activeSuite); try? FileManager.default.removeItem(at:seedDraft); if let path=createdActivePath { try? FileManager.default.removeItem(atPath:path) } }
+  let nextLaunch=Studio(draftURL:seedDraft,libraryDefaults:activeDefaults,nearbyFolder:libraryFolder); nextLaunch.timer?.invalidate(); nextLaunch.newQuiz()
+  let activeDraftPath = activeDefaults.string(forKey:"ActiveDraftWorkspace")!
+  createdActivePath=activeDraftPath
+  assert(nextLaunch.draft.path == activeDraftPath && nextLaunch.quiz.title == "Новый квиз")
+  nextLaunch.quiz.rounds[0].questions[0].text="Черновик после запуска"; nextLaunch.autosave(); nextLaunch.flushAutosave { _ in }
+  for _ in 0..<100 { if let saved=try? Data(contentsOf:nextLaunch.draft.appendingPathComponent("quiz.json")), let decoded=try? JSONDecoder().decode(Quiz.self,from:saved), decoded.rounds[0].questions[0].text=="Черновик после запуска" { break }; Thread.sleep(forTimeInterval:0.02) }
+  let nextProcess = Studio(libraryDefaults:activeDefaults,nearbyFolder:libraryFolder); nextProcess.timer?.invalidate()
+  assert(nextProcess.draft.path == activeDraftPath && nextProcess.quiz.rounds[0].questions[0].text == "Черновик после запуска")
   print("PASS: creation library, open for editing, non-destructive removal, hidden discovery after restart, explicit restore, duplicate prevention, play library and new blank quiz")
 
 

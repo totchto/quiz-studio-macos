@@ -52,6 +52,14 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   restored.quiz.teams[0].scores=[roundID:99];assert(paper.teams[0].total==1.25)
   let finished=reloaded.games.first { $0.id==id }!
   let snapshot=GameArchive.aggregate([finished]);assert(snapshot.first { $0.question.id==q.id }!.correct==2)
+  let transition=Studio(draftURL:root.appendingPathComponent("ArchiveTransition.workspace"));transition.timer?.invalidate()
+  var transitionQuestion=Question(text:"Из архива",answer:"Ответ");transitionQuestion.id=UUID()
+  transition.quiz.rounds[0].questions=[transitionQuestion];let transitionSource=root.appendingPathComponent("Archive-source.quiz")
+  try transition.write(to:transitionSource);assert(transition.load(transitionSource));transition.start()
+  transition.index=transition.steps.firstIndex{$0.kind == .finish}!;transition.enter()
+  let transitionGame=transition.gameArchive.games.first!;let transitionQuestionSnapshot=transitionGame.questions.first!
+  GameArchiveView(studio:transition).openQuestion(game:transitionGame,question:transitionQuestionSnapshot)
+  assert(!transition.playing && transition.screen == .editor && transition.focusEditorQuestionID == transitionQuestion.id && transition.gameArchive.games.first{$0.id==transitionGame.id}?.status=="completed")
   let preview=Studio(draftURL:root.appendingPathComponent("Preview.workspace"));preview.timer?.invalidate();preview.beginEditorPreview(from:restored,mode:.round);preview.persistArchive();assert(preview.archiveRun==nil);preview.endEditorPreview()
   var changed=q;changed.answer="Другой ответ";assert(ArchivedQuestion(q,round:app.quiz.rounds[0]).analysisKey != ArchivedQuestion(changed,round:app.quiz.rounds[0]).analysisKey)
   if CommandLine.arguments.count>2 {

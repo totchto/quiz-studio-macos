@@ -599,6 +599,10 @@ private struct AutosaveSnapshot {
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         rememberRecent = draftURL == nil || libraryDefaults != nil
         draft = draftURL ?? support.appendingPathComponent("Draft.workspace")
+        if draftURL == nil, let active = self.libraryDefaults.string(forKey: "ActiveDraftWorkspace") {
+            let candidate = URL(fileURLWithPath: active).standardizedFileURL
+            if candidate.deletingLastPathComponent() == support.standardizedFileURL { draft = candidate }
+        }
         if draftURL == nil, !FileManager.default.fileExists(atPath: draft.path) {
             let legacyDraft = support.appendingPathComponent("Draft.quiz")
             if FileManager.default.fileExists(atPath: legacyDraft.path) { try? FileManager.default.copyItem(at: legacyDraft,to: draft) }
@@ -614,7 +618,14 @@ private struct AutosaveSnapshot {
             recentQuizzes = (saved + discovered).filter { url in
                 !hiddenQuizzes.contains(url.path) && FileManager.default.fileExists(atPath: url.path) && seen.insert(url.path).inserted
             }
+            if self.libraryDefaults.string(forKey:"ActiveDraftWorkspace") == nil {
+                let legacy = support.appendingPathComponent("Draft.workspace")
+                let oldDraft = support.appendingPathComponent("Draft.quiz")
+                let initial = FileManager.default.fileExists(atPath:legacy.path) || FileManager.default.fileExists(atPath:oldDraft.path) ? legacy : draft
+                self.libraryDefaults.set(initial.path,forKey:"ActiveDraftWorkspace")
+            }
         }
+        if rememberRecent { self.libraryDefaults.set(draft.path,forKey:"ActiveDraftWorkspace") }
         if FileManager.default.fileExists(atPath: draft.path) { load(draft) }
         phoneRoom.studio = self
         playbackSubscription = playback.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
@@ -637,7 +648,7 @@ private struct AutosaveSnapshot {
     func autosave() {
         if rehearsal { return }
         if (playing || screen == .teams) && !phoneMode { do { try persistResults() } catch { status = "Ошибка автосохранения: \(error.localizedDescription)" } }
-        if playing { checkpoint() }
+        if playing && !phoneMode { checkpoint() }
         autosaveGeneration += 1
         autosavePending = true
         autosaveFailed = false
@@ -697,7 +708,10 @@ private struct AutosaveSnapshot {
         var isDirectory: ObjCBool = false
         if FileManager.default.fileExists(atPath: documentURL.path,isDirectory: &isDirectory), isDirectory.boolValue {
             try JSONEncoder().encode(quiz.teams).write(to: documentURL.appendingPathComponent("game-results.json"),options: .atomic)
-        } else { try write(to: documentURL) }
+        } else {
+            let sidecar=documentURL.deletingPathExtension().appendingPathExtension("game-results.json")
+            try JSONEncoder().encode(quiz.teams).write(to:sidecar,options:.atomic)
+        }
     }
     @discardableResult func handleKey(_ key: UInt16) -> Bool {
         guard playing, !repairingQuestion else { return false }
@@ -868,6 +882,8 @@ private struct AutosaveSnapshot {
                 let archive = try JSONDecoder().decode(QuizFile.self,from: Data(contentsOf: url))
                 guard archive.version == 1 else { throw CocoaError(.fileReadCorruptFile) }
                 decoded = archive.quiz
+                let sidecar=url.deletingPathExtension().appendingPathExtension("game-results.json")
+                if FileManager.default.fileExists(atPath:sidecar.path) { decoded.teams=try JSONDecoder().decode([Team].self,from:Data(contentsOf:sidecar)) }
                 mediaFolder = FileManager.default.temporaryDirectory.appendingPathComponent("QuizStudio-" + UUID().uuidString)
                 let media = mediaFolder.appendingPathComponent("Media")
                 try FileManager.default.createDirectory(at: media,withIntermediateDirectories: true)
@@ -891,8 +907,10 @@ private struct AutosaveSnapshot {
         autosave(); flushAutosave { _ in }
         let support = draft.deletingLastPathComponent()
         draft = support.appendingPathComponent("Draft-" + UUID().uuidString + ".workspace")
+        if rememberRecent { libraryDefaults.set(draft.path,forKey:"ActiveDraftWorkspace") }
         screen = .editor; quiz = Quiz(); registeredFontName = nil; folder = nil; documentURL = nil
         roundIndex = 0; questionIndex = 0; status = "Создан новый квиз"; undoHistory = []; redoHistory = []
+        autosave()
     }
     func duplicateSelectedQuestion() {
         guard !playing, quiz.rounds.indices.contains(roundIndex), quiz.rounds[roundIndex].questions.indices.contains(questionIndex) else { return }
@@ -1279,7 +1297,7 @@ private struct AutosaveSnapshot {
     func beginRehearsal() {
         guard !playing else { return }
         let session=Studio(draftURL:FileManager.default.temporaryDirectory.appendingPathComponent("QuizStudio-Rehearsal-\(UUID().uuidString).workspace"))
-        session.timer?.invalidate(); session.quiz=quiz; session.folder=folder; session.documentURL=documentURL
+        session.quiz=quiz; session.folder=folder; session.documentURL=documentURL
         session.rehearsalParent=self
         session.screen = .editor; session.roundIndex=roundIndex; session.questionIndex=questionIndex; session.focusEditorQuestionID=focusEditorQuestionID
         session.introductionSeconds=introductionSeconds; session.phoneMode=phoneMode; session.automaticAdvance=false; session.signalsEnabled=false
@@ -1290,7 +1308,7 @@ private struct AutosaveSnapshot {
     func startRehearsal() {
         guard !quiz.rounds.isEmpty else { status = "Добавьте раунд перед репетицией"; return }
         isEditorPreview = true; rehearsal = true; rehearsalIssue = nil; rememberRecent = false
-        steps = makeGameSteps(for:quiz,phoneMode:phoneMode,introductionSeconds:introductionSeconds,includeTeamIntroductions:true); matchLayouts=makeMatchLayouts(for:quiz); phoneMode=false; signalsEnabled=false; automaticAdvance=false; publishedScores=false; archiveRun=nil; playing=true; paused=true; index=0; enter(); paused=false; playback.setPaused(false)
+        steps = makeGameSteps(for:quiz,phoneMode:phoneMode,introductionSeconds:introductionSeconds); matchLayouts=makeMatchLayouts(for:quiz); signalsEnabled=false; automaticAdvance=false; publishedScores=false; archiveRun=nil; playing=true; paused=true; index=0; enter(); paused=false; playback.setPaused(false)
     }
     func endRehearsal() {
         playback.stop(); background.stop(); timer?.invalidate(); playing=false; rehearsal=false; isEditorPreview=false; rehearsalTV?.close(); rehearsalTV=nil
@@ -1314,6 +1332,8 @@ private struct AutosaveSnapshot {
         paused = false; playback.setPaused(false)
     }
     func togglePause() { if awaitingQuestionStart { startQuestionTimer(); return }; paused.toggle(); playback.setPaused(paused); if paused { bleep?.stop() } }
+    var repairWasPaused = false
+    var repairWasAwaitingStart = false
     func beginQuestionRepair() {
         guard playing, let s = step, [.question,.repeated,.answerPrompt,.answer].contains(s.kind), let q = currentQuestion else { return }
         repairDraft = q
@@ -1321,14 +1341,31 @@ private struct AutosaveSnapshot {
         preview.timer?.invalidate(); preview.quiz = quiz; preview.steps = steps; preview.index = index
         preview.folder = folder; preview.matchLayouts = matchLayouts; preview.playing = true; preview.paused = true
         preview.phoneMode = false; preview.readBeforeTimer = false; preview.enter()
-        repairPreview = preview; repairingQuestion = true
+        repairPreview = preview; repairingQuestion = true; repairWasPaused = paused; repairWasAwaitingStart = awaitingQuestionStart
         if !paused { paused = true; playback.setPaused(true); bleep?.stop() }
     }
-    func cancelQuestionRepair() { repairingQuestion = false; repairDraft = nil; repairPreview = nil; repairSourceMode = false }
+    func returnToEditorAfterGame() {
+        guard playing else { return }
+        let sourceURL = documentURL
+        autosave()
+        if phoneMode { do { try persistResults() } catch { status = "Результаты игры сохранены в архиве, но не в документе: " + error.localizedDescription } }
+        persistArchive(status:step?.kind == .finish ? "completed" : "stopped")
+        archiveRun = nil
+        phoneRoom.stop(); clearRecovery(); signalPlayer?.stop(); background.stop(); playback.stop(); bleep?.stop()
+        timer?.invalidate(); timer = nil; playing = false; paused = false; awaitingQuestionStart = false
+        timer = Timer.scheduledTimer(withTimeInterval:0.2,repeats:true) { [weak self] _ in Task { @MainActor in self?.tick() } }
+        tv?.close(); tv = nil; screen = .editor
+        if let sourceURL { _ = load(sourceURL) }
+    }
+    func cancelQuestionRepair() {
+        repairingQuestion = false; repairDraft = nil; repairPreview = nil; repairSourceMode = false
+        paused = repairWasPaused; playback.setPaused(paused)
+    }
     func applyQuestionRepair() {
         guard let draft = repairDraft, let s = step, quiz.rounds.indices.contains(s.round), quiz.rounds[s.round].questions.indices.contains(s.question) else { return }
         quiz.rounds[s.round].questions[s.question] = draft
         if draft.kind == "Один из четырёх", let selected = draft.selectedChoice, draft.choices.indices.contains(selected) { quiz.rounds[s.round].questions[s.question].answer = draft.choices[selected] }
+        phoneRoom.questionRulesChanged(questionID:draft.id)
         repairingQuestion = false; repairDraft = nil; repairPreview = nil
         // Keep the live clip position and all step, timer, phone, and score state intact.
         checkpoint(copyAssets: true)
@@ -1338,6 +1375,7 @@ private struct AutosaveSnapshot {
             catch { status = "Исправление действует в игре; не удалось записать исходный квиз: \(error.localizedDescription)" }
         } else { status = "Исправление сохранено только для текущей игры" }
         repairSourceMode = false
+        paused = repairWasPaused; playback.setPaused(paused)
     }
     func next() {
         var target = index+1
@@ -1870,7 +1908,7 @@ struct RoundDropTarget: View {
         }
     }
     var body: some Scene {
-        WindowGroup("Квиз Студия · 0.19.0") { Content(studio: studio).onAppear { appDelegate.install(studio) }.frame(minWidth: 1050,minHeight: 720).preferredColorScheme(appearance).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if url.pathExtension.lowercased() == "siq" { studio.chooseSIQ(url) } else if !studio.playing && studio.load(url) { studio.prepareGame() } } }
+        WindowGroup("Квиз Студия · 0.20.0") { Content(studio: studio).onAppear { appDelegate.install(studio) }.frame(minWidth: 1050,minHeight: 720).preferredColorScheme(appearance).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if url.pathExtension.lowercased() == "siq" { studio.chooseSIQ(url) } else if !studio.playing && studio.load(url) { studio.prepareGame() } } }
         .commands {
             CommandGroup(replacing: .newItem) { Button("Создать квиз") { studio.newQuiz() }.keyboardShortcut("n").disabled(studio.playing); Button("Открыть квиз…") { studio.open() }.keyboardShortcut("o").disabled(studio.playing); Button("Сохранить квиз…") { studio.save() }.keyboardShortcut("s") }
             CommandGroup(replacing:.undoRedo) {

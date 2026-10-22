@@ -81,8 +81,35 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
         assert(app.quiz.teams.map(\.total).reduce(0,+) == 10)
         let beforeResults = try JSONDecoder().decode(QuizFile.self,from:Data(contentsOf:app.documentURL!))
         assert(beforeResults.quiz.teams.map(\.total).reduce(0,+) == 0)
-        let same = try await call("/answer",token:tokens[2],body:["question":epoch,"answer":["choice":2]]); assert(same.0 == 200 && app.phoneRoom.answers.count == 40)
-        let changed = try await call("/answer",token:tokens[2],body:["question":epoch,"answer":["choice":1]]); assert(changed.0 == 409)
+        try app.persistResults()
+        let sidecar=app.documentURL!.deletingPathExtension().appendingPathExtension("game-results.json")
+        let persistedSidecar=try JSONDecoder().decode([Team].self,from:Data(contentsOf:sidecar))
+        let sidecarTotal=persistedSidecar.map(\.total).reduce(0,+)
+        let liveTotal=app.quiz.teams.map(\.total).reduce(0,+)
+        assert(sidecarTotal==liveTotal)
+        let sourceBytes=try Data(contentsOf:app.documentURL!)
+        let autoCorrect = app.phoneRoom.answers.first { $0.teamID == app.quiz.teams[2].id && $0.questionID == choice.id }!
+        var correctedChoice = app.quiz.rounds[0].questions[0]; correctedChoice.selectedChoice = 1; correctedChoice.answer = "Б"
+        app.quiz.rounds[0].questions[0] = correctedChoice; app.phoneRoom.questionRulesChanged(questionID:choice.id)
+        let invalidated = app.phoneRoom.answers.first { $0.id == autoCorrect.id }!
+        assert(invalidated.outcome == "wrong" && invalidated.points == 0 && invalidated.payload == autoCorrect.payload)
+        let manualAnswer = app.phoneRoom.answers.first { $0.teamID == app.quiz.teams[1].id && $0.questionID == choice.id }!
+        app.phoneRoom.grade(manualAnswer.id,points:1)
+        let manuallyGraded = app.phoneRoom.answers.first { $0.id == manualAnswer.id }!
+        var legacyAnswer=try JSONSerialization.jsonObject(with:JSONEncoder().encode(manuallyGraded)) as! [String:Any];legacyAnswer.removeValue(forKey:"manuallyGraded")
+        let decodedLegacyAnswer=try JSONDecoder().decode(PhoneAnswer.self,from:JSONSerialization.data(withJSONObject:legacyAnswer))
+        assert(decodedLegacyAnswer.manuallyGraded == false)
+        correctedChoice.selectedChoice=0;correctedChoice.answer="А";app.quiz.rounds[0].questions[0]=correctedChoice
+        app.phoneRoom.questionRulesChanged(questionID:choice.id)
+        let sourceBytesAfterRegrade=try Data(contentsOf:app.documentURL!)
+        assert(sourceBytesAfterRegrade==sourceBytes)
+        let stillManual=app.phoneRoom.answers.first { $0.id == manualAnswer.id }!
+        assert(stillManual.points == manuallyGraded.points && stillManual.outcome == manuallyGraded.outcome && stillManual.manuallyGraded)
+        app.quiz.rounds[0].questions[0] = choice; app.phoneRoom.questionRulesChanged(questionID:choice.id)
+        let staleAfterRuleEdit = try await call("/answer",token:tokens[2],body:["question":epoch,"answer":["choice":2]]); assert(staleAfterRuleEdit.0 == 409)
+        let refreshedState=try await call("/state",token:tokens[2]);let refreshedEpoch=refreshedState.1["question"] as! String
+        let same = try await call("/answer",token:tokens[2],body:["question":refreshedEpoch,"answer":["choice":2]]); assert(same.0 == 200 && app.phoneRoom.answers.count == 40)
+        let changed = try await call("/answer",token:tokens[2],body:["question":refreshedEpoch,"answer":["choice":1]]); assert(changed.0 == 409)
         let mIndex = app.steps.firstIndex { $0.kind == .question && $0.question == 1 }!
         app.jump(to:mIndex); app.startQuestionTimer()
         let oldRequest = try await call("/answer",token:tokens[0],body:["question":epoch,"answer":["choice":2]]); assert(oldRequest.0 == 409)
@@ -125,8 +152,8 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
         let breakState = try await call("/state",token:tokens[0]); assert(breakState.1["scores"] == nil)
         app.phoneRoom.grade(app.phoneRoom.pending(through:0)[0].id,points:1)
         app.publishScores(); assert(app.publishedScores)
-        let savedResults = try JSONDecoder().decode(QuizFile.self,from:Data(contentsOf:app.documentURL!))
-        assert(savedResults.quiz.teams.map(\.total) == app.quiz.teams.map(\.total))
+        let savedResults = try JSONDecoder().decode([Team].self,from:Data(contentsOf:sidecar))
+        assert(savedResults.map(\.total) == app.quiz.teams.map(\.total))
         app.revealAllScores(); let scoreState = try await call("/state",token:tokens[0]); assert((scoreState.1["scores"] as? [[String:Any]])?.count == 40)
         app.index = app.steps.firstIndex { $0.kind == .answerPrompt && $0.question == 2 }!; assert(app.phoneRoom.state(for:app.quiz.teams[0])["correct"] == nil)
         app.index = app.steps.firstIndex { $0.kind == .answer && $0.question == 2 }!; assert(app.phoneRoom.state(for:app.quiz.teams[0])["correct"] as? String == "Санкт-Петербург")

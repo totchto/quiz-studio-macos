@@ -100,12 +100,13 @@ struct QuizAssemblyView: View {
                     HStack { TextField("Название раунда",text:$rounds[ri].title); Stepper("Вопросов: \(rounds[ri].count)",value:$rounds[ri].count,in:1...50) }
                     TextField("Темы через запятую",text:Binding(get:{rounds[ri].tags.joined(separator:", ")},set:{rounds[ri].tags=Question.cleanTags($0)}))
                     HStack { Picker("Тип",selection:$rounds[ri].kind) { ForEach(["Любой тип"]+Question.kinds,id:\.self) { Text($0) } }; Picker("Сложность",selection:$rounds[ri].difficulty) { ForEach(["Любая сложность","Лёгкий","Средний","Сложный"],id:\.self) { Text($0) } } }
-                    let excluded=Set(rounds.enumerated().filter{$0.offset != ri}.flatMap{$0.element.questions}.map(\.id))
+                    let excluded=Set(rounds.flatMap{$0.questions}.map(\.id))
                     let eligible=rounds[ri].candidates(bank.entries,excluding:excluded,unusedOnly:rules.unusedOnly)
                     let incomplete=max(0,rounds[ri].count-rounds[ri].questions.count)
                     let shortage=max(0,rounds[ri].count-min(rounds[ri].questions.count+eligible.count,rounds[ri].count))
                     Text("Подобрано: \(rounds[ri].questions.count)/\(rounds[ri].count) · осталось подобрать: \(incomplete) · кандидатов ещё: \(eligible.count) · дефицит: \(shortage)").font(.caption).foregroundStyle(shortage > 0 ? .orange:.secondary)
                     Button("Подобрать недостающие вопросы") {
+                        let excluded=Set(rounds.flatMap{$0.questions}.map(\.id))
                         let candidates=rounds[ri].candidates(bank.entries,excluding:excluded,unusedOnly:rules.unusedOnly).shuffled()
                         rounds[ri].questions += Array(candidates.prefix(incomplete)); chosen=rounds.flatMap(\.questions)
                     }
@@ -117,6 +118,7 @@ struct QuizAssemblyView: View {
                                 Button("↓") { if qi+1<rounds[ri].questions.count { rounds[ri].questions.swapAt(qi,qi+1) } }.disabled(qi+1>=rounds[ri].questions.count)
                                 Menu("Перенести") { ForEach(rounds.indices.filter{$0 != ri},id:\.self) { target in Button(rounds[target].title.isEmpty ? "Раунд \(target+1)" : rounds[target].title) {
                                     guard rounds[target].accepts(entry,unusedOnly:rules.unusedOnly) else { error="Вопрос не соответствует условиям раунда «\(rounds[target].title)»."; return }
+                                    guard rounds[target].questions.count < rounds[target].count else { error="Сначала освободите место в целевом раунде."; return }
                                     rounds[target].questions.append(entry); rounds[ri].questions.remove(at:qi); chosen=rounds.flatMap(\.questions)
                                 } } }.disabled(rounds.count<2)
                                 Button("Заменить") {
@@ -124,6 +126,7 @@ struct QuizAssemblyView: View {
                                     if let replacement=rounds[ri].candidates(bank.entries,excluding:excluded,unusedOnly:rules.unusedOnly).randomElement() { rounds[ri].questions[qi]=replacement; chosen=rounds.flatMap(\.questions); error=nil }
                                     else { error="Для этого раунда нет доступной замены." }
                                 }
+                                Button("Удалить",role:.destructive) { rounds[ri].questions.remove(at:qi); chosen=rounds.flatMap(\.questions) }
                             }
                             Text("\(entry.question.tags?.joined(separator:", ") ?? "Без темы") · \(entry.question.kind) · \(entry.question.difficulty ?? "Не указана") · \(entry.question.media == nil && entry.question.explanationMedia == nil ? "Без медиа":"Есть медиа")").font(.caption).foregroundStyle(.secondary)
                             Text("Ответ: \(entry.question.correctAnswer)").font(.caption).foregroundStyle(.secondary)

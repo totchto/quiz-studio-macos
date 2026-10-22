@@ -72,6 +72,7 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   var alpha=QuizAssemblyRound(title:"Раунд Альфа",count:1,tags:["Альфа"],kind:"Открытый вопрос",questions:[themeA])
   let beta=QuizAssemblyRound(title:"Раунд Бета",count:1,tags:["Бета"],kind:"Открытый вопрос",questions:[themeB])
   assert(alpha.accepts(themeA,unusedOnly:true) && !alpha.accepts(themeB,unusedOnly:true))
+  assert(alpha.candidates([themeA,themeB],excluding:Set([themeA.id]),unusedOnly:true).isEmpty)
   alpha.count=2;let shortage=alpha.candidates(app.questionBank.entries,unusedOnly:true).count;assert(shortage==1)
   let sourceQuiz=app.quiz
   do { try app.assembleQuiz([alpha,beta],title:"Не должно собраться");fatalError("Incomplete round accepted") } catch {}

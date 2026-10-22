@@ -111,6 +111,18 @@ struct PhoneAnswer: Codable, Identifiable {
     var payload: Data
     var points: Double?
     var outcome: String? = nil
+    var manuallyGraded = false
+    enum CodingKeys: String, CodingKey { case teamID,questionID,roundID,display,payload,points,outcome,manuallyGraded }
+    init(teamID:UUID,questionID:UUID,roundID:UUID,display:String,payload:Data,points:Double?,outcome:String?=nil,manuallyGraded:Bool=false) {
+        self.teamID=teamID; self.questionID=questionID; self.roundID=roundID; self.display=display; self.payload=payload; self.points=points; self.outcome=outcome; self.manuallyGraded=manuallyGraded
+    }
+    init(from decoder:Decoder) throws {
+        let values=try decoder.container(keyedBy:CodingKeys.self)
+        teamID=try values.decode(UUID.self,forKey:.teamID); questionID=try values.decode(UUID.self,forKey:.questionID)
+        roundID=try values.decode(UUID.self,forKey:.roundID); display=try values.decode(String.self,forKey:.display)
+        payload=try values.decode(Data.self,forKey:.payload); points=try values.decodeIfPresent(Double.self,forKey:.points)
+        outcome=try values.decodeIfPresent(String.self,forKey:.outcome); manuallyGraded=try values.decodeIfPresent(Bool.self,forKey:.manuallyGraded) ?? false
+    }
 }
 struct PhoneRecovery: Codable {
     var roomKey: String
@@ -201,6 +213,71 @@ struct PhoneRecovery: Codable {
             studio.quiz.teams[i].scores = scores
         }
     }
+    func questionRulesChanged(questionID: UUID) {
+        guard let question = studio?.quiz.rounds.flatMap(\.questions).first(where: { $0.id == questionID }) else { return }
+        var changed = false
+        for index in answers.indices where answers[index].questionID == questionID {
+            // Keep human decisions. Automatically graded decisions are invalidated against the new key.
+            guard !answers[index].manuallyGraded, answers[index].points != nil, answers[index].outcome != nil else { continue }
+            let oldPoints=answers[index].points, oldOutcome=answers[index].outcome
+            let payload = (try? JSONSerialization.jsonObject(with: answers[index].payload)) as? [String:Any] ?? [:]
+            let wagered = question.wagerEnabled == true && payload["wager"] as? Bool == true
+            if let text = payload["text"] as? String {
+                if question.extraIssues != nil {
+                    if let result = try? question.gradeExtra(["text":text]) {
+                        answers[index].points = question.awardedPoints(grade:result.points,wagered:wagered)
+                        answers[index].outcome = result.points == 1 ? "correct" : result.points == 2 ? "partial" : "wrong"
+                    } else { answers[index].points = nil; answers[index].outcome = nil }
+                } else {
+                    let allowed = [question.correctAnswer] + (question.acceptedAnswers ?? [])
+                    let correct = allowed.contains { Self.normalize($0) == Self.normalize(text) }
+                    answers[index].points = correct ? question.awardedPoints(correct:true,wagered:wagered) : nil
+                    answers[index].outcome = correct ? "correct" : nil
+                }
+            } else if let choices = payload["choices"] as? [Int], let correct = question.correctChoices {
+                let selected = Set(choices), expected = Set(correct), all = selected == expected
+                let count = selected.intersection(expected).count
+                answers[index].points = all ? question.awardedPoints(correct:true,wagered:wagered) : count > 0 ? (question.partialPoints ?? question.awardedPoints(correct:false,wagered:wagered)) : question.awardedPoints(correct:false,wagered:wagered)
+                answers[index].outcome = all ? "correct" : count > 0 && question.partialPoints != nil ? "partial" : "wrong"
+            } else if let choice = payload["choice"] as? Int {
+                let correct = question.selectedChoice ?? question.choices.firstIndex(of:question.correctAnswer)
+                let isCorrect = choice == correct
+                answers[index].points = question.awardedPoints(correct:isCorrect,wagered:wagered)
+                answers[index].outcome = isCorrect ? "correct" : "wrong"
+            } else if let matches = payload["matches"] as? [String:String], let pairs = question.matchPairs {
+                let layout = studio?.matchLayouts[questionID]
+                var correctCount=0
+                if let layout {
+                    for (i,leftID) in layout.left.enumerated() {
+                        guard let rightValue=matches["l\(i)"],let rightIndex=Int(rightValue.dropFirst()),layout.right.indices.contains(rightIndex) else { continue }
+                        if layout.right[rightIndex] == leftID { correctCount += 1 }
+                    }
+                }
+                let all = correctCount == pairs.count
+                answers[index].points = all ? question.awardedPoints(correct:true,wagered:wagered) : correctCount > 0 ? (question.partialPoints ?? question.awardedPoints(correct:false,wagered:wagered)) : question.awardedPoints(correct:false,wagered:wagered)
+                answers[index].outcome = all ? "correct" : correctCount > 0 && question.partialPoints != nil ? "partial" : "wrong"
+            } else if let order = payload["order"] as? [Int], let items = question.sequenceItems {
+                let expected = items.map(\.id)
+                let correctOrder = order.compactMap { question.displayedSequence.indices.contains($0) ? question.displayedSequence[$0].id : nil }
+                let all = correctOrder == expected
+                let partial = zip(correctOrder,expected).contains { $0 == $1 }
+                answers[index].points = question.awardedPoints(grade:all ? 1 : partial && question.partialPoints != nil ? 2 : 0,wagered:wagered)
+                answers[index].outcome = all ? "correct" : partial && question.partialPoints != nil ? "partial" : "wrong"
+            } else if let categories = payload["categories"] as? [String:Int] {
+                let items = question.displayedCategoryItems
+                let correctCount = items.indices.filter { categories[String($0)] == items[$0].category }.count
+                let all = correctCount == items.count
+                answers[index].points = question.awardedPoints(grade:all ? 1 : correctCount > 0 && question.partialPoints != nil ? 2 : 0,wagered:wagered)
+                answers[index].outcome = all ? "correct" : correctCount > 0 && question.partialPoints != nil ? "partial" : "wrong"
+            } else {
+                answers[index].points = nil; answers[index].outcome = nil
+            }
+            if oldPoints != answers[index].points || oldOutcome != answers[index].outcome { changed = true }
+        }
+        updateScores()
+        if changed { revision += 1 }
+        studio?.checkpoint()
+    }
     func grade(_ id: String,points: Int) {
         guard let i = answers.firstIndex(where: { $0.id == id }), [0,1,2].contains(points) else { return }
         let q=studio?.quiz.rounds.flatMap(\.questions).first { $0.id == answers[i].questionID }
@@ -208,6 +285,7 @@ struct PhoneRecovery: Codable {
         let payload=(try? JSONSerialization.jsonObject(with:answers[i].payload)) as? [String:Any]
         answers[i].points = points == 2 ? q?.partialPoints : q?.awardedPoints(correct:points==1,wagered:q?.wagerEnabled == true && payload?["wager"] as? Bool == true) ?? Double(points)
         answers[i].outcome = points == 1 ? "correct" : points == 2 ? "partial":"wrong"
+        answers[i].manuallyGraded = true
         updateScores(); studio?.checkpoint()
     }
     nonisolated static func normalize(_ text: String) -> String { text.lowercased().replacingOccurrences(of:"ё",with:"е").split(whereSeparator: { $0.isWhitespace }).joined(separator:" ") }

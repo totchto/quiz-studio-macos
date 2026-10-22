@@ -267,6 +267,7 @@ struct GameArchiveView: View {
     func openQuestion(game: ArchivedGame,question: ArchivedQuestion) {
         guard let path=game.sourcePath else { exportError="У этой архивной записи нет адреса исходного квиза. Снимок вопроса сохранён в архиве."; return }
         let url=URL(fileURLWithPath:path)
+        if studio.playing { studio.returnToEditorAfterGame() }
         guard let source=Self.readSourceQuiz(url), source.bankHistoryID == game.quizID,
               let r=source.rounds.firstIndex(where:{$0.id == question.roundID}), let q=source.rounds[r].questions.firstIndex(where:{$0.id == question.id}),
               studio.load(url) else { exportError="Исходный квиз изменён или недоступен. Снимок вопроса сохранён в архиве."; return }
