@@ -162,7 +162,7 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   invalid.start(url:wav); invalid.stop(); try await Task.sleep(nanoseconds:300_000_000); assert(invalid.player == nil && invalid.finished && invalid.error == nil)
   print("PASS: malformed media and invalid fragment fail safely; cancelled load does not restart playback")
   let quiz=Studio(draftURL:root.appendingPathComponent("Draft.workspace")); quiz.timer?.invalidate()
-  var question=Question(); question.text="Аудиовопрос"; question.answer="Ответ"; question.media="tone.wav"; question.start=0.4; question.end=1.0; question.afterMedia=true; question.seconds=5
+  var question=Question(); question.text="Аудиовопрос"; question.answer="Ответ"; question.media="tone.wav"; question.start=0.4; question.end=1.0; question.afterMedia=true; question.seconds=5; question.editorialReviewStatus = .reviewed; question.answerVideo = false
   let media=root.appendingPathComponent("Media"); try FileManager.default.createDirectory(at:media,withIntermediateDirectories:true); try FileManager.default.copyItem(at:wav,to:media.appendingPathComponent("tone.wav"))
   quiz.folder=root; quiz.quiz.rounds[0].questions=[question]; quiz.start()
   for _ in 0..<20 { quiz.tick() }; assert(quiz.remaining==5) // Loading must not consume discussion time.
@@ -249,10 +249,19 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   quiz.quiz.rounds[0].questions[0].start = 100
   await quiz.validateQuiz(); assert(!quiz.preflightIssues.isEmpty)
   quiz.quiz.rounds[0].questions[0].start = 0.4
+  quiz.quiz.rounds[0].questions[0].media = nil
   await quiz.validateQuiz(); assert(quiz.preflightIssues.isEmpty)
+  quiz.quiz.rounds[0].questions[0].media = "tone.wav"
+  quiz.quiz.rounds[0].questions[0].explanationMedia = nil
+  quiz.quiz.rounds[0].questions[0].audioOnly = true
+  await quiz.validateQuiz(); assert(quiz.preflightIssues.isEmpty)
+  quiz.quiz.rounds[0].questions[0].audioOnly = false
+  await quiz.validateQuiz(); assert(quiz.preflightIssues.contains { $0.contains("вопрос") && $0.contains("видеодорожки") })
   quiz.quiz.rounds[0].questions[0].image = "missing.png"
   await quiz.validateQuiz(); assert(quiz.preflightIssues.contains { $0.contains("missing.png") })
   quiz.quiz.rounds[0].questions[0].image = nil
+  quiz.quiz.rounds[0].questions[0].audioOnly = true
+  quiz.checkpoint(copyAssets:true)
   quiz.start(); quiz.startQuestionTimer()
   try await wait("recovery source playing") { !quiz.playback.loading }
   quiz.player?.volume = 0; quiz.remaining = 3; quiz.checkpoint()
