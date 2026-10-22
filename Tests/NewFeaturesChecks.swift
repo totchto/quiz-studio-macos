@@ -66,8 +66,30 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   do { _=try rules.select(app.questionBank.entries);fatalError("Shortage accepted") } catch {}
   assert(app.quiz==original);rules.perRound=2
   try app.assembleQuiz(picked,rules:rules,title:"Из банка");assert(app.quiz.rounds.count==1 && app.quiz.rounds[0].questions.count==2 && app.quiz.rounds[0].questions.allSatisfy { $0.bankEntryID != nil })
+  let themeA=try app.questionBank.save({ var q=Question();q.text="Альфа вопрос";q.answer="Альфа ответ";q.tags=["Альфа"];q.kind="Открытый вопрос";q.media="theme.mp3";return q }(),assets:["theme.mp3":Data("theme-media".utf8)])
+  var themeQuestion=Question();themeQuestion.text="Бета вопрос";themeQuestion.answer="Бета ответ";themeQuestion.tags=["Бета"];themeQuestion.kind="Открытый вопрос"
+  let themeB=try app.questionBank.save(themeQuestion,assets:[:])
+  var alpha=QuizAssemblyRound(title:"Раунд Альфа",count:1,tags:["Альфа"],kind:"Открытый вопрос",questions:[themeA])
+  let beta=QuizAssemblyRound(title:"Раунд Бета",count:1,tags:["Бета"],kind:"Открытый вопрос",questions:[themeB])
+  assert(alpha.accepts(themeA,unusedOnly:true) && !alpha.accepts(themeB,unusedOnly:true))
+  alpha.count=2;let shortage=alpha.candidates(app.questionBank.entries,unusedOnly:true).count;assert(shortage==1)
+  let sourceQuiz=app.quiz
+  do { try app.assembleQuiz([alpha,beta],title:"Не должно собраться");fatalError("Incomplete round accepted") } catch {}
+  assert(app.quiz==sourceQuiz)
+  alpha.count=1;try app.assembleQuiz([alpha,beta],title:"Темы")
+  let assembled=app.quiz.rounds.flatMap(\.questions);assert(app.quiz.rounds.count==2 && assembled.count==2 && Set(assembled.map(\.id)).count==2)
+  let alphaCopy=app.quiz.rounds.flatMap(\.questions).first{$0.text=="Альфа вопрос"}!
+  let alphaRecord=try app.questionBank.record(themeA)
+  let betaRecord=try app.questionBank.record(themeB)
+  let alphaAnswer=alphaCopy.answer
+  let betaAnswer=app.quiz.rounds.flatMap(\.questions).first{$0.text=="Бета вопрос"}!.answer
+  assert(alphaAnswer=="Альфа ответ" && betaAnswer=="Бета ответ")
+  assert(alphaRecord.entry.question.answer=="Альфа ответ" && betaRecord.entry.question.answer=="Бета ответ")
+  let copiedMedia=try Data(contentsOf:app.asset(alphaCopy.media)!)
+  assert(copiedMedia==Data("theme-media".utf8),"assembled media missing or mismatched: \(alphaCopy.media ?? "nil") at \(app.asset(alphaCopy.media)?.path ?? "no asset path")")
+  assert(alphaRecord.entry.history?.isEmpty ?? true)
   assert(app.questionBank.entries.filter { picked.map(\.id).contains($0.id) }.allSatisfy { ($0.history ?? []).isEmpty })
-  let file=root.appendingPathComponent("Generated.quiz");try app.write(to:file);let saved=try JSONDecoder().decode(QuizFile.self,from:Data(contentsOf:file));assert(saved.quiz.rounds[0].questions.count==2)
+  let file=root.appendingPathComponent("Generated.quiz");try app.write(to:file);let saved=try JSONDecoder().decode(QuizFile.self,from:Data(contentsOf:file));assert(saved.quiz.rounds.count==2 && saved.quiz.rounds.flatMap(\.questions).count==2)
   print("PASS: repeat import deduplication, no repeated bank IDs, archived/used exclusion, shortage keeps source quiz, independent assembled questions, history only after save")
   numeric.wagerEnabled=true;numeric.wagerCorrectPoints=2;numeric.wagerWrongPoints = -2
   let pollBlock=PresentationBlock(kind:"Голосование",title:"Тема",text:"Выберите",seconds:0,beforeQuestion:0,options:["Кино","Музыка"])

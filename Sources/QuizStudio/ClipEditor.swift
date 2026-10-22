@@ -139,6 +139,53 @@ struct WaveformData {
     }
 }
 
+private enum AudioReverse {
+    static func render(_ source: URL, to destination: URL, includeVideo: Bool) async throws {
+        let asset = AVURLAsset(url:source)
+        guard let audioTrack = try await asset.loadTracks(withMediaType:.audio).first else { throw CocoaError(.fileReadCorruptFile) }
+        let extractedURL = destination.deletingLastPathComponent().appendingPathComponent("\(UUID().uuidString)-source.m4a")
+        defer { try? FileManager.default.removeItem(at:extractedURL) }
+        let audioComposition = AVMutableComposition()
+        let audioTarget = audioComposition.addMutableTrack(withMediaType:.audio,preferredTrackID:kCMPersistentTrackID_Invalid)!
+        try audioTarget.insertTimeRange(CMTimeRange(start:.zero,duration:try await asset.load(.duration)),of:audioTrack,at:.zero)
+        guard let extractor = AVAssetExportSession(asset:audioComposition,presetName:AVAssetExportPresetAppleM4A) else { throw CocoaError(.fileWriteUnknown) }
+        extractor.outputURL = extractedURL; extractor.outputFileType = .m4a
+        await extractor.export()
+        guard extractor.status == .completed else { throw extractor.error ?? CocoaError(.fileWriteUnknown) }
+        let input = try AVAudioFile(forReading:extractedURL)
+        let format = input.processingFormat
+        let frames = AVAudioFrameCount(input.length)
+        guard frames > 0, let sourceBuffer = AVAudioPCMBuffer(pcmFormat:format,frameCapacity:frames) else { throw CocoaError(.fileReadCorruptFile) }
+        try input.read(into:sourceBuffer,frameCount:frames)
+        guard let sourceChannels = sourceBuffer.floatChannelData else { throw CocoaError(.fileReadCorruptFile) }
+        let reversedURL = destination.deletingLastPathComponent().appendingPathComponent("\(UUID().uuidString)-audio.caf")
+        defer { try? FileManager.default.removeItem(at:reversedURL) }
+        let audioFile = try AVAudioFile(forWriting:reversedURL,settings:format.settings)
+        guard let reversedBuffer = AVAudioPCMBuffer(pcmFormat:format,frameCapacity:sourceBuffer.frameLength), let targetChannels = reversedBuffer.floatChannelData else { throw CocoaError(.fileWriteUnknown) }
+        reversedBuffer.frameLength = sourceBuffer.frameLength
+        for channel in 0..<Int(format.channelCount) {
+            for frame in 0..<Int(sourceBuffer.frameLength) { targetChannels[channel][frame] = sourceChannels[channel][Int(sourceBuffer.frameLength)-frame-1] }
+        }
+        try audioFile.write(from:reversedBuffer)
+        let composition = AVMutableComposition()
+        let duration = try await asset.load(.duration)
+        if includeVideo, let video = try await asset.loadTracks(withMediaType:.video).first {
+            let target = composition.addMutableTrack(withMediaType:.video,preferredTrackID:kCMPersistentTrackID_Invalid)!
+            try target.insertTimeRange(CMTimeRange(start:.zero,duration:duration),of:video,at:.zero)
+            target.preferredTransform = try await video.load(.preferredTransform)
+        }
+        let reversedAsset = AVURLAsset(url:reversedURL)
+        guard let reversedTrack = try await reversedAsset.loadTracks(withMediaType:.audio).first else { throw CocoaError(.fileReadCorruptFile) }
+        let targetAudio = composition.addMutableTrack(withMediaType:.audio,preferredTrackID:kCMPersistentTrackID_Invalid)!
+        try targetAudio.insertTimeRange(CMTimeRange(start:.zero,duration:try await reversedAsset.load(.duration)),of:reversedTrack,at:.zero)
+        guard let exporter = AVAssetExportSession(asset:composition,presetName:includeVideo ? AVAssetExportPresetHighestQuality : AVAssetExportPresetPassthrough) else { throw CocoaError(.fileWriteUnknown) }
+        exporter.outputURL = destination
+        exporter.outputFileType = includeVideo ? .mov : .caf
+        await exporter.export()
+        guard exporter.status == .completed else { throw exporter.error ?? CocoaError(.fileWriteUnknown) }
+    }
+}
+
 struct ClipEditor: View {
     @Binding var question: Question
     let questionURL: URL
@@ -165,19 +212,23 @@ struct ClipEditor: View {
     @State private var loop = false
     @State private var cursor: Double = 0
     @State private var selection: ClosedRange<Double>?
-    @State private var history: [(ClipSettings,ClipSettings)] = []
+    @State private var history: [(ClipSettings,ClipSettings,[URL:URL])] = []
     @State private var dragSaved = false
     @State private var dragRange: ClosedRange<Double>?
     @State private var loader: Task<Void,Never>?
+    @State private var reversedURLs: [URL:URL] = [:]
+    @State private var isReversing = false
+    @State private var reverseError: String?
+    @State private var applied = false
     var draft: ClipSettings { answer ? answerDraft : questionDraft }
-    var sourceURL: URL { answer ? answerURL : questionURL }
+    var sourceURL: URL { reversedURLs[answer ? answerURL : questionURL] ?? (answer ? answerURL : questionURL) }
     var visibleRange: ClosedRange<Double> {
         if let dragRange { return dragRange }
         guard let wave else { return 0...1 }
         let clip = draft.bounded(to:wave.duration)
         return cropView ? clip.start...clip.end : 0...wave.duration
     }
-    func remember() { history.append((questionDraft,answerDraft)); if history.count > 100 { history.removeFirst() } }
+    func remember() { history.append((questionDraft,answerDraft,reversedURLs)); if history.count > 100 { history.removeFirst() } }
     func update(_ value: ClipSettings) { if answer { answerDraft = value } else { questionDraft = value } }
     func load() {
         preview.stop(); scrubber.clear(); frames = []; loader?.cancel(); wave = nil; loadError = nil; selection = nil; zoom = 1; cropView = false; dragRange = nil; dragSaved = false
@@ -267,7 +318,10 @@ struct ClipEditor: View {
                 Spacer()
                 Button("Отмена") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Применить") {
+                    applied = true
                     question.questionClip = questionDraft; question.answerClip = answerDraft
+                    if let url = reversedURLs[questionURL] { question.media = url.lastPathComponent; question.questionClip = nil; question.start = 0; question.end = 0; question.bleepRanges = "" }
+                    if let url = reversedURLs[answerURL] { question.explanationMedia = url.lastPathComponent; question.answerClip = nil }
                     question.audioOnly = questionAudioOnly; question.answerVideo = answerShowsVideo
                     question.start = questionDraft.start; question.end = questionDraft.end
                     question.bleepRanges = questionDraft.regions.filter { !$0.silence }.map { "\($0.start)-\($0.end)" }.joined(separator:", ")
@@ -280,10 +334,28 @@ struct ClipEditor: View {
             else if let wave {
                 if wave.hasVideo { videoPreview(wave) }
                 HStack {
-                    Button { if let last = history.popLast() { questionDraft = last.0; answerDraft = last.1; preview.stop() } } label: { Label("Отменить действие",systemImage:"arrow.uturn.backward") }.disabled(history.isEmpty)
+                    Button { if let last = history.popLast() { questionDraft = last.0; answerDraft = last.1; for url in reversedURLs.values where !last.2.values.contains(url) { try? FileManager.default.removeItem(at:url) }; reversedURLs = last.2; load(); preview.stop() } } label: { Label("Отменить действие",systemImage:"arrow.uturn.backward") }.disabled(history.isEmpty)
                     Spacer()
                     Toggle("Только фрагмент",isOn:$cropView).toggleStyle(.checkbox)
                     Text("Масштаб"); Slider(value:$zoom,in:1...12).frame(width:120)
+                }
+                HStack {
+                    Button {
+                        guard !isReversing else { return }
+                        let original = answer ? answerURL : questionURL
+                        let ext = wave.hasVideo ? "mov" : "caf"
+                        let output = original.deletingLastPathComponent().appendingPathComponent("\(UUID().uuidString)-reverse.\(ext)")
+                        isReversing = true; reverseError = nil; preview.stop()
+                        Task { @MainActor in
+                            do {
+                                try await AudioReverse.render(original,to:output,includeVideo:wave.hasVideo)
+                                remember(); reversedURLs[original] = output; load()
+                            } catch { try? FileManager.default.removeItem(at:output); reverseError = error.localizedDescription }
+                            isReversing = false
+                        }
+                    } label: { if isReversing { ProgressView().controlSize(.small); Text("Реверсируем…") } else { Label("Реверс трека",systemImage:"backward.end.fill") } }.disabled(isReversing || !wave.hasAudio)
+                    if let reverseError { Text(reverseError).font(.caption).foregroundStyle(.red) }
+                    Spacer()
                 }
                 ScrollView(.horizontal) {
                     timeline(wave).frame(width:860*zoom,height:wave.hasVideo ? 210 : 150)
@@ -342,7 +414,7 @@ struct ClipEditor: View {
         .onAppear { questionDraft = question.settings(answer:false); answerDraft = question.settings(answer:true); questionAudioOnly = question.audioOnly; answerShowsVideo = question.answerVideo; if initialAnswer { answer = true } else { load() } }
         .onChange(of:answer) { _,_ in load() }
         .onChange(of:preview.finished) { old,done in if !old && done && loop && preview.player != nil && preview.error == nil { play() } }
-        .onDisappear { loader?.cancel(); scrubber.clear(); preview.stop() }
+        .onDisappear { loader?.cancel(); scrubber.clear(); preview.stop(); if !applied { for url in reversedURLs.values { try? FileManager.default.removeItem(at:url) } } }
     }
     func timeField(_ key: WritableKeyPath<ClipSettings,Double>) -> some View {
         TextField("Секунды",value:Binding(get:{ draft[keyPath:key] },set:{ v in

@@ -18,6 +18,7 @@ struct ArchivedQuestion: Codable, Identifiable {
     var kind: String
     var analysisKey: String
     var tags: [String]
+    var notes: String? = nil
     init(_ q: Question,round: Round) {
         id = q.id; roundID = round.id; roundTitle = round.title; text = q.text; kind = q.kind; tags = q.tags ?? []
         answer = q.kind == "Сопоставление" ? (q.matchPairs ?? []).map { $0.left+" — "+$0.right }.joined(separator:"; ") : q.correctAnswer
@@ -51,6 +52,8 @@ struct ArchivedGame: Codable, Identifiable {
     var shown: Set<UUID>
     var closed: Set<UUID>
     var answers: [ArchivedAnswer]
+    var notes: String? = nil
+    var sourcePath: String? = nil
     var statusText: String { switch status { case "completed": return "Завершена"; case "paused": return "Сохранена для продолжения"; case "stopped": return "Прервана"; default: return "Незавершена" } }
     var sortedTeams: [Team] { teams.sorted { $0.total == $1.total ? $0.name.localizedStandardCompare($1.name) == .orderedAscending : $0.total > $1.total } }
     var pending: Int { answers.filter { $0.points == nil }.count }
@@ -137,6 +140,7 @@ struct AggregatedQuestion: Identifiable {
         if let i = games.firstIndex(where:{ $0.id == game.id }) { games[i] = game } else { games.append(game) }
         games.sort { $0.started > $1.started }; error = ""
     }
+    func update(_ game: ArchivedGame) { do { try save(game) } catch { self.error = "Ошибка архива: "+error.localizedDescription } }
     static func aggregate(_ games: [ArchivedGame]) -> [AggregatedQuestion] {
         var rows: [String:AggregatedQuestion] = [:]
         for game in games where game.phone && game.status == "completed" {
@@ -195,10 +199,12 @@ extension Studio {
         let existing = gameArchive.games.first { $0.id == run.id }
         let status = requested ?? (step?.kind == .finish ? "completed" : "running")
         let ended = status == "completed" || status == "stopped" ? (existing?.ended ?? Date()) : nil
-        let questions = quiz.rounds.flatMap { r in r.questions.map { ArchivedQuestion($0,round:r) } }
+        var previous: [UUID:String?] = [:]
+        for question in existing?.questions ?? [] { previous[question.id] = question.notes }
+        let questions = quiz.rounds.flatMap { r in r.questions.map { q -> ArchivedQuestion in var archived=ArchivedQuestion(q,round:r); archived.notes=previous[q.id] ?? nil; return archived } }
         let ids = Set(questions.map(\.id)); let teams = Set(quiz.teams.map(\.id))
         let answers = phoneMode ? phoneRoom.answers.filter { ids.contains($0.questionID) && teams.contains($0.teamID) }.map { ArchivedAnswer(teamID:$0.teamID,questionID:$0.questionID,display:$0.display,points:$0.points,outcome:$0.outcome) } : []
-        let game = ArchivedGame(id:run.id,quizID:quiz.bankHistoryID,title:quiz.title,started:run.started,updated:Date(),ended:ended,status:status,phone:phoneMode,teams:quiz.teams,rounds:quiz.rounds.map { ArchivedRound(id:$0.id,title:$0.title) },questions:questions,shown:run.shown,closed:run.closed,answers:answers)
+        let game = ArchivedGame(id:run.id,quizID:quiz.bankHistoryID,title:quiz.title,started:run.started,updated:Date(),ended:ended,status:status,phone:phoneMode,teams:quiz.teams,rounds:quiz.rounds.map { ArchivedRound(id:$0.id,title:$0.title) },questions:questions,shown:run.shown,closed:run.closed,answers:answers,notes:existing?.notes,sourcePath:documentURL?.path ?? existing?.sourcePath)
         do { try gameArchive.save(game) } catch { gameArchive.error = "Ошибка архива: "+error.localizedDescription }
     }
 }
@@ -233,7 +239,7 @@ struct GameArchiveView: View {
                         }.padding(.vertical,6).tag(game.id)
                     }.frame(minWidth:210,idealWidth:270,maxWidth:360)
                     if let game = visible.first(where:{ $0.id == selected }) {
-                        ScrollView { ArchivedGameDetail(game:game,export:{ type in export(game,type:type) }).frame(maxWidth:.infinity,alignment:.leading) }
+                        ScrollView { ArchivedGameDetail(game:game,export:{ type in export(game,type:type) },update:{ archive.update($0) },openQuestion:{ openQuestion(game:$0,question:$1) }).id(game.id).frame(maxWidth:.infinity,alignment:.leading) }
                     } else { ContentUnavailableView("Выберите игру",systemImage:"chart.bar.doc.horizontal",description:Text(visible.isEmpty ? "Результаты появятся после запуска квиза. Старые игры автоматически восстановить нельзя." : "Слева — отдельные проведения квизов." )).frame(maxWidth:.infinity) }
                 }
             } else {
@@ -258,14 +264,36 @@ struct GameArchiveView: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do { let text = type == "результаты" ? GameArchive.scoresCSV(game) : GameArchive.questionsCSV(game); try ("\u{FEFF}"+text).write(to:url,atomically:true,encoding:.utf8); exportError = nil } catch { exportError = error.localizedDescription }
     }
+    func openQuestion(game: ArchivedGame,question: ArchivedQuestion) {
+        guard let path=game.sourcePath else { exportError="У этой архивной записи нет адреса исходного квиза. Снимок вопроса сохранён в архиве."; return }
+        let url=URL(fileURLWithPath:path)
+        guard let source=Self.readSourceQuiz(url), source.bankHistoryID == game.quizID,
+              let r=source.rounds.firstIndex(where:{$0.id == question.roundID}), let q=source.rounds[r].questions.firstIndex(where:{$0.id == question.id}),
+              studio.load(url) else { exportError="Исходный квиз изменён или недоступен. Снимок вопроса сохранён в архиве."; return }
+        studio.roundIndex=r; studio.questionIndex=q; studio.focusEditorQuestionID=question.id; studio.showGameArchive=false; studio.screen = .editor
+    }
+    private static func readSourceQuiz(_ url:URL) -> Quiz? {
+        var isDirectory:ObjCBool=false
+        guard FileManager.default.fileExists(atPath:url.path,isDirectory:&isDirectory) else { return nil }
+        do {
+            if isDirectory.boolValue { return try JSONDecoder().decode(Quiz.self,from:Data(contentsOf:url.appendingPathComponent("quiz.json"))) }
+            let file=try JSONDecoder().decode(QuizFile.self,from:Data(contentsOf:url))
+            return file.version == 1 ? file.quiz : nil
+        } catch { return nil }
+    }
 }
 struct ArchivedGameDetail: View {
-    let game: ArchivedGame
+    @State var game: ArchivedGame
     let export: (String) -> Void
+    let update: (ArchivedGame) -> Void
+    let openQuestion: (ArchivedGame,ArchivedQuestion) -> Void
+    init(game: ArchivedGame,export: @escaping (String)->Void,update: @escaping (ArchivedGame)->Void = {_ in},openQuestion: @escaping (ArchivedGame,ArchivedQuestion)->Void = {_,_ in}) { _game=State(initialValue:game); self.export=export; self.update=update; self.openQuestion=openQuestion }
     var body: some View {
         VStack(alignment:.leading,spacing:16) {
             Text(game.title).font(.title2.bold())
             Text("Начало: "+game.started.formatted(date:.abbreviated,time:.shortened)+" · "+game.statusText).font(.caption).foregroundStyle(.secondary)
+            Text("Заметки по игре").font(.headline)
+            TextEditor(text:Binding(get:{game.notes ?? ""},set:{game.notes=$0; update(game)})).frame(height:80)
             HStack { Button("Результаты CSV") { export("результаты") }; if game.phone { Button("Статистика вопросов CSV") { export("вопросы") } } }
             Text("Команды и баллы по раундам").font(.headline)
             ScrollView(.horizontal) {
@@ -288,6 +316,8 @@ struct ArchivedGameDetail: View {
                     let stats = game.stats(for:q)
                     DisclosureGroup {
                         VStack(alignment:.leading,spacing:8) {
+                            TextEditor(text:Binding(get:{game.questions.first(where:{$0.id == q.id})?.notes ?? ""},set:{value in if let i=game.questions.firstIndex(where:{$0.id == q.id}) { game.questions[i].notes=value; update(game) }})).frame(height:65)
+                            Button("Открыть исходный вопрос в редакторе") { openQuestion(game,q) }.disabled(game.quizID == nil)
                             Text("Правильный ответ: "+q.answer)
                             if !stats.shown { Text("Вопрос не показывался и не учитывается в статистике.") }
                             else {
@@ -318,7 +348,7 @@ struct ArchivedGameDetail: View {
                     } label: {
                         VStack(alignment:.leading,spacing:4) {
                             Text(q.roundTitle+" · "+q.text).lineLimit(3)
-                            Text(!stats.shown ? "Не показан" : stats.percent.map { "\($0.formatted(.number.precision(.fractionLength(0...1))))% верно" } ?? "Приём не завершён").font(.caption).foregroundStyle(.secondary)
+                            Text(!stats.shown ? "Не показан" : !stats.closed ? "Приём не завершён" : stats.gradedPercent.map { "\($0.formatted(.number.precision(.fractionLength(0...1))))% верно среди оценённых · \(stats.graded) ответов" } ?? "Нет оценённых ответов").font(.caption).foregroundStyle(.secondary)
                         }
                     }.padding(10).background(.quaternary.opacity(0.3),in:RoundedRectangle(cornerRadius:10))
                 }

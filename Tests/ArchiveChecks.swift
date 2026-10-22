@@ -24,6 +24,11 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   restored.index=restored.steps.firstIndex { $0.kind == .finish }!;restored.enter()
   assert(restored.gameArchive.games.count==1 && restored.gameArchive.games[0].status=="completed")
   let completed=restored.gameArchive.games[0];assert(completed.answers.count==3 && completed.closed.contains(q2.id) && !completed.shown.contains(q3.id))
+  var noted=completed; noted.notes="Задержка оборудования"; noted.questions[0].notes="Спорный вопрос"; try restored.gameArchive.save(noted)
+  let notedReload=GameArchive(root:restored.gameArchive.root).games.first { $0.id==id }!; assert(notedReload.notes=="Задержка оборудования" && notedReload.questions[0].notes=="Спорный вопрос")
+  var legacyObject=try JSONSerialization.jsonObject(with:JSONEncoder().encode(completed)) as! [String:Any]; legacyObject.removeValue(forKey:"notes"); legacyObject.removeValue(forKey:"sourcePath")
+  legacyObject["questions"]=(legacyObject["questions"] as! [[String:Any]]).map { item in var copy=item; copy.removeValue(forKey:"notes"); return copy }
+  let legacy=try JSONDecoder().decode(ArchivedGame.self,from:JSONSerialization.data(withJSONObject:legacyObject)); assert(legacy.notes==nil && legacy.sourcePath==nil && legacy.questions[0].notes==nil)
   let aggregate=GameArchive.aggregate([completed]);assert(aggregate.count==2 && aggregate.first { $0.question.id==q.id }!.percent==25)
   restored.phoneRoom.grade(restored.phoneRoom.answers[2].id,points:1)
   assert(restored.gameArchive.games[0].stats(for:completed.questions[0]).pending==0 && restored.gameArchive.games[0].stats(for:completed.questions[0]).correct==2)

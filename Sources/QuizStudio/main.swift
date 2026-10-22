@@ -495,6 +495,8 @@ private struct AutosaveSnapshot {
     @Published var showBulkEdit = false
     @Published var editorPreview: EditorPreviewMode?
     @Published var rehearsal = false
+    @Published var rehearsalSession: Studio?
+    weak var rehearsalParent: Studio?
     @Published var rehearsalSource: RehearsalReturnPoint?
     @Published var rehearsalIssue: String?
     @Published var rehearsalIssueStep: Int?
@@ -617,7 +619,7 @@ private struct AutosaveSnapshot {
         phoneRoom.studio = self
         playbackSubscription = playback.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, self.playing else { return event }
+            guard let self, self.playing, !self.repairingQuestion else { return event }
             if event.modifierFlags.intersection([.command,.control,.option]).isEmpty == false {
                 if event.modifierFlags.contains(.command) && event.keyCode == 116 { self.showTV(); return nil }
                 return event
@@ -633,6 +635,7 @@ private struct AutosaveSnapshot {
         timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
     }
     func autosave() {
+        if rehearsal { return }
         if (playing || screen == .teams) && !phoneMode { do { try persistResults() } catch { status = "Ошибка автосохранения: \(error.localizedDescription)" } }
         if playing { checkpoint() }
         autosaveGeneration += 1
@@ -697,7 +700,7 @@ private struct AutosaveSnapshot {
         } else { try write(to: documentURL) }
     }
     @discardableResult func handleKey(_ key: UInt16) -> Bool {
-        guard playing else { return false }
+        guard playing, !repairingQuestion else { return false }
         switch key {
         case 49, 36, Self.playPauseKeyCode: togglePause() // Space, Return, Play/Pause
         case 123, 116: back() // Left, Page Up
@@ -1274,19 +1277,25 @@ private struct AutosaveSnapshot {
         status = "Ошибка медиа · " + rehearsalIssue!
     }
     func beginRehearsal() {
-        guard !playing, !quiz.rounds.contains(where:{$0.questions.isEmpty}) else { status = "Заполните пустой раунд перед репетицией"; return }
-        rehearsalSource = RehearsalReturnPoint(screen:screen,showQuestionBank:showQuestionBank,showGameArchive:showGameArchive,roundIndex:roundIndex,questionIndex:questionIndex,focusEditorQuestionID:focusEditorQuestionID,phoneMode:phoneMode,automaticAdvance:automaticAdvance,signalsEnabled:signalsEnabled,steps:steps,layouts:matchLayouts,index:index,playing:playing,paused:paused)
+        guard !playing else { return }
+        let session=Studio(draftURL:FileManager.default.temporaryDirectory.appendingPathComponent("QuizStudio-Rehearsal-\(UUID().uuidString).workspace"))
+        session.timer?.invalidate(); session.quiz=quiz; session.folder=folder; session.documentURL=documentURL
+        session.rehearsalParent=self
+        session.screen = .editor; session.roundIndex=roundIndex; session.questionIndex=questionIndex; session.focusEditorQuestionID=focusEditorQuestionID
+        session.introductionSeconds=introductionSeconds; session.phoneMode=phoneMode; session.automaticAdvance=false; session.signalsEnabled=false
+        session.registeredFontName=registeredFontName; session.audioOutputUID=audioOutputUID
+        rehearsalSession=session
+        session.startRehearsal()
+    }
+    func startRehearsal() {
+        guard !quiz.rounds.isEmpty else { status = "Добавьте раунд перед репетицией"; return }
         isEditorPreview = true; rehearsal = true; rehearsalIssue = nil; rememberRecent = false
-        for r in quiz.rounds { for (qi,q) in r.questions.enumerated() {
-            if !q.issues.isEmpty { status = "\(r.title), вопрос \(qi+1): \(q.issues.joined(separator:"; "))"; endRehearsal(); return }
-        } }
-        steps = makeGameSteps(for:quiz,phoneMode:phoneMode,introductionSeconds:introductionSeconds,includeTeamIntroductions:true); matchLayouts=makeMatchLayouts(for:quiz); phoneMode=false; signalsEnabled=false; automaticAdvance=false; publishedScores=false; archiveRun=nil; playing=true; paused=true; index=0; enter(); paused=false; playback.setPaused(false); screen = rehearsalSource?.screen ?? .editor
+        steps = makeGameSteps(for:quiz,phoneMode:phoneMode,introductionSeconds:introductionSeconds,includeTeamIntroductions:true); matchLayouts=makeMatchLayouts(for:quiz); phoneMode=false; signalsEnabled=false; automaticAdvance=false; publishedScores=false; archiveRun=nil; playing=true; paused=true; index=0; enter(); paused=false; playback.setPaused(false)
     }
     func endRehearsal() {
-        guard let source=rehearsalSource else { return }
         playback.stop(); background.stop(); timer?.invalidate(); playing=false; rehearsal=false; isEditorPreview=false; rehearsalTV?.close(); rehearsalTV=nil
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor); self.keyMonitor=nil }
-        screen=source.screen; showQuestionBank=source.showQuestionBank; showGameArchive=source.showGameArchive; roundIndex=source.roundIndex; questionIndex=source.questionIndex; focusEditorQuestionID=source.focusEditorQuestionID; phoneMode=source.phoneMode; automaticAdvance=source.automaticAdvance; signalsEnabled=source.signalsEnabled; steps=source.steps; matchLayouts=source.layouts; index=source.index; rehearsalSource=nil; rehearsalIssue=nil; rehearsalIssueStep=nil; status=""
+        rehearsalIssue=nil; rehearsalIssueStep=nil; rehearsalSource=nil; rehearsalParent?.rehearsalSession=nil; rehearsalParent=nil
     }
     func showRehearsalTV() {
         guard rehearsal else { return }
@@ -2186,9 +2195,10 @@ struct Content: View {
     @ObservedObject var studio: Studio
     var body: some View {
         VStack(spacing:0) {
-            if !studio.playing { AppSectionBar(studio:studio) }
+            if !studio.playing && studio.rehearsalSession == nil { AppSectionBar(studio:studio) }
             Group {
-                if studio.showQuestionBank { QuestionBankView(studio:studio) }
+                if let rehearsal=studio.rehearsalSession { RehearsalView(studio:rehearsal) }
+                else if studio.showQuestionBank { QuestionBankView(studio:studio) }
                 else if studio.showGameArchive { GameArchiveView(studio:studio) }
                 else if studio.playing && studio.rehearsal { RehearsalView(studio:studio) }
                 else if studio.playing { PlayerView(studio: studio) }
@@ -2206,13 +2216,14 @@ struct Content: View {
         .sheet(isPresented:$studio.showBulkImport) { BulkQuestionImportView(studio:studio) }
         .sheet(isPresented:$studio.showQuizAssembly) { QuizAssemblyView(studio:studio) }
         .sheet(isPresented:$studio.showSIQImport) { if let url = studio.siqSource { SIQImportView(studio:studio,source:url) } }
+        .sheet(isPresented:$studio.showPreflight) { PreflightReport(studio:studio) }
     }
 }
 struct RehearsalView: View {
     @ObservedObject var studio: Studio
     var body: some View {
         VStack(spacing:0) {
-            HStack { Label("Репетиция",systemImage:"play.rectangle.on.rectangle").font(.headline); Spacer(); Text(studio.quiz.title).foregroundStyle(.secondary); Button("Вернуться в редактор") { studio.endRehearsal() }.keyboardShortcut(.cancelAction) }.padding(12)
+            HStack { Label("Репетиция",systemImage:"play.rectangle.on.rectangle").font(.headline); Spacer(); Text(studio.quiz.title).foregroundStyle(.secondary); Button("Вернуться") { studio.endRehearsal() }.keyboardShortcut(.cancelAction) }.padding(12)
             Stage(studio:studio,audience:false).frame(minHeight:480)
             HStack { Button("Назад") { studio.back() }.disabled(studio.index == 0); Button("Экран участников") { studio.showRehearsalTV() }.disabled(NSScreen.screens.count < 2); Spacer(); Text(studio.stepTitle(studio.index)).font(.caption).lineLimit(1); Spacer(); Button("Вперёд") { studio.next() }.disabled(studio.step?.kind == .finish) }.padding(12)
             if let issue=studio.rehearsalIssue { HStack { Image(systemName:"exclamationmark.triangle.fill"); Text(issue).lineLimit(2); Spacer(); Button("Перейти и повторить") { if let target=studio.rehearsalIssueStep { studio.jump(to:target) } } }.foregroundStyle(.orange).padding(.horizontal,12).padding(.bottom,10) }
@@ -2222,34 +2233,62 @@ struct RehearsalView: View {
 struct AppSectionBar: View {
     @ObservedObject var studio: Studio
     var body: some View {
-        HStack(spacing:6) {
-            section("Главная","house",selected:studio.screen == .home && !studio.showQuestionBank && !studio.showGameArchive) {
-                studio.showQuestionBank=false; studio.showGameArchive=false
-                if studio.screen == .editor { studio.leaveEditor(destination:.home) } else { studio.screen = .home }
-            }
-            section("Мои квизы","rectangle.stack",selected:(studio.screen == .library || studio.screen == .createLibrary) && !studio.showQuestionBank && !studio.showGameArchive) {
-                studio.showQuestionBank=false; studio.showGameArchive=false
-                studio.libraryIntent = .edit
-                if studio.screen == .editor { studio.leaveEditor(destination:.createLibrary) } else { studio.screen = .createLibrary }
-            }
-            section("Банк вопросов","tray.full",selected:studio.showQuestionBank) {
-                studio.showGameArchive=false; studio.showQuestionBank=true
-            }
-            section("Архив игр","chart.bar.doc.horizontal",selected:studio.showGameArchive) {
-                studio.showQuestionBank=false; studio.persistArchive(); studio.showGameArchive=true
-            }
-            Spacer(minLength:0)
-        }.buttonStyle(.plain).padding(.horizontal,12).padding(.vertical,7)
+        ViewThatFits(in:.horizontal) {
+            navigationRow(compact:false)
+            navigationRow(compact:true)
+        }
+        .padding(.horizontal,12).padding(.vertical,7)
             .background(.bar)
             .overlay(alignment:.bottom) { Divider() }
     }
-    private func section(_ title:String,_ icon:String,selected:Bool,action:@escaping ()->Void) -> some View {
+    private func navigationRow(compact:Bool) -> some View {
+        HStack(spacing:compact ? 2 : 6) {
+            section("Собрать квиз",compactTitle:"Собрать","square.and.pencil",compact:compact,selected:!studio.showQuestionBank && !studio.showGameArchive && studio.screen != .teams && !studio.showPreflight,shortcut:"1",description:"Создание, библиотека, банк вопросов, импорт и медиа") {
+                let returningFromStageOverlay = studio.showQuestionBank || studio.showGameArchive || studio.showPreflight
+                studio.showQuestionBank=false; studio.showGameArchive=false; studio.showPreflight=false
+                if returningFromStageOverlay {
+                    if studio.screen == .teams { studio.screen = .editor }
+                }
+                else if studio.screen == .editor { studio.leaveEditor(destination:.home) }
+                else if studio.screen == .teams { studio.screen = .editor }
+                else { studio.screen = .home }
+            }
+            section("Проверить",compactTitle:"Проверить","checkmark.circle",compact:compact,selected:studio.showPreflight,shortcut:"2",description:"Статусы вопросов, техническая проверка медиа и репетиция") {
+                studio.showQuestionBank=false; studio.showGameArchive=false; studio.screen = .editor
+                studio.showPreflight=true
+                Task { await studio.validateQuiz() }
+            }
+            section("Подготовить площадку",compactTitle:"Площадка","display",compact:compact,selected:studio.screen == .teams && !studio.showQuestionBank && !studio.showGameArchive,shortcut:"3",description:"Команды, экран, звук и формат ответов") {
+                studio.showQuestionBank=false; studio.showGameArchive=false; studio.showPreflight=false
+                if studio.screen == .editor { studio.autosave(); studio.prepareGame() }
+                else if studio.screen != .teams { studio.showLibrary(forPlay:true) }
+            }
+            section("Провести игру",compactTitle:"Провести","play.rectangle",compact:compact,selected:studio.playing && !studio.rehearsal,shortcut:"4",description:"Пульт ведущего, таймер и быстрые исправления") {
+                studio.showQuestionBank=false; studio.showGameArchive=false; studio.showPreflight=false
+                if studio.screen == .teams { studio.beginCheckedGame() }
+                else if studio.screen == .editor { studio.autosave(); studio.prepareGame() }
+                else { studio.showLibrary(forPlay:true) }
+            }
+            section("Разобрать результаты",compactTitle:"Результаты","chart.bar.doc.horizontal",compact:compact,selected:studio.showGameArchive,shortcut:"5",description:"Архив проведений, статистика и заметки") {
+                studio.showQuestionBank=false; studio.showPreflight=false; studio.persistArchive(); studio.showGameArchive=true
+            }
+            Spacer(minLength:0)
+        }
+    }
+    private func section(_ title:String,compactTitle:String,_ icon:String,compact:Bool,selected:Bool,shortcut:KeyEquivalent,description:String,action:@escaping ()->Void) -> some View {
         Button(action:action) {
-            Label(title,systemImage:icon).font(.callout.weight(selected ? .semibold : .regular))
+            Label(compact ? compactTitle : title,systemImage:icon).font(.callout.weight(selected ? .semibold : .regular))
+                .lineLimit(1).minimumScaleFactor(0.76)
                 .padding(.horizontal,10).padding(.vertical,6)
+                .frame(maxWidth:.infinity)
                 .background(selected ? Color.accentColor.opacity(0.12) : .clear,in:Capsule())
                 .foregroundStyle(selected ? Color.accentColor : Color.secondary)
-        }.help(title)
+        }
+        .buttonStyle(.plain)
+        .help("\(title) · \(description) · ⌘\(shortcut.character)")
+        .accessibilityLabel(title)
+        .accessibilityHint(description)
+        .keyboardShortcut(shortcut,modifiers:[.command])
     }
 }
 struct Editor: View {
@@ -3290,7 +3329,7 @@ struct Welcome: View {
             HStack(alignment:.center,spacing:12) {
                 VStack(alignment:.leading,spacing:4) {
                     Text("Квиз Студия").font(.system(size: compact ? 28 : 34,weight:.bold))
-                    Text("Создайте игру или проведите готовый квиз").font(compact ? .callout : .title3).foregroundStyle(.secondary)
+                    Text("Соберите квиз, проверьте, подготовьте площадку и проведите игру").font(compact ? .callout : .title3).foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button("Архив",systemImage:"chart.bar.doc.horizontal") { studio.showGameArchive = true }.buttonStyle(.bordered)
@@ -3298,7 +3337,7 @@ struct Welcome: View {
             if studio.recoveryAvailable { Button("Восстановить незавершённую игру") { studio.restoreGame() }.buttonStyle(.borderedProminent) }
             Button("Продолжить черновик",systemImage:"pencil") { studio.screen = .editor }.buttonStyle(.link).frame(maxWidth:.infinity,alignment:.leading)
             LazyVGrid(columns: [GridItem(.flexible(),spacing: 12),GridItem(.flexible(),spacing: 12)],spacing: 12) {
-                Button { showQuickCreate = true } label: { entry("Создать квиз","Начните с первого вопроса, затем настройте игру","square.and.pencil") }
+                Button { showQuickCreate = true } label: { entry("Создать короткий квиз","Добавьте вопросы и ответы, раунды и медиа настройте позже","square.and.pencil") }
                 Button { studio.showLibrary() } label: { entry("Мои квизы","Редактируйте проекты и управляйте библиотекой","rectangle.stack") }
                 Button { studio.showLibrary(forPlay:true) } label: { entry("Провести игру","Выберите квиз — подготовка начнётся сразу","play.rectangle") }
                 Button { studio.showQuestionBank = true } label: { entry("Банк вопросов","Ищите, импортируйте и собирайте вопросы","tray.full") }
@@ -3771,7 +3810,6 @@ struct TeamSetup: View {
         }.padding(36) }
         .onChange(of: studio.phoneMode) { _,enabled in if !enabled { studio.phoneRoom.stop(); studio.tv?.close(); studio.tv = nil } }
         .sheet(isPresented: $deviceSettings) { DeviceSettings(studio: studio,soundCheck:$soundCheck,soundTestPlayed:$soundTestPlayed) }
-        .sheet(isPresented: $studio.showPreflight) { PreflightReport(studio: studio) }
         .task { await refreshPreflight() }
         .onChange(of: studio.quiz) { _,_ in preflightComplete = false; preflightPassed = false; studio.preflightAcceptedLocalMode = false }
     }
@@ -4078,6 +4116,11 @@ struct PreflightReport: View {
             HStack {
                 Button("Проверить снова") { Task { await studio.validateQuiz() } }.disabled(studio.checkingQuiz)
                 if !studio.preflightIssues.isEmpty { Button("Исправить в редакторе") { studio.screen = .editor; dismiss() } }
+                Button("Репетиция") {
+                    dismiss()
+                    Task { @MainActor in await Task.yield(); studio.beginRehearsal() }
+                }
+                    .disabled(studio.playing)
                 Spacer(); Button("Закрыть") { dismiss() }
             }
         }.padding(24).frame(width: 650,height: 450)

@@ -6,6 +6,9 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
  }
  @MainActor static func main() async throws {
   let root=URL(fileURLWithPath:CommandLine.arguments[1]);let studio=Studio(draftURL:root.appendingPathComponent("Draft.workspace"));studio.timer?.invalidate();studio.screen = .editor
+  let rehearsalOwner=Studio(draftURL:root.appendingPathComponent("RehearsalOwner.workspace"));rehearsalOwner.timer?.invalidate();var rehearsalQuiz=Quiz();rehearsalQuiz.rounds[0].questions=[Question()];rehearsalOwner.quiz=rehearsalQuiz;let rehearsalRecovery=rehearsalOwner.recoveryURL
+  rehearsalOwner.beginRehearsal();assert(!rehearsalOwner.playing && rehearsalOwner.rehearsalSession?.playing==true && rehearsalOwner.quiz==rehearsalQuiz)
+  let isolated=rehearsalOwner.rehearsalSession!;assert(!FileManager.default.fileExists(atPath:rehearsalRecovery.path));isolated.endRehearsal();assert(rehearsalOwner.rehearsalSession==nil && rehearsalOwner.quiz==rehearsalQuiz && !FileManager.default.fileExists(atPath:rehearsalRecovery.path))
   assert(Question.cleanTags(" кино, музыка;КИНО\n космос ")==["кино","музыка","космос"])
   var q=Question();q.text="Назовите исполнителя";q.answer="Ответ";q.tags=["музыка","кино"];q.difficulty="Средний"
   let entry=try studio.questionBank.save(q,assets:[:]);try studio.insertBankQuestions([entry])
