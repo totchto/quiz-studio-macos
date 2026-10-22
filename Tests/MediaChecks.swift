@@ -250,13 +250,20 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   await quiz.validateQuiz(); assert(!quiz.preflightIssues.isEmpty)
   quiz.quiz.rounds[0].questions[0].start = 0.4
   quiz.quiz.rounds[0].questions[0].media = nil
-  await quiz.validateQuiz(); assert(quiz.preflightIssues.isEmpty)
+  await quiz.validateQuiz(); assert(quiz.preflightIssues.isEmpty && quiz.preflightMediaIssues.isEmpty)
   quiz.quiz.rounds[0].questions[0].media = "tone.wav"
   quiz.quiz.rounds[0].questions[0].explanationMedia = nil
   quiz.quiz.rounds[0].questions[0].audioOnly = true
-  await quiz.validateQuiz(); assert(quiz.preflightIssues.isEmpty)
+  await quiz.validateQuiz(); assert(quiz.preflightIssues.isEmpty && quiz.preflightMediaIssues.isEmpty)
   quiz.quiz.rounds[0].questions[0].audioOnly = false
-  await quiz.validateQuiz(); assert(quiz.preflightIssues.contains { $0.contains("вопрос") && $0.contains("видеодорожки") })
+  await quiz.validateQuiz(); assert(quiz.preflightIssues.contains { $0.contains("видеодорожки") && $0.contains("Аудиовопрос") }); assert(quiz.preflightMediaIssues.count == 1)
+  quiz.openPreflightIssue(quiz.preflightMediaIssues[0]); assert(quiz.focusEditorQuestionID == quiz.quiz.rounds[0].questions[0].id)
+  quiz.openPreflightIssue("Правила раунда «\(quiz.quiz.rounds[0].title)»: не читается фрагмент")
+  assert(quiz.focusEditorRoundIntroID == quiz.quiz.rounds[0].id)
+  quiz.focusEditorRoundIntroID = nil
+  quiz.quiz.rounds[0].questions[0].audioOnly = true; quiz.quiz.rounds[0].questions[0].media = "missing.wav"
+  await quiz.validateQuiz(); assert(quiz.preflightMediaIssues.contains { $0.contains("Аудиовопрос") && $0.contains("missing.wav") })
+  quiz.quiz.rounds[0].questions[0].media = "tone.wav"
   quiz.quiz.rounds[0].questions[0].image = "missing.png"
   await quiz.validateQuiz(); assert(quiz.preflightIssues.contains { $0.contains("missing.png") })
   quiz.quiz.rounds[0].questions[0].image = nil
@@ -302,5 +309,10 @@ struct Stage: View { var studio: Studio; var audience: Bool; var body: some View
   quiz.selectRound(quiz.quiz.rounds[0].id); assert(quiz.selectedQuestion == nil)
   quiz.deleteEmptyRound(quiz.quiz.rounds[0].id); assert(quiz.quiz.rounds.count == 1 && quiz.selectedQuestion != nil)
   print("PASS: native drag provider decoding, moving last question, selecting and removing empty round")
+  let accepted = Studio(draftURL:root.appendingPathComponent("accepted-preflight.workspace")); accepted.timer?.invalidate()
+  accepted.quiz.rounds[0].questions[0].text = "Тестовый вопрос"; accepted.quiz.rounds[0].questions[0].answer = "Ответ"; accepted.quiz.teams = [Team(name:"Проверка")]
+  accepted.preflightAcceptedLocalMode = true; accepted.beginCheckedGame()
+  try await wait("accepted preflight starts") { accepted.playing }
+  accepted.stop(); print("PASS: explicit organizer acceptance allows game to proceed after a fresh preflight with unresolved editorial warning")
  }
 }

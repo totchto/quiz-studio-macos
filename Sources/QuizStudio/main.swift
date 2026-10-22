@@ -535,6 +535,7 @@ private struct AutosaveSnapshot {
     var checkpointTicks = 0
     @Published var checkingQuiz = false
     @Published var preflightIssues: [String] = []
+    @Published var preflightMediaIssues: [String] = []
     @Published var showPreflight = false
     @Published var showScoreInputLocally = false
     @Published var showJump = false
@@ -558,6 +559,7 @@ private struct AutosaveSnapshot {
     @Published var autosaveError: String?
     @Published var focusEditorSearch = false
     @Published var focusEditorQuestionID: UUID?
+    @Published var focusEditorRoundIntroID: UUID?
     @Published var focusLibrarySearch = false
     @Published var publishedScores = false
     @Published var scoreSnapshot: [Team] = []
@@ -1065,6 +1067,16 @@ private struct AutosaveSnapshot {
         }
         for (roundIndex,round) in quiz.rounds.enumerated() {
             if target != nil { break }
+            if issue.hasPrefix("Правила раунда «\(round.title)»") {
+                self.roundIndex = roundIndex; questionIndex = 0; focusEditorRoundIntroID = round.id
+                screen = .editor
+                return
+            }
+            let mediaQuestionPrefix = "Раунд «\(round.title)», вопрос "
+            if issue.hasPrefix(mediaQuestionPrefix) {
+                let number = issue.dropFirst(mediaQuestionPrefix.count).prefix { $0.isNumber }
+                if let index = Int(number), round.questions.indices.contains(index-1) { target = (roundIndex,index-1); break }
+            }
             let prefix = "\(round.title), вопрос "
             if issue.hasPrefix(prefix) {
                 let number = issue.dropFirst(prefix.count).prefix { $0.isNumber }
@@ -1074,9 +1086,15 @@ private struct AutosaveSnapshot {
                let questionIndex = round.questions.firstIndex(where: { !$0.text.isEmpty && issue.contains($0.text) }) {
                 target = (roundIndex,questionIndex); break
             }
-            if let assetName = ["Нет файла: ","Не читается изображение: "].compactMap({ prefix in
+            let missingAssetName = ["Нет файла: ","Не читается изображение: "].compactMap({ prefix in
                 issue.hasPrefix(prefix) ? String(issue.dropFirst(prefix.count)) : nil
-            }).first,
+            }).first
+            if let missingAssetName, (round.intro?.media == missingAssetName || round.intro?.image == missingAssetName) {
+                self.roundIndex = roundIndex; questionIndex = 0; focusEditorRoundIntroID = round.id
+                screen = .editor
+                return
+            }
+            if let assetName = missingAssetName,
                let questionIndex = round.questions.firstIndex(where: { question in
                    ([question.image,question.media,question.explanationImage,question.explanationMedia].compactMap { $0 } + (question.imageGallery ?? []) + (question.explanationGallery ?? []) + (question.choiceImages ?? []).compactMap { $0 } + (question.siqAttachments ?? []).map(\.name)).contains(assetName)
                }) {
@@ -1523,6 +1541,10 @@ extension Studio {
     private func performQuizValidation() async {
         let checkedQuiz = quiz
         let checkedAssets = referencedAssets
+        var mediaIssues: [String] = []
+        let usedFragmentNames = Set(checkedQuiz.rounds.flatMap { round in
+            round.questions.flatMap { [$0.media,$0.explanationMedia].compactMap { $0 } } + [round.intro?.media].compactMap { $0 }
+        })
         var issues = checkedQuiz.rounds.enumerated().flatMap { roundIndex,round in
             (round.questions.isEmpty ? ["\(round.title): нет вопросов"] : []) + round.questions.enumerated().flatMap { index,question in
                 let technical = question.issues.isEmpty ? nil : "\(round.title), вопрос \(index+1): \(question.issues.joined(separator: "; "))"
@@ -1532,20 +1554,25 @@ extension Studio {
             }
         }
         for name in checkedAssets {
-            guard let url = asset(name), FileManager.default.fileExists(atPath: url.path) else { issues.append("Нет файла: " + name); continue }
-            if ["png","jpg","jpeg","gif","heic","tiff","webp"].contains(url.pathExtension.lowercased()), NSImage(contentsOf: url) == nil { issues.append("Не читается изображение: " + name) }
+            guard let url = asset(name), FileManager.default.fileExists(atPath: url.path) else {
+                if !usedFragmentNames.contains(name) { let issue = "Нет файла: " + name; issues.append(issue); mediaIssues.append(issue) }
+                continue
+            }
+            if ["png","jpg","jpeg","gif","heic","tiff","webp"].contains(url.pathExtension.lowercased()), NSImage(contentsOf: url) == nil { let issue = "Не читается изображение: " + name; issues.append(issue); mediaIssues.append(issue) }
         }
         var checked: [String: (duration: Double,audio: Bool,video: Bool)] = [:]
         for round in checkedQuiz.rounds {
-            let entries = round.questions.flatMap { q -> [(String,Double,Double,String)] in
-                var a: [(String,Double,Double,String)] = []
+            let entries = round.questions.enumerated().flatMap { index,q -> [(String,Double,Double,String,Bool?)] in
+                var a: [(String,Double,Double,String,Bool?)] = []
                 let questionSettings = q.settings(answer:false); let answerSettings = q.settings(answer:true)
-                if let name = q.media { a.append((name,questionSettings.start,questionSettings.end,round.title + ": " + q.text)) }
-                if let name = q.explanationMedia ?? q.media { a.append((name,answerSettings.start,answerSettings.end,"Объяснение: " + q.text)) }; return a
-            } + (round.intro?.media.map { [($0,0.0,0.0,"Правила: " + round.title)] } ?? [])
-            for (name,start,end,label) in entries {
+                let title = q.text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? "без названия" : q.text
+                let questionLabel = "Раунд «\(round.title)», вопрос \(index+1) «\(title)»"
+                if let name = q.media { a.append((name,questionSettings.start,questionSettings.end,questionLabel + " · вопрос",!q.audioOnly)) }
+                if let name = q.explanationMedia ?? q.media { a.append((name,answerSettings.start,answerSettings.end,questionLabel + " · ответ",q.answerVideo)) }; return a
+            } + (round.intro?.media.map { [($0,0.0,0.0,"Правила раунда «\(round.title)»",nil as Bool?)] } ?? [])
+            for (name,start,end,label,videoExpected) in entries {
                 do {
-                    guard let url = asset(name), FileManager.default.fileExists(atPath: url.path) else { continue }
+                    guard let url = asset(name), FileManager.default.fileExists(atPath: url.path) else { let issue = label + ": отсутствует файл «\(name)». Перейдите к медиафайлу и выберите или восстановите запись."; issues.append(issue); mediaIssues.append(issue); continue }
                     let media: (duration: Double,audio: Bool,video: Bool)
                     if let value = checked[name] { media = value } else {
                         let asset = AVURLAsset(url: url)
@@ -1557,25 +1584,21 @@ extension Studio {
                     }
                     _ = try MediaRange.resolve(start: start,end: end,duration: media.duration)
                     if end > media.duration { issues.append(label + ": конец фрагмента позже конца записи.") }
-                    let isAnswer = label.hasPrefix("Объяснение:")
-                    let videoExpected: Bool
-                    if label.hasPrefix("Правила:") { videoExpected = true }
-                    else if isAnswer, let q = round.questions.first(where: { !$0.text.isEmpty && label.contains($0.text) }) { videoExpected = q.answerVideo }
-                    else if let q = round.questions.first(where: { !$0.text.isEmpty && label.contains($0.text) }) { videoExpected = !q.audioOnly }
-                    else { videoExpected = false }
-                    if videoExpected && !media.video { issues.append(label + ": выбран показ видео, но в этом файле нет видеодорожки. Переключите вопрос в режим «только звук» или выберите видеофайл.") }
-                    if !media.audio && !media.video { issues.append(label + ": фрагмент не содержит аудио- или видеодорожки.") }
-                } catch { issues.append(label + ": " + error.localizedDescription) }
+                    if videoExpected == true && !media.video { let issue = label + ": выбран показ видео, но в этом файле нет видеодорожки. Переключите вопрос в режим «только звук» или выберите видеофайл."; issues.append(issue); mediaIssues.append(issue) }
+                    if !media.audio && !media.video { let issue = label + ": фрагмент не содержит аудио- или видеодорожки."; issues.append(issue); mediaIssues.append(issue) }
+                } catch { let issue = label + ": " + error.localizedDescription; issues.append(issue); mediaIssues.append(issue) }
             }
         }
         if quiz == checkedQuiz {
             preflightIssues = Array(Set(issues)).sorted()
+            preflightMediaIssues = Array(Set(mediaIssues)).sorted()
         } else {
             preflightIssues = ["Квиз изменился во время проверки. Запустите проверку снова."]
+            preflightMediaIssues = []
         }
     }
     func beginCheckedGame() {
-        Task { let checked = quiz; await validateQuiz(); guard checked == quiz else { status = "Квиз изменился во время проверки. Нажмите старт ещё раз."; return }; if preflightIssues.isEmpty { beginGame() } else { showPreflight = true } }
+        Task { let checked = quiz; await validateQuiz(); guard checked == quiz else { status = "Квиз изменился во время проверки. Нажмите старт ещё раз."; return }; if preflightIssues.isEmpty || preflightAcceptedLocalMode { beginGame() } else { showPreflight = true } }
     }
 }
 
@@ -2529,8 +2552,14 @@ struct Editor: View {
         }
         .onAppear { focusPendingQuestion() }
         .onChange(of: studio.focusEditorQuestionID) { _, _ in focusPendingQuestion() }
+        .onChange(of: studio.focusEditorRoundIntroID) { _, _ in focusPendingQuestion() }
     }
     private func focusPendingQuestion() {
+        if let id = studio.focusEditorRoundIntroID, let index = studio.quiz.rounds.firstIndex(where: { $0.id == id }) {
+            studio.roundIndex = index; studio.questionIndex = 0; currentView = .round
+            studio.focusEditorRoundIntroID = nil; studio.focusEditorQuestionID = nil
+            return
+        }
         guard let id = studio.focusEditorQuestionID else { return }
         for (roundIndex,round) in studio.quiz.rounds.enumerated() {
             if let questionIndex = round.questions.firstIndex(where: { $0.id == id }) {
@@ -3652,7 +3681,7 @@ struct TeamSetup: View {
                 Image(systemName:"chevron.right").font(.caption2).foregroundStyle(.tertiary)
                 Button { setupStep = 1 } label: { preparationStep("2 · Команды",detail:studio.phoneMode ? "\(studio.phoneRoom.joinedTeams.count) подключено" : "\(validTeamCount) добавлено",ready:studio.phoneMode ? (studio.phoneRoom.running && !studio.phoneRoom.joinedTeams.isEmpty) : validTeamCount > 0,active:setupStep == 1) }.buttonStyle(.plain)
                 Image(systemName:"chevron.right").font(.caption2).foregroundStyle(.tertiary)
-                Button { setupStep = 2 } label: { preparationStep("3 · Экран и звук",detail:NSScreen.screens.count > 1 ? "Экран: \(NSScreen.screens.indices.contains(studio.selectedScreen) ? NSScreen.screens[studio.selectedScreen].localizedName : "не выбран")" : "Локальный экран Mac",ready:NSScreen.screens.indices.contains(studio.selectedScreen),active:setupStep == 2) }.buttonStyle(.plain)
+                Button { setupStep = 2 } label: { preparationStep("3 · Экран и звук",detail:NSScreen.screens.count > 1 ? "Экран: \(NSScreen.screens.indices.contains(studio.selectedScreen) ? NSScreen.screens[studio.selectedScreen].localizedName : "не выбран")" : "Локальный экран Mac",ready:NSScreen.screens.count < 2 || NSScreen.screens.indices.contains(studio.selectedScreen),active:setupStep == 2) }.buttonStyle(.plain)
                 Image(systemName:"chevron.right").font(.caption2).foregroundStyle(.tertiary)
                 Button { setupStep = 3 } label: { preparationStep("4 · Проверка",detail:preflightComplete ? (preflightPassed ? "Пройдена" : "Есть замечания") : "Не проверено",ready:preflightComplete ? preflightPassed : nil,active:setupStep == 3) }.buttonStyle(.plain)
             }.padding(12).background(.quaternary.opacity(0.55),in:RoundedRectangle(cornerRadius:10))
@@ -3712,18 +3741,17 @@ struct TeamSetup: View {
             if setupStep == 3 { GroupBox {
                 VStack(alignment: .leading,spacing: 10) {
                     Text("Готовность к игре").font(.headline)
-                    readinessRow("Формат",detail:studio.phoneMode ? "Ответы с телефонов" : "Бумажные бланки",ready:true)
+                    readinessRow("Формат ответов",detail:studio.phoneMode ? "Ответы с телефонов" : "Бумажные бланки",ready:true)
                     readinessRow("Команды",detail:studio.phoneMode ? (studio.phoneRoom.running ? "Подключено: \(studio.phoneRoom.joinedTeams.count)" : "Комната не запущена") : "Добавлено: \(validTeamCount)",ready:studio.phoneMode ? (studio.phoneRoom.running && !studio.phoneRoom.joinedTeams.isEmpty) : validTeamCount > 0)
                     readinessRow("Экран",detail:NSScreen.screens.count < 2 ? "Локальный режим · экран Mac" : (NSScreen.screens.indices.contains(studio.selectedScreen) ? studio.selectedScreenName : "Не выбран"),ready:NSScreen.screens.count < 2 || NSScreen.screens.indices.contains(studio.selectedScreen))
                     readinessRow("Звук",detail:soundCheck == true ? "Проверено: звук слышен" : soundCheck == false ? "Проблема: звук не слышен" : soundTestPlayed ? "Сигнал запущен — подтвердите результат" : "Не проверен",ready:soundCheck)
-                    readinessRow("Медиа",detail:preflightComplete ? (studio.preflightIssues.contains(where: { $0.localizedCaseInsensitiveContains("фрагмент") || $0.localizedCaseInsensitiveContains("видеодорож") }) ? "Есть проблемы с фрагментами" : "Файлы и фрагменты проверены") : "Не проверено",ready:preflightComplete ? !studio.preflightIssues.contains(where: { $0.localizedCaseInsensitiveContains("фрагмент") || $0.localizedCaseInsensitiveContains("видеодорож") }) : nil)
+                    readinessRow("Медиа",detail:preflightComplete ? (studio.preflightMediaIssues.isEmpty ? "Файлы и используемые фрагменты проверены" : "Замечаний: \(studio.preflightMediaIssues.count)") : "Проверка ещё не запускалась",ready:preflightComplete ? studio.preflightMediaIssues.isEmpty : nil)
                     readinessRow("Квиз",detail:preflightComplete ? (preflightPassed ? "Проверка пройдена" : "Найдены замечания") : "Не проверен",ready:preflightComplete ? preflightPassed : nil)
                     HStack {
                         Button("Команды") { setupStep = 1 }
                         Button("Открыть настройки экрана") { deviceSettings = true }
                         Button("Проверить звук") { deviceSettings = true }
-                        Button("Проверить квиз") { studio.showPreflight = true; Task { await refreshPreflight() } }
-                        Button("Исправить в редакторе") { studio.showPreflight = false; studio.screen = .editor }
+                        Button("Медиа и замечания…") { studio.showPreflight = true; Task { await refreshPreflight() } }
                     }.buttonStyle(.bordered)
                     if studio.checkingQuiz { ProgressView("Проверяем квиз…") }
                     else if !studio.status.isEmpty { Text(studio.status).font(.caption).foregroundStyle(.secondary) }
@@ -3732,7 +3760,7 @@ struct TeamSetup: View {
                         Text("Проблемы могут повлиять на показ отдельных вопросов или звук. Необязательный внешний экран остаётся локальным режимом.").font(.caption).foregroundStyle(.secondary)
                     }
                     HStack { Spacer(); Button("Проверить и начать игру",systemImage: "play.fill") { if preflightComplete && !preflightPassed && !studio.preflightAcceptedLocalMode { showLocalModeConfirmation = true } else { studio.beginCheckedGame() } }.buttonStyle(.borderedProminent).disabled((!studio.phoneMode && validTeamCount == 0) || studio.checkingQuiz || (studio.phoneMode && (!studio.phoneRoom.running || studio.phoneRoom.joinedTeams.isEmpty))) }
-                    .alert("Продолжить с замечаниями?",isPresented:$showLocalModeConfirmation) { Button("Вернуться к проверке",role:.cancel) {}; Button("Продолжить игру") { studio.preflightAcceptedLocalMode = true; studio.beginGame() } } message: { Text("Нерешённые проблемы могут нарушить показ медиа или звука. Продолжайте, только если готовы провести игру с этими ограничениями.") }
+                    .alert("Продолжить с замечаниями?",isPresented:$showLocalModeConfirmation) { Button("Вернуться к проверке",role:.cancel) {}; Button("Продолжить игру") { studio.preflightAcceptedLocalMode = true; studio.beginCheckedGame() } } message: { Text("Нерешённые проблемы могут нарушить показ медиа или звука. Продолжайте, только если готовы провести игру с этими ограничениями.") }
                 }
             } }
             HStack {
@@ -3745,15 +3773,16 @@ struct TeamSetup: View {
         .sheet(isPresented: $deviceSettings) { DeviceSettings(studio: studio,soundCheck:$soundCheck,soundTestPlayed:$soundTestPlayed) }
         .sheet(isPresented: $studio.showPreflight) { PreflightReport(studio: studio) }
         .task { await refreshPreflight() }
-        .onChange(of: studio.quiz) { _,_ in preflightComplete = false }
+        .onChange(of: studio.quiz) { _,_ in preflightComplete = false; preflightPassed = false; studio.preflightAcceptedLocalMode = false }
     }
     func readinessRow(_ title: String,detail: String,ready: Bool?) -> some View {
         HStack(spacing: 10) {
             Image(systemName: ready == true ? "checkmark.circle.fill" : ready == false ? "exclamationmark.circle.fill" : "questionmark.circle")
                 .foregroundStyle(ready == true ? Color.green : ready == false ? Color.orange : Color.secondary)
-            Text(title).fontWeight(.medium)
+            VStack(alignment:.leading,spacing:2) { Text(title).fontWeight(.medium); Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(2) }
             Spacer()
-            Text(detail).foregroundStyle(.secondary)
+            Text(ready == true ? "Готово" : ready == false ? "Есть проблема" : "Не проверено")
+                .font(.caption.weight(.semibold)).foregroundStyle(ready == true ? Color.green : ready == false ? Color.orange : Color.secondary)
         }.font(.subheadline)
     }
     func preparationStep(_ title: String,detail: String,ready: Bool?,active: Bool) -> some View {
@@ -4049,9 +4078,6 @@ struct PreflightReport: View {
             HStack {
                 Button("Проверить снова") { Task { await studio.validateQuiz() } }.disabled(studio.checkingQuiz)
                 if !studio.preflightIssues.isEmpty { Button("Исправить в редакторе") { studio.screen = .editor; dismiss() } }
-                if !studio.preflightIssues.isEmpty && studio.preflightIssues.allSatisfy({ $0.contains("Редакторская проверка — ") }) {
-                    Button("Начать игру") { studio.showPreflight = false; studio.beginGame() }.buttonStyle(.borderedProminent)
-                }
                 Spacer(); Button("Закрыть") { dismiss() }
             }
         }.padding(24).frame(width: 650,height: 450)
