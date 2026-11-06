@@ -1899,6 +1899,7 @@ struct RoundDropTarget: View {
 @main struct QuizStudioApp: App {
     @NSApplicationDelegateAdaptor(GameAppDelegate.self) var appDelegate
     @StateObject var studio = Studio()
+    @StateObject private var appUpdater = AppUpdater()
     @AppStorage("appearanceMode") private var appearanceMode = "system"
     var appearance: ColorScheme? {
         switch appearanceMode {
@@ -1908,8 +1909,11 @@ struct RoundDropTarget: View {
         }
     }
     var body: some Scene {
-        WindowGroup("Квиз Студия · 0.20.0") { Content(studio: studio).onAppear { appDelegate.install(studio) }.frame(minWidth: 1050,minHeight: 720).preferredColorScheme(appearance).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if url.pathExtension.lowercased() == "siq" { studio.chooseSIQ(url) } else if !studio.playing && studio.load(url) { studio.prepareGame() } } }
+        WindowGroup("Квиз Студия · \(AppVersion.display)") { Content(studio: studio).onAppear { appDelegate.install(studio); appUpdater.start() }.frame(minWidth: 1050,minHeight: 720).preferredColorScheme(appearance).onChange(of: studio.quiz) { _,_ in studio.autosave() }.onOpenURL { url in if url.pathExtension.lowercased() == "siq" { studio.chooseSIQ(url) } else if !studio.playing && studio.load(url) { studio.prepareGame() } } }
         .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Проверить обновления…") { appUpdater.checkForUpdates() }
+            }
             CommandGroup(replacing: .newItem) { Button("Создать квиз") { studio.newQuiz() }.keyboardShortcut("n").disabled(studio.playing); Button("Открыть квиз…") { studio.open() }.keyboardShortcut("o").disabled(studio.playing); Button("Сохранить квиз…") { studio.save() }.keyboardShortcut("s") }
             CommandGroup(replacing:.undoRedo) {
                 Button("Отменить изменение") { studio.undoEdit() }.keyboardShortcut("z").disabled(studio.playing || studio.undoHistory.isEmpty)
@@ -2323,7 +2327,7 @@ struct AppSectionBar: View {
                 .foregroundStyle(selected ? Color.accentColor : Color.secondary)
         }
         .buttonStyle(.plain)
-        .help("\(title) · \(description) · ⌘\(shortcut.character)")
+        .help("\(title) · \(description) · ⌘\(String(shortcut.character))")
         .accessibilityLabel(title)
         .accessibilityHint(description)
         .keyboardShortcut(shortcut,modifiers:[.command])
