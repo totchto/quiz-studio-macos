@@ -42,9 +42,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.20.0</string>
+	<string>0.21.0</string>
 	<key>CFBundleVersion</key>
-	<string>29</string>
+	<string>30</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>
@@ -53,6 +53,18 @@
 	<string>Игроки подключаются к локальной комнате квиза на этом Mac по QR-коду и отправляют ответы из общей Wi-Fi-сети.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>SUAllowsAutomaticUpdates</key>
+	<false/>
+	<key>SUAutomaticallyUpdate</key>
+	<false/>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/totchto/quiz-studio-macos/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>D8m3S5RFOvGASFrcvxLsn8BxsP2jU7UQNs98MKQs9Uw=</string>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
 	<key>UTExportedTypeDeclarations</key>
 	<array>
 		<dict>
