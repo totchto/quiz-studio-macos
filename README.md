@@ -31,6 +31,24 @@
 
 Сборка подписана ad hoc и не имеет нотариального заверения Apple. Перед мероприятием проверьте приложение с вашим телевизором, акустикой и Wi-Fi.
 
+## Обновления приложения
+
+Начиная с версии 0.21.0 «Квиз Студия» проверяет обновления через [Sparkle](https://sparkle-project.org): автоматически при запуске не чаще раза в сутки и по команде «Квиз Студия» → «Проверить обновления…». Приложение показывает номер версии, заметки релиза и предлагает установить обновление сейчас или отложить. Без согласия пользователя обновление не устанавливается и приложение не перезапускается. Проверка выполняется в фоне: без сети, при ошибке ленты или отсутствии новой версии приложение просто продолжает работать.
+
+Обновление принимается только с подписью EdDSA и только от приложения, подписанного тем же сертификатом Developer ID. Поэтому релиз с автообновлением нужно собирать с `QUIZSTUDIO_SIGN_IDENTITY` и заверять нотариусом Apple: ad-hoc сборка запускается, но Sparkle отклонит установку.
+
+Пользователям 0.20.0 и более ранних версий нужно один раз вручную скачать ZIP из [Releases](https://github.com/totchto/quiz-studio-macos/releases/latest), распаковать и заменить приложение в «Программах». После этого обновления приходят из приложения. Квизы `.quiz`, банк вопросов, архив игр и настройки при замене приложения не затрагиваются.
+
+### Выпуск обновления
+
+1. Поднимите `CFBundleShortVersionString` и `CFBundleVersion` в `Resources/Info.plist`; `CFBundleVersion` должен только возрастать.
+2. Соберите и подпишите: `QUIZSTUDIO_SIGN_IDENTITY="Developer ID Application: …" QUIZSTUDIO_NOTARY_PROFILE=<профиль notarytool> python3 build.py`.
+3. Соберите ленту: `python3 scripts/make_appcast.py --version <версия> --previous https://github.com/totchto/quiz-studio-macos/releases/latest/download/appcast.xml`.
+4. Опубликуйте GitHub Release `v<версия>` и приложите `QuizStudio-macOS.zip` (прежняя ссылка), `dist/sparkle/QuizStudio-<версия>.zip`, `dist/sparkle/appcast.xml` и заметки релиза.
+5. Проверьте `https://github.com/totchto/quiz-studio-macos/releases/latest/download/appcast.xml` в браузере и обновление с предыдущей версии.
+
+Закрытый ключ EdDSA хранится только в Keychain или секрете релизной среды; в репозиторий и артефакты попадает только открытый ключ `SUPublicEDKey`. Подробности — в `docs/superpowers/notes/sparkle-keys.md`.
+
 ## Подготовка квиза
 
 ### Вопросы и раунды
@@ -204,6 +222,7 @@ python3 build.py
 | Область | Команда |
 | --- | --- |
 | Модели, сохранение и ход игры | `python3 Tests/run.py` |
+| Настройки обновлений, Info.plist и версия Sparkle | `python3 Tests/check_updates.py` |
 | Аудио и видео | `python3 Tests/check_media.py` |
 | Телефонная игра и HTTP | `python3 Tests/check_phones.py` |
 | Импорт YouTube без сетевой загрузки | `python3 Tests/check_youtube.py` |
