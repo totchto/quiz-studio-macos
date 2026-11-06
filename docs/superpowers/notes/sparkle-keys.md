@@ -26,7 +26,7 @@ QUIZSTUDIO_NOTARY_PROFILE=<профиль notarytool> \
 python3 build.py
 ```
 
-- Без `QUIZSTUDIO_SIGN_IDENTITY` сборка подписывается ad hoc и пригодна только для локальной проверки: Sparkle отклонит обновление.
+- Без `QUIZSTUDIO_SIGN_IDENTITY` сборка подписывается ad hoc. Обновления при этом работают по EdDSA; Developer ID нужен для нотаризации и стабильной identity.
 - Профиль `notarytool` создаётся заранее: `xcrun notarytool store-credentials <профиль> --apple-id … --team-id …`.
 - `build.py` встраивает `Sparkle.framework`, добавляет rpath, подписывает вложенные компоненты снизу вверх (`XPCServices`, `Autoupdate`, `Updater.app`, framework, затем приложение), при необходимости отправляет ZIP в notarytool и staple.
 
@@ -42,7 +42,7 @@ python3 scripts/make_appcast.py --version 0.22.0 \
 - По умолчанию закрытый ключ берётся из Keychain; в CI передайте `--key-file`.
 - Скрипт каждый раз заново собирает `dist/sparkle/`: копирует подписанный ZIP, преобразует `Releases/v<версия>.md` во встроенные HTML-заметки, генерирует `dist/sparkle/appcast.xml` и проверяет подпись архива. Старые ZIP в каталоге не накапливаются.
 - Без `--previous` создаётся новая лента только с текущей версией. `--previous` принимает отсутствующий файл (404) и тогда начинает ленту заново.
-- Ad-hoc сборка по умолчанию отклоняется: `--allow-ad-hoc` создаёт ленту только для локальной проверки, устанавливать её нельзя.
+- Ad-hoc сборка допустима: скрипт выводит предупреждение о ненотаризованном приложении, `--allow-ad-hoc` его отключает.
 - Загрузите в GitHub Release `v<версия>`: `dist/QuizStudio-macOS.zip` (прежняя публичная ссылка), `dist/sparkle/QuizStudio-<версия>.zip`, `dist/sparkle/appcast.xml`. Заметки уже встроены в ленту.
 - `SUFeedURL` указывает на `https://github.com/totchto/quiz-studio-macos/releases/latest/download/appcast.xml`: этот адрес постоянен, а файл берётся из последнего опубликованного (не черновика и не prerelease) релиза.
 

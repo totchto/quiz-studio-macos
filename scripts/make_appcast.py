@@ -125,7 +125,7 @@ def main():
     parser.add_argument('--key-file', help='private EdDSA key file; omit to read it from the Keychain')
     parser.add_argument('--download-prefix', help='URL prefix for new archives')
     parser.add_argument('--previous', help='previous appcast URL or file, to keep old releases in the feed')
-    parser.add_argument('--allow-ad-hoc', action='store_true', help='generate a feed for local testing only')
+    parser.add_argument('--allow-ad-hoc', action='store_true', help='silence the warning for an unnotarized ad-hoc build')
     args = parser.parse_args()
 
     app = root / 'dist' / 'Квиз Студия.app'
@@ -136,8 +136,7 @@ def main():
     if version != args.version:
         raise SystemExit(f'{archive} contains version {version}, not {args.version}.')
     if app.exists() and signature_kind(app) == 'adhoc' and not args.allow_ad_hoc:
-        raise SystemExit('Ad-hoc builds cannot receive updates. Sign with QUIZSTUDIO_SIGN_IDENTITY first, '
-                         'or pass --allow-ad-hoc for a local feed that will not install.')
+        print('Warning: ad-hoc build. Updates rely on the EdDSA archive signature; the app is not notarized.')
     if args.key_file == '-':
         raise SystemExit('A stdin key file cannot be used here; pass a file path or use the Keychain.')
 

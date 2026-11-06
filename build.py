@@ -179,7 +179,7 @@ def main():
     validate_updater_config(app)
     identity = signing_identity()
     if identity == '-':
-        print('Warning: ad-hoc signing. Sparkle rejects updates unless the app is signed with a Developer ID identity.')
+        print('Note: ad-hoc signing. Updates are authenticated by the EdDSA signature; Developer ID + notarization is still recommended.')
     sign_app(app, identity)
     notarize(app, identity)
     archive = package_app(app)
