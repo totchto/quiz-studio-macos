@@ -1913,7 +1913,6 @@ struct RoundDropTarget: View {
         .commands {
             CommandGroup(after: .appInfo) {
                 Button("Проверить обновления…") { appUpdater.checkForUpdates() }
-                    .disabled(!appUpdater.isConfigured)
             }
             CommandGroup(replacing: .newItem) { Button("Создать квиз") { studio.newQuiz() }.keyboardShortcut("n").disabled(studio.playing); Button("Открыть квиз…") { studio.open() }.keyboardShortcut("o").disabled(studio.playing); Button("Сохранить квиз…") { studio.save() }.keyboardShortcut("s") }
             CommandGroup(replacing:.undoRedo) {

@@ -29,7 +29,7 @@
 5. Перед стартом задайте формат игры, команды, режим переключения и настройки звука.
 6. Выполните проверку квиза и начните игру.
 
-Сборка подписана ad hoc и не имеет нотариального заверения Apple. Перед мероприятием проверьте приложение с вашим телевизором, акустикой и Wi-Fi.
+Опубликованная сборка 0.20.0 подписана ad hoc и не имеет нотариального заверения Apple. Сборку 0.21.0 с автообновлением нельзя публиковать в ad-hoc виде: Sparkle отклонит обновления, и пользователям понадобится повторная ручная замена приложения. Перед мероприятием проверьте приложение с вашим телевизором, акустикой и Wi-Fi.
 
 ## Обновления приложения
 
@@ -43,9 +43,11 @@
 
 1. Поднимите `CFBundleShortVersionString` и `CFBundleVersion` в `Resources/Info.plist`; `CFBundleVersion` должен только возрастать.
 2. Соберите и подпишите: `QUIZSTUDIO_SIGN_IDENTITY="Developer ID Application: …" QUIZSTUDIO_NOTARY_PROFILE=<профиль notarytool> python3 build.py`.
-3. Соберите ленту: `python3 scripts/make_appcast.py --version <версия> --previous https://github.com/totchto/quiz-studio-macos/releases/latest/download/appcast.xml`.
-4. Опубликуйте GitHub Release `v<версия>` и приложите `QuizStudio-macOS.zip` (прежняя ссылка), `dist/sparkle/QuizStudio-<версия>.zip`, `dist/sparkle/appcast.xml` и заметки релиза.
+3. Соберите ленту: `python3 scripts/make_appcast.py --version <версия>`. Для второго и последующих релизов добавьте `--previous https://github.com/totchto/quiz-studio-macos/releases/latest/download/appcast.xml`, чтобы сохранить старые записи; для самой первой ленты предыдущего файла ещё нет. `--allow-ad-hoc` годится только для локальной проверки.
+4. Опубликуйте GitHub Release `v<версия>` и приложите `QuizStudio-macOS.zip` (прежняя ссылка), `dist/sparkle/QuizStudio-<версия>.zip` и `dist/sparkle/appcast.xml`. Заметки релиза встраиваются в ленту, отдельный файл загружать не нужно.
 5. Проверьте `https://github.com/totchto/quiz-studio-macos/releases/latest/download/appcast.xml` в браузере и обновление с предыдущей версии.
+
+Не публикуйте ad-hoc сборку 0.21.0: Sparkle отклонит её обновления, а пользователям понадобится ещё одна ручная замена. Релиз с обновлением выпускается только после подписи Developer ID и нотариального заверения.
 
 Закрытый ключ EdDSA хранится только в Keychain или секрете релизной среды; в репозиторий и артефакты попадает только открытый ключ `SUPublicEDKey`. Подробности — в `docs/superpowers/notes/sparkle-keys.md`.
 

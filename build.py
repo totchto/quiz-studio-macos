@@ -25,11 +25,13 @@ def notary_profile():
     return os.environ.get('QUIZSTUDIO_NOTARY_PROFILE', '')
 
 
-def sign(path, identity):
+def sign(path, identity, entitlements=None):
     command = ['codesign', '--force', '--sign', identity]
     if identity != '-':
         # Developer ID builds need the hardened runtime for notarization.
         command += ['--options', 'runtime', '--timestamp']
+    if entitlements:
+        command += ['--entitlements', str(entitlements)]
     command.append(str(path))
     run(command)
 
@@ -61,14 +63,33 @@ def validate_updater_config(app):
         problems.append('SUPublicEDKey is still the placeholder; generate the Sparkle key first.')
     else:
         try:
-            if len(base64.b64decode(key)) != 32:
+            if len(base64.b64decode(key, validate=True)) != 32:
                 problems.append('SUPublicEDKey is not a 32-byte EdDSA public key.')
         except Exception:
             problems.append('SUPublicEDKey is not valid base64.')
     if not info.get('SUEnableAutomaticChecks'):
         problems.append('SUEnableAutomaticChecks must be enabled for launch checks.')
+    if info.get('SUAllowsAutomaticUpdates', True):
+        problems.append('SUAllowsAutomaticUpdates must be disabled to avoid silent installs.')
+    if info.get('SUAutomaticallyUpdate', False):
+        problems.append('SUAutomaticallyUpdate must be disabled to avoid silent installs.')
     if problems:
         raise SystemExit('Updater configuration is incomplete:\n  ' + '\n  '.join(problems))
+
+
+def verify_helpers(app):
+    """Prove the signed helpers still start: hardened runtime without the
+    right entitlements kills Deno (JIT) and yt-dlp (PyInstaller dlopen)."""
+    for name in ('deno', 'yt-dlp'):
+        binary = app / 'Contents/Resources/ImportTools' / name
+        if not binary.exists():
+            continue
+        try:
+            result = subprocess.run([str(binary), '--version'], capture_output=True, text=True, timeout=90)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise SystemExit(f'{name} did not run after signing: {error}')
+        if result.returncode != 0:
+            raise SystemExit(f'{name} did not run after signing:\n{result.stdout}{result.stderr}')
 
 
 def sign_app(app, identity):
@@ -81,13 +102,16 @@ def sign_app(app, identity):
         sign(version_b / 'Updater.app', identity)
         sign(framework, identity)
     import_tools = app / 'Contents/Resources/ImportTools'
+    entitlements = root / 'Resources/Entitlements'
     if import_tools.exists():
         for name in ('yt-dlp', 'deno'):
             binary = import_tools / name
             if binary.exists():
-                sign(binary, identity)
+                helper_entitlements = entitlements / f'{name}.entitlements'
+                sign(binary, identity, helper_entitlements if identity != '-' and helper_entitlements.exists() else None)
     sign(app, identity)
     run(['codesign', '--verify', '--deep', '--strict', str(app)])
+    verify_helpers(app)
 
 
 def notarize(app, identity):
@@ -102,6 +126,7 @@ def notarize(app, identity):
         run(['xcrun', 'notarytool', 'submit', str(upload), '--keychain-profile', profile, '--wait'])
         run(['xcrun', 'stapler', 'staple', str(app)])
         run(['xcrun', 'stapler', 'validate', str(app)])
+        run(['codesign', '--verify', '--deep', '--strict', str(app)])
     finally:
         upload.unlink(missing_ok=True)
 
@@ -110,13 +135,6 @@ def package_app(app):
     dist = root / 'dist'
     archive = dist / 'QuizStudio-macOS.zip'
     run(['/usr/bin/ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(archive)])
-    version = plistlib.loads((app / 'Contents/Info.plist').read_bytes())['CFBundleShortVersionString']
-    sparkle = dist / 'sparkle'
-    sparkle.mkdir(exist_ok=True)
-    shutil.copy2(archive, sparkle / f'QuizStudio-{version}.zip')
-    notes = root / 'Releases' / f'v{version}.md'
-    if notes.exists():
-        shutil.copy2(notes, sparkle / f'QuizStudio-{version}.md')
     return archive
 
 

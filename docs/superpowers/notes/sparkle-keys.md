@@ -33,15 +33,18 @@ python3 build.py
 ## Лента
 
 ```sh
-python3 scripts/make_appcast.py --version 0.21.0 \
+python3 scripts/make_appcast.py --version 0.21.0
+# Со второго релиза добавьте предыдущую ленту, чтобы сохранить старые записи:
+python3 scripts/make_appcast.py --version 0.22.0 \
   --previous https://github.com/totchto/quiz-studio-macos/releases/latest/download/appcast.xml
 ```
 
-- По умолчанию закрытый ключ берётся из Keychain; в CI передайте `--key-file` (или `--ed-key-file -` внутри самого Sparkle при подаче ключа через stdin).
-- Скрипт копирует заметки `Releases/v<версия>.md` рядом с архивом, генерирует `dist/sparkle/appcast.xml` и проверяет подпись архива.
-- Загрузите в GitHub Release `v<версия>`: `dist/QuizStudio-macOS.zip` (прежняя публичная ссылка), `dist/sparkle/QuizStudio-<версия>.zip`, `dist/sparkle/appcast.xml`.
+- По умолчанию закрытый ключ берётся из Keychain; в CI передайте `--key-file`.
+- Скрипт каждый раз заново собирает `dist/sparkle/`: копирует подписанный ZIP, преобразует `Releases/v<версия>.md` во встроенные HTML-заметки, генерирует `dist/sparkle/appcast.xml` и проверяет подпись архива. Старые ZIP в каталоге не накапливаются.
+- Без `--previous` создаётся новая лента только с текущей версией. `--previous` принимает отсутствующий файл (404) и тогда начинает ленту заново.
+- Ad-hoc сборка по умолчанию отклоняется: `--allow-ad-hoc` создаёт ленту только для локальной проверки, устанавливать её нельзя.
+- Загрузите в GitHub Release `v<версия>`: `dist/QuizStudio-macOS.zip` (прежняя публичная ссылка), `dist/sparkle/QuizStudio-<версия>.zip`, `dist/sparkle/appcast.xml`. Заметки уже встроены в ленту.
 - `SUFeedURL` указывает на `https://github.com/totchto/quiz-studio-macos/releases/latest/download/appcast.xml`: этот адрес постоянен, а файл берётся из последнего опубликованного (не черновика и не prerelease) релиза.
-- Старые записи ленты сохраняются, если передать `--previous`; без него в ленте останется только новая версия.
 
 ## Проверка
 

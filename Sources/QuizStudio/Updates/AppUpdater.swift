@@ -3,10 +3,8 @@ import Sparkle
 /// Owns the single Sparkle updater for the app lifetime. If the bundle is not
 /// configured with an HTTPS feed and a valid public key the updater stays off
 /// instead of failing in front of the user.
-@MainActor final class AppUpdater: NSObject, ObservableObject {
+@MainActor final class AppUpdater: ObservableObject {
     private var controller: SPUStandardUpdaterController?
-
-    var isConfigured: Bool { controller != nil }
 
     func start() {
         guard controller == nil, UpdateConfiguration.load().isUsable else { return }
